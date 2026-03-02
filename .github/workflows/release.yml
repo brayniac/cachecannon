@@ -25,17 +25,15 @@ jobs:
         run: cargo install cargo-deb
       - name: Build release binary
         run: cargo build --release
-      - name: Build .deb package
-        run: |
-          cargo deb --no-build
-          DEB_FILE=$(find target/debian -name 'cachecannon*.deb' | head -1)
-          echo "DEB_FILE=$DEB_FILE" >> $GITHUB_ENV
-          echo "Built: $DEB_FILE"
-      - name: Upload .deb artifact
+      - name: Build cachecannon .deb package
+        run: cargo deb --no-build
+      - name: Build valkey-bench .deb package
+        run: cargo deb --no-build --variant valkey-bench
+      - name: Upload .deb artifacts
         uses: actions/upload-artifact@v4
         with:
           name: deb-amd64
-          path: ${{ env.DEB_FILE }}
+          path: target/debian/*.deb
           retention-days: 7
 
   build-deb-arm64:
@@ -55,17 +53,15 @@ jobs:
         run: cargo install cargo-deb
       - name: Build release binary with cross
         run: cross build --release --target aarch64-unknown-linux-gnu
-      - name: Build .deb package
-        run: |
-          cargo deb --no-build --no-strip --target aarch64-unknown-linux-gnu
-          DEB_FILE=$(find target/aarch64-unknown-linux-gnu/debian -name 'cachecannon*.deb' | head -1)
-          echo "DEB_FILE=$DEB_FILE" >> $GITHUB_ENV
-          echo "Built: $DEB_FILE"
-      - name: Upload .deb artifact
+      - name: Build cachecannon .deb package
+        run: cargo deb --no-build --no-strip --target aarch64-unknown-linux-gnu
+      - name: Build valkey-bench .deb package
+        run: cargo deb --no-build --no-strip --target aarch64-unknown-linux-gnu --variant valkey-bench
+      - name: Upload .deb artifacts
         uses: actions/upload-artifact@v4
         with:
           name: deb-arm64
-          path: ${{ env.DEB_FILE }}
+          path: target/aarch64-unknown-linux-gnu/debian/*.deb
           retention-days: 7
 
   build-rpm-amd64:
@@ -81,17 +77,15 @@ jobs:
         run: cargo install cargo-generate-rpm
       - name: Build release binary
         run: cargo build --release
-      - name: Build .rpm package
-        run: |
-          cargo generate-rpm
-          RPM_FILE=$(find target/generate-rpm -name 'cachecannon*.rpm' | head -1)
-          echo "RPM_FILE=$RPM_FILE" >> $GITHUB_ENV
-          echo "Built: $RPM_FILE"
-      - name: Upload .rpm artifact
+      - name: Build cachecannon .rpm package
+        run: cargo generate-rpm
+      - name: Build valkey-bench .rpm package
+        run: cargo generate-rpm -s 'name = "valkey-bench"' -s 'assets = [{source = "target/release/valkey-bench", dest = "/usr/bin/valkey-bench", mode = "0755"}]'
+      - name: Upload .rpm artifacts
         uses: actions/upload-artifact@v4
         with:
           name: rpm-amd64
-          path: ${{ env.RPM_FILE }}
+          path: target/generate-rpm/*.rpm
           retention-days: 7
 
   build-rpm-arm64:
@@ -111,17 +105,15 @@ jobs:
         run: cargo install cargo-generate-rpm
       - name: Build release binary with cross
         run: cross build --release --target aarch64-unknown-linux-gnu
-      - name: Build .rpm package
-        run: |
-          cargo generate-rpm --target aarch64-unknown-linux-gnu
-          RPM_FILE=$(find target/aarch64-unknown-linux-gnu/generate-rpm -name 'cachecannon*.rpm' | head -1)
-          echo "RPM_FILE=$RPM_FILE" >> $GITHUB_ENV
-          echo "Built: $RPM_FILE"
-      - name: Upload .rpm artifact
+      - name: Build cachecannon .rpm package
+        run: cargo generate-rpm --target aarch64-unknown-linux-gnu
+      - name: Build valkey-bench .rpm package
+        run: cargo generate-rpm --target aarch64-unknown-linux-gnu -s 'name = "valkey-bench"' -s 'assets = [{source = "target/aarch64-unknown-linux-gnu/release/valkey-bench", dest = "/usr/bin/valkey-bench", mode = "0755"}]'
+      - name: Upload .rpm artifacts
         uses: actions/upload-artifact@v4
         with:
           name: rpm-arm64
-          path: ${{ env.RPM_FILE }}
+          path: target/aarch64-unknown-linux-gnu/generate-rpm/*.rpm
           retention-days: 7
 
   sign-and-publish:
