@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7] - 2026-03-10
+
+### Fixed
+- Fix viewer percentile charts by bumping metriken-query to 0.2.0
+
 ## [0.0.6] - 2026-03-02
 
 ### Added
