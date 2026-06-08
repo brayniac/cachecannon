@@ -814,6 +814,8 @@ fn make_momento_callback() -> impl Fn(&ringline_momento::CommandResult) {
             ringline_momento::CommandType::Delete => {
                 let _ = metrics::DELETE_LATENCY.increment(r.latency_ns);
             }
+            // `CommandType` is #[non_exhaustive]; common metrics below still apply.
+            _ => {}
         }
         let _ = metrics::RESPONSE_LATENCY.increment(r.latency_ns);
         metrics::BYTES_TX.add(r.tx_bytes as u64);
@@ -1256,6 +1258,8 @@ fn map_resp_op(op: ringline_redis::CompletedOp) -> RequestResult {
                 redirect,
             }
         }
+        // cachecannon only fires Get/Set/Del; `CompletedOp` is #[non_exhaustive].
+        _ => unreachable!("unexpected ringline-redis CompletedOp variant"),
     }
 }
 
@@ -1700,6 +1704,8 @@ fn map_memcache_op(op: ringline_memcache::CompletedOp) -> RequestResult {
                 redirect: None,
             }
         }
+        // cachecannon only fires Get/Set/Delete; `CompletedOp` is #[non_exhaustive].
+        _ => unreachable!("unexpected ringline-memcache CompletedOp variant"),
     }
 }
 
@@ -2206,6 +2212,8 @@ fn map_momento_op(op: ringline_momento::CompletedOp) -> RequestResult {
                 redirect: None,
             }
         }
+        // cachecannon only fires Get/Set/Delete; `CompletedOp` is #[non_exhaustive].
+        _ => unreachable!("unexpected ringline-momento CompletedOp variant"),
     }
 }
 
