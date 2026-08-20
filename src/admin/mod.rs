@@ -302,6 +302,29 @@ fn create_snapshot() -> Snapshot {
                     metadata,
                 });
             }
+            // metriken-core 0.2 carries histograms in a dedicated `Histogram`
+            // variant. Without this arm every latency histogram fell through to
+            // the catch-all below and was silently dropped, so neither the
+            // parquet recording nor the Prometheus endpoint carried any latency
+            // data -- it existed only in the terminal summary.
+            Some(metriken::Value::Histogram(h)) => {
+                if let Some(hist) = h.load() {
+                    metadata.insert(
+                        "grouping_power".to_string(),
+                        h.config().grouping_power().to_string(),
+                    );
+                    metadata.insert(
+                        "max_value_power".to_string(),
+                        h.config().max_value_power().to_string(),
+                    );
+                    histograms.push(SnapHistogram {
+                        name: name.to_string(),
+                        value: hist,
+                        metadata,
+                    });
+                }
+            }
+            // Retained for metrics that still surface as `Other`.
             Some(metriken::Value::Other(other)) => {
                 let histogram = if let Some(h) = other.downcast_ref::<metriken::AtomicHistogram>() {
                     h.load()
