@@ -246,29 +246,58 @@ pub fn run_benchmark_full(
         None
     };
 
-    // Size the TCP provided-recv buffers to hold a whole response when values
-    // are large. With the default 16 KiB buffers, a 64 KiB response fragments
-    // across 4 buffers; N concurrent large responses then need 4N buffers and
-    // stall once they exhaust the 256-buffer ring — throughput DROPS as
-    // connections rise (measured against valcache: 64c 8.1 Gbps → 256c
-    // 7.0 Gbps). One buffer per response lands each in a single CQE and removes
-    // the accumulator stitching. (A prior override was removed after a valkey
-    // 200 GbE A/B showed no benefit there; valcache streams a single contiguous
-    // transferTo per response and does hit the cliff, so we size by value.)
-    let recv_buffer_size: u32 = {
-        let v = config.workload.values.length as u32;
-        if v > 16384 {
-            v.saturating_add(4096).next_power_of_two()
-        } else {
-            16384
-        }
-    };
+    // Size the TCP provided-recv buffers to hold a whole response in ONE buffer
+    // when values are large. The default 16 KiB buffers fragment a 64 KiB
+    // response across 4 buffers; because a parsing client needs the reply
+    // contiguous, ringline then memcpy-stitches the 4 segments back together in
+    // the per-connection accumulator (plus 4× the CQEs). Measured against
+    // valcache, that reassembly — not ring exhaustion — is the cost: enlarging
+    // the ring while keeping 16 KiB buffers barely helped (8.15 vs 8.99 Gbps),
+    // whereas one buffer per response reached 8.9 Gbps. So we size by value.
+    //
+    // The buffer is page-aligned to the value + one page of framing headroom
+    // (NOT rounded to a power of two — that doubled the buffer for no gain:
+    // 68 KiB and 128 KiB buffers measured identically, so we keep the smaller).
+    // A pure forwarding proxy could instead consume the slices without stitching
+    // and prefer packed small buffers; a load generator that reads every value
+    // cannot.
+    let recv_buffer_size: u32 = std::env::var("CC_RECV_BUFSZ")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            let v = config.workload.values.length as u32;
+            if v > 16384 {
+                // round the value up to a 4 KiB page, then add one page for the
+                // protocol framing (binary 28 B header/extras, or RESP prefix).
+                v.next_multiple_of(4096).saturating_add(4096)
+            } else {
+                16384
+            }
+        });
+    // ring_size is the concurrency headroom: with one buffer per response it
+    // must cover every connection's in-flight response (plus pipelining), or
+    // recvs fall back to the slow one-shot path. The 256 default covers ~256
+    // in-flight responses (fine to a few hundred connections); scale it for
+    // higher connection-per-worker counts. Env override for A/B testing.
+    let conns_per_worker =
+        (total_connections as usize).div_ceil((num_threads as usize).max(1));
+    let pipeline_depth = (config.connection.pipeline_depth as usize).max(1);
+    let recv_ring_size: u16 = std::env::var("CC_RECV_RING")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            conns_per_worker
+                .saturating_mul(pipeline_depth)
+                .saturating_mul(2)
+                .next_power_of_two()
+                .clamp(256, 8192) as u16
+        });
     let mut ringline_builder = ringline::ConfigBuilder::new()
         .workers(num_threads)
         .pin_to_core(false) // We pin in create_for_worker instead
         .core_offset(0)
         .tcp_nodelay(true)
-        .recv_buffer(256, recv_buffer_size);
+        .recv_buffer(recv_ring_size, recv_buffer_size);
     if let Some(tls_client) = tls_client {
         ringline_builder = ringline_builder.tls_client(tls_client);
     }
