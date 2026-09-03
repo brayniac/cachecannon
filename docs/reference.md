@@ -174,7 +174,9 @@ mode = "userspace"
 
 ```toml
 [admin]
-# Prometheus metrics endpoint (optional)
+# Metrics endpoint (optional). Serves two paths:
+#   /metrics         Prometheus exposition text
+#   /metrics/binary  msgpack snapshot, for `rezolus record`
 listen = "127.0.0.1:9090"
 
 # Write metrics to Parquet file (optional)
@@ -189,6 +191,22 @@ format = "clean"
 # Color mode: auto, always, never
 color = "auto"
 ```
+
+### Metrics Endpoint
+
+With `[admin] listen` set, the benchmark serves its live metrics on two paths:
+
+| Path | Content type | Consumer |
+|---|---|---|
+| `/metrics` (and `/`) | `text/plain; version=0.0.4` | Prometheus scrapers |
+| `/metrics/binary` | `application/msgpack` | `rezolus record` |
+
+Both carry the same metrics, including the latency histograms. The msgpack path
+is the one [Rezolus](https://github.com/brayniac/rezolus) probes for a
+non-Prometheus source, so a run can be recorded alongside system telemetry into
+a single `.rez` archive — see
+[Correlating with Rezolus](guide.md#correlating-with-rezolus). Any other path
+returns 404.
 
 ## Output Formats
 
