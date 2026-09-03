@@ -1,0 +1,34 @@
+# cachecannon → Datomic valcache (memcache binary, UUID keys) over 10GbE
+[general]
+duration = "20s"
+warmup = "5s"
+threads = 8
+
+[target]
+endpoints = ["10.1.0.2:11311"]
+protocol = "memcache-binary"
+
+[connection]
+connections = 16
+pipeline_depth = 1        # valcache is synchronous per connection
+connect_timeout = "5s"
+request_timeout = "5s"
+
+[workload]
+
+[workload.keyspace]
+length = 36               # canonical UUID
+count = 200000
+distribution = "uniform"
+format = "uuid"           # <-- new: emit dashed UUID keys
+
+[workload.commands]
+get = 90
+set = 10
+
+[workload.values]
+length = 4096
+
+[timestamps]
+enabled = true
+mode = "userspace"

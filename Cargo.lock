@@ -495,7 +495,7 @@ dependencies = [
  "histogram 1.4.1",
  "http",
  "include_dir",
- "ketama",
+ "ketama 0.0.1",
  "libc",
  "metriken",
  "metriken-exposition",
@@ -1148,6 +1148,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5bc28a770b7d738684c2b53fff2e68614edfa874c865b6592a7d72fc3c3ac2be"
 
 [[package]]
+name = "ketama"
+version = "0.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02477b4e4b5454c404fa7ef505c85cacb89fee3987793f9a3a2bd9ab556c4e3b"
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1337,9 +1343,9 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "memcache-proto"
-version = "0.0.2"
+version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e6f1d6ac2aabd607eca46582dd78d83d451177ca659516f876bc66df2716afe"
+checksum = "1bc235782fb39adfbf6629e80cd16bb5fe09c88081a6d7b3ffe8487c6ddbde5d"
 dependencies = [
  "bytes",
  "itoa",
@@ -1896,9 +1902,8 @@ dependencies = [
 
 [[package]]
 name = "ringline"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1eb0635869c2e96749aced1750f4506d3c468f34a6b7acc1af4cf3992f17e5b3"
+version = "0.5.6"
+source = "git+https://github.com/brayniac/ringline?branch=memcache-binary#c9ff27d803f8aaa420d3ecdaffe31a0c3368bcbe"
 dependencies = [
  "bytes",
  "crossbeam-channel",
@@ -1914,14 +1919,13 @@ dependencies = [
 
 [[package]]
 name = "ringline-memcache"
-version = "0.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b41b0cf0a2652a33676299ca7db97621f408172afda66360e92a596070d9a3d3"
+version = "0.6.6"
+source = "git+https://github.com/brayniac/ringline?branch=memcache-binary#c9ff27d803f8aaa420d3ecdaffe31a0c3368bcbe"
 dependencies = [
  "bytes",
  "histogram 0.11.5",
  "itoa",
- "ketama",
+ "ketama 0.0.2",
  "libc",
  "memcache-proto",
  "ringline",
@@ -1950,7 +1954,7 @@ dependencies = [
  "bytes",
  "histogram 0.11.5",
  "itoa",
- "ketama",
+ "ketama 0.0.1",
  "libc",
  "resp-proto",
  "ringline",

@@ -154,6 +154,13 @@ pub fn run_benchmark_full(
         .into());
     }
 
+    // Fix the key format (hex vs UUID) before any key is generated, so the
+    // prefill queues and the workload agree.
+    crate::worker::KEY_FORMAT.store(
+        config.workload.keyspace.format as u8,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
     // Build the shared per-endpoint prefill queues once: the full keyspace,
     // partitioned by owning endpoint. All workers share this `Arc` and drain
     // the queues for whichever endpoints their connections serve.

@@ -152,3 +152,12 @@ lto = true
 codegen-units = 1
 panic = "abort"
 debug = true
+
+# --- dev: binary-memcache work lives on a ringline branch ---
+# ringline-memcache gains ClientBuilder::binary(). Patch only it plus `ringline`
+# core (so the core unifies to one source); ringline-redis/ringline-ping stay on
+# crates.io — the branch's newer ringline-redis pulls resp-proto 0.0.2, which
+# would clash with cachecannon's own resp-proto 0.0.1.
+[patch.crates-io]
+ringline = { git = "https://github.com/brayniac/ringline", branch = "memcache-binary" }
+ringline-memcache = { git = "https://github.com/brayniac/ringline", branch = "memcache-binary" }

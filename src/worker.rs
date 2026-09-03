@@ -460,9 +460,7 @@ impl AsyncEventHandler for BenchHandler {
                     spawn_protocol_tasks(&worker_state, my_connections, worker_id);
                 }
                 CacheProtocol::MemcacheBinary => {
-                    tracing::error!(
-                        "MemcacheBinary protocol is not supported; use Memcache (ASCII) instead"
-                    );
+                    spawn_protocol_tasks(&worker_state, my_connections, worker_id);
                 }
             }
             worker_state.task_state.shared.mark_worker_started();
@@ -654,13 +652,12 @@ fn spawn_protocol_tasks(
                 CacheProtocol::Resp | CacheProtocol::Resp3 => {
                     resp_connection_task(state, endpoint_idx, session_seed).await;
                 }
-                CacheProtocol::Memcache => {
+                CacheProtocol::Memcache | CacheProtocol::MemcacheBinary => {
                     memcache_connection_task(state, endpoint_idx, session_seed).await;
                 }
                 CacheProtocol::Ping => {
                     ping_connection_task(state, endpoint_idx, session_seed).await;
                 }
-                _ => unreachable!(),
             }
         });
     }
@@ -1344,6 +1341,10 @@ async fn memcache_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: u
         metrics::CONNECTIONS_ACTIVE.increment();
         let builder = ringline_memcache::Client::builder(conn)
             .on_result(make_memcache_callback())
+            .binary(matches!(
+                config.target.protocol,
+                CacheProtocol::MemcacheBinary
+            ))
             .max_batch_size(config.connection.effective_batch_size());
         #[cfg(target_os = "linux")]
         let builder =
@@ -1359,7 +1360,16 @@ async fn memcache_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: u
 
         // Precheck: send VERSION to verify connectivity
         if state.task_state.shared.phase() == Phase::Precheck && !state.is_precheck_done() {
-            match client.version().await {
+            // valcache's binary protocol has no VERSION opcode (it would be
+            // rejected as NOT_SUPPORTED and drop the connection). Treat binary
+            // as reachable — the first real op surfaces any connectivity error.
+            let precheck: Result<Box<str>, ringline_memcache::Error> =
+                if matches!(config.target.protocol, CacheProtocol::MemcacheBinary) {
+                    Ok(Box::from("binary"))
+                } else {
+                    client.version().await
+                };
+            match precheck {
                 Ok(_version) => {
                     tracing::debug!(
                         worker = state.task_state.worker_id,
@@ -2068,8 +2078,34 @@ pub(crate) fn build_endpoint_keys(
 }
 
 /// Write a numeric key ID into the buffer as hex.
+/// Run-scoped key format, as a `KeyFormat` `repr(u8)` discriminant. Set once
+/// from `keyspace.format` by the runner before the prefill queues are built, so
+/// prefill and workload keys agree. `write_key` is called from many places
+/// (including the signature-limited prefill builder), and the format is a
+/// run-wide invariant, so a run-scoped atomic is a better fit than threading a
+/// parameter through every call site.
+pub(crate) static KEY_FORMAT: AtomicU8 = AtomicU8::new(0);
+
 fn write_key(buf: &mut [u8], id: usize) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
+    // Canonical UUID form: 8-4-4-4-12 hex with dashes at 8/13/18/23. Java's
+    // UUID.fromString (used by valcache) accepts any hex in those positions,
+    // and the last 3 chars stay hex so valcache's subdir routing works.
+    if crate::config::KeyFormat::from_u8(KEY_FORMAT.load(Ordering::Relaxed))
+        == crate::config::KeyFormat::Uuid
+        && buf.len() == 36
+    {
+        let mut n = id as u128;
+        for (i, byte) in buf.iter_mut().enumerate().rev() {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                *byte = b'-';
+            } else {
+                *byte = HEX[(n & 0xf) as usize];
+                n >>= 4;
+            }
+        }
+        return;
+    }
     let mut n = id;
     for byte in buf.iter_mut().rev() {
         *byte = HEX[n & 0xf];
