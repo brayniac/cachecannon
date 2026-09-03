@@ -152,3 +152,11 @@ lto = true
 codegen-units = 1
 panic = "abort"
 debug = true
+
+[dev-dependencies]
+# Decodes what `/metrics/binary` serves. The consumer that matters is
+# `rezolus record`, which links metriken-exposition 0.19 against our 0.16 --
+# that pairing cannot be tested in this graph (metriken-core sets `links`, so
+# two versions cannot coexist), so `dump_msgpack_fixture` writes the bytes for
+# an out-of-tree decode and this dep covers the in-graph half.
+rmp-serde = "1"

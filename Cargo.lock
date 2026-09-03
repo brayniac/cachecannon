@@ -510,6 +510,7 @@ dependencies = [
  "ringline-memcache",
  "ringline-ping",
  "ringline-redis",
+ "rmp-serde",
  "rustls",
  "serde",
  "serde_json",

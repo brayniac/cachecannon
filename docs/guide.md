@@ -77,6 +77,30 @@ rezolus record http://localhost:4241 client-rezolus.parquet &
 
 This lets you correlate cache performance with CPU utilization, network statistics, scheduler behavior, and other system metrics.
 
+#### One archive per run
+
+Rezolus can also record the benchmark itself. With `[admin] listen` set, the
+benchmark serves a msgpack snapshot on `/metrics/binary` — the path
+`rezolus record` probes — so a single invocation captures all three sources as
+labelled recordings inside one `.rez` archive:
+
+```bash
+# Terminal 1: one recorder, three endpoints
+rezolus record \
+    --endpoint http://localhost:9090,source=cachecannon,role=loadgen \
+    --endpoint http://server:4241,role=service \
+    --endpoint http://client:4241 \
+    -o run.rez
+
+# Terminal 2: run the benchmark with its metrics endpoint enabled
+./target/release/cachecannon config/valkey.toml
+```
+
+Every recording shares one timeline, so benchmark and system metrics line up
+without matching timestamps across files by hand. Analysis happens in Rezolus
+(`rezolus view run.rez`); `cachecannon view` reads Parquet, so keep
+`--parquet results.parquet` if you also want the built-in dashboards.
+
 ## Workload Patterns
 
 ### Read-Heavy (Default)

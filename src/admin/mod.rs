@@ -129,28 +129,23 @@ async fn run_prometheus_server(addr: SocketAddr, stop_notify: Arc<Notify>) -> io
                     Ok((mut socket, _peer)) => {
                         tokio::spawn(async move {
                             let mut buf = [0u8; 1024];
-                            // Read the request (we don't parse it, just need to consume it)
-                            if let Err(e) = socket.read(&mut buf).await {
-                                tracing::debug!("prometheus read error: {}", e);
-                                return;
-                            }
+                            let read = match socket.read(&mut buf).await {
+                                Ok(n) => n,
+                                Err(e) => {
+                                    tracing::debug!("admin read error: {}", e);
+                                    return;
+                                }
+                            };
 
-                            // Generate Prometheus output
-                            let body = generate_prometheus_output();
+                            // An unparseable request names no target, so there
+                            // is nothing to serve it from.
+                            let body = match request_target(&buf[..read]) {
+                                Some(target) => respond(target),
+                                None => AdminBody::NotFound,
+                            };
 
-                            let response = format!(
-                                "HTTP/1.1 200 OK\r\n\
-                                 Content-Type: text/plain; version=0.0.4\r\n\
-                                 Content-Length: {}\r\n\
-                                 Connection: close\r\n\
-                                 \r\n\
-                                 {}",
-                                body.len(),
-                                body
-                            );
-
-                            if let Err(e) = socket.write_all(response.as_bytes()).await {
-                                tracing::debug!("prometheus write error: {}", e);
+                            if let Err(e) = socket.write_all(&http_response(body)).await {
+                                tracing::debug!("admin write error: {}", e);
                             }
                         });
                     }
@@ -166,6 +161,73 @@ async fn run_prometheus_server(addr: SocketAddr, stop_notify: Arc<Notify>) -> io
     }
 
     Ok(())
+}
+
+/// What the admin server serves for a request path.
+enum AdminBody {
+    Prometheus(String),
+    Msgpack(Vec<u8>),
+    NotFound,
+    ServerError,
+}
+
+/// The request target from an HTTP request line (`GET /metrics HTTP/1.1`),
+/// with any query string stripped. `None` when the bytes are not a request
+/// line naming an absolute path.
+fn request_target(request: &[u8]) -> Option<&str> {
+    let line = request.split(|b| *b == b'\n').next()?;
+    let line = std::str::from_utf8(line).ok()?;
+    let target = line.split_whitespace().nth(1)?;
+    let target = target.split('?').next().unwrap_or(target);
+    target.starts_with('/').then_some(target)
+}
+
+/// Serve one path.
+///
+/// The two metric paths are the ones `rezolus record` probes: it tries
+/// `/metrics/binary` for a msgpack source first and falls back to `/metrics`
+/// for a Prometheus one (`probe_endpoint`, rezolus src/recorder/mod.rs). Serving
+/// msgpack is what lets a run be recorded into the same `.rez` archive as the
+/// server- and client-side agents, as one more `--endpoint`.
+fn respond(path: &str) -> AdminBody {
+    match path {
+        // `/` served the exposition text before paths were routed at all; a
+        // scraper pointed at it must not start 404ing.
+        "/" | "/metrics" => AdminBody::Prometheus(generate_prometheus_output()),
+        "/metrics/binary" => match Snapshot::to_msgpack(&create_snapshot()) {
+            Ok(bytes) => AdminBody::Msgpack(bytes),
+            Err(e) => {
+                tracing::warn!("failed to serialize snapshot as msgpack: {}", e);
+                AdminBody::ServerError
+            }
+        },
+        _ => AdminBody::NotFound,
+    }
+}
+
+/// Frame a body as an HTTP/1.1 response. Bytes, not a string: the msgpack body
+/// is not UTF-8.
+fn http_response(body: AdminBody) -> Vec<u8> {
+    let (status, content_type, body) = match body {
+        AdminBody::Prometheus(text) => ("200 OK", "text/plain; version=0.0.4", text.into_bytes()),
+        AdminBody::Msgpack(bytes) => ("200 OK", "application/msgpack", bytes),
+        AdminBody::NotFound => ("404 Not Found", "text/plain", Vec::new()),
+        AdminBody::ServerError => ("500 Internal Server Error", "text/plain", Vec::new()),
+    };
+
+    let mut response = format!(
+        "HTTP/1.1 {}\r\n\
+         Content-Type: {}\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        status,
+        content_type,
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(&body);
+    response
 }
 
 fn generate_prometheus_output() -> String {
@@ -193,43 +255,22 @@ fn generate_prometheus_output() -> String {
                 let _ = writeln!(output, "# TYPE {} gauge", name);
                 let _ = writeln!(output, "{} {}", name, v);
             }
+            // metriken-core 0.2 carries histograms in a dedicated `Histogram`
+            // variant, so this -- not the `Other` arm below -- is what every
+            // AtomicHistogram reaches. `create_snapshot` was fixed for the same
+            // reason (#117); this endpoint was left behind, and until now
+            // served no latency data at all.
+            metriken::Value::Histogram(h) => {
+                if let Some(snapshot) = h.load() {
+                    write_histogram_summary(&mut output, name, description, &snapshot);
+                }
+            }
             metriken::Value::Other(any) => {
-                // Try to downcast to AtomicHistogram. We emit a "summary"
-                // (with `quantile="..."` rows) rather than a Prometheus
-                // "histogram" (which would require cumulative `_bucket{le=}`
-                // rows). The previous code declared `histogram` while
-                // emitting `quantile`, which is invalid exposition.
+                // Retained for histograms that still surface as `Other`.
                 if let Some(histogram) = any.downcast_ref::<metriken::AtomicHistogram>()
                     && let Some(snapshot) = histogram.load()
                 {
-                    write_help(&mut output, name, description);
-                    let _ = writeln!(output, "# TYPE {} summary", name);
-
-                    let quantiles = [0.50, 0.90, 0.95, 0.99, 0.999, 0.9999];
-                    if let Ok(Some(results)) = snapshot.quantiles(&quantiles) {
-                        for (quantile, bucket) in results.entries() {
-                            let _ = writeln!(
-                                output,
-                                "{}{{quantile=\"{}\"}} {}",
-                                name,
-                                quantile.as_f64(),
-                                bucket.end()
-                            );
-                        }
-                    }
-
-                    // Output count and sum
-                    let mut count = 0u64;
-                    let mut sum = 0u128;
-                    for bucket in snapshot.into_iter() {
-                        let bucket_count = bucket.count();
-                        count += bucket_count;
-                        // Use midpoint of bucket for sum approximation
-                        let midpoint = (bucket.start() as u128 + bucket.end() as u128) / 2;
-                        sum += bucket_count as u128 * midpoint;
-                    }
-                    let _ = writeln!(output, "{}_count {}", name, count);
-                    let _ = writeln!(output, "{}_sum {}", name, sum);
+                    write_histogram_summary(&mut output, name, description, &snapshot);
                 }
             }
             // Handle any future Value variants
@@ -238,6 +279,46 @@ fn generate_prometheus_output() -> String {
     }
 
     output
+}
+
+/// Render one histogram as a Prometheus "summary" -- `quantile="..."` rows plus
+/// `_count`/`_sum` -- rather than a "histogram" (which would require cumulative
+/// `_bucket{le=}` rows).
+fn write_histogram_summary(
+    out: &mut String,
+    name: &str,
+    description: Option<&str>,
+    snapshot: &histogram::Histogram,
+) {
+    use std::fmt::Write as _;
+
+    write_help(out, name, description);
+    let _ = writeln!(out, "# TYPE {} summary", name);
+
+    let quantiles = [0.50, 0.90, 0.95, 0.99, 0.999, 0.9999];
+    if let Ok(Some(results)) = snapshot.quantiles(&quantiles) {
+        for (quantile, bucket) in results.entries() {
+            let _ = writeln!(
+                out,
+                "{}{{quantile=\"{}\"}} {}",
+                name,
+                quantile.as_f64(),
+                bucket.end()
+            );
+        }
+    }
+
+    let mut count = 0u64;
+    let mut sum = 0u128;
+    for bucket in snapshot {
+        let bucket_count = bucket.count();
+        count += bucket_count;
+        // Midpoint of the bucket: the exact values are not retained.
+        let midpoint = (bucket.start() as u128 + bucket.end() as u128) / 2;
+        sum += bucket_count as u128 * midpoint;
+    }
+    let _ = writeln!(out, "{}_count {}", name, count);
+    let _ = writeln!(out, "{}_sum {}", name, sum);
 }
 
 /// Emit a `# HELP` line if `description` is non-empty. The text is escaped
@@ -467,4 +548,119 @@ fn msgpack_temp_path(parquet_path: &Path) -> PathBuf {
 fn append_snapshot<W: Write>(writer: &mut W, snapshot: &Snapshot) -> io::Result<()> {
     let bytes = Snapshot::to_msgpack(snapshot).map_err(|e| io::Error::other(e.to_string()))?;
     writer.write_all(&bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prometheus_output_carries_latency_histograms() {
+        let _ = crate::metrics::RESPONSE_LATENCY.increment(12_345);
+
+        let output = generate_prometheus_output();
+
+        assert!(
+            output.contains("# TYPE response_latency summary"),
+            "response_latency missing from the exposition output:\n{output}"
+        );
+        assert!(output.contains("response_latency{quantile="));
+        assert!(output.contains("response_latency_count "));
+    }
+
+    #[test]
+    fn request_target_reads_the_path_from_the_request_line() {
+        assert_eq!(
+            request_target(b"GET /metrics/binary HTTP/1.1\r\nHost: x\r\n\r\n"),
+            Some("/metrics/binary")
+        );
+        assert_eq!(
+            request_target(b"GET /metrics?collect=all HTTP/1.1\r\n\r\n"),
+            Some("/metrics")
+        );
+        assert_eq!(request_target(b"garbage"), None);
+    }
+
+    #[test]
+    fn metrics_paths_route_to_their_formats() {
+        assert!(matches!(respond("/metrics"), AdminBody::Prometheus(_)));
+        // The root kept serving the exposition text before paths were routed;
+        // a scraper pointed at it must not start 404ing.
+        assert!(matches!(respond("/"), AdminBody::Prometheus(_)));
+        assert!(matches!(respond("/metrics/binary"), AdminBody::Msgpack(_)));
+        assert!(matches!(respond("/nope"), AdminBody::NotFound));
+    }
+
+    #[test]
+    fn msgpack_body_decodes_as_a_snapshot_carrying_histograms() {
+        let _ = crate::metrics::RESPONSE_LATENCY.increment(12_345);
+
+        let AdminBody::Msgpack(bytes) = respond("/metrics/binary") else {
+            panic!("/metrics/binary did not serve msgpack");
+        };
+
+        // `Snapshot` is an untagged enum and rmp-serde encodes structs as
+        // arrays, so this also pins the variant: a V2 body must not decode as
+        // a V1 one.
+        let mut snapshot: Snapshot =
+            rmp_serde::from_slice(&bytes).expect("msgpack body is not a snapshot");
+        assert!(matches!(snapshot, Snapshot::V2(_)));
+
+        assert!(
+            snapshot
+                .histograms()
+                .iter()
+                .any(|h| h.name == "response_latency"),
+            "decoded snapshot carries no response_latency histogram"
+        );
+        assert_eq!(
+            snapshot.metadata().get("source").map(String::as_str),
+            Some("cachecannon")
+        );
+    }
+
+    #[test]
+    fn msgpack_response_is_framed_as_binary() {
+        let target = request_target(b"GET /metrics/binary HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let response = http_response(respond(target));
+
+        let split = response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("no header/body separator");
+        let headers = std::str::from_utf8(&response[..split]).unwrap();
+        let body = &response[split + 4..];
+
+        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"), "{headers}");
+        assert!(
+            headers.contains("Content-Type: application/msgpack\r\n"),
+            "{headers}"
+        );
+        assert!(
+            headers.contains(&format!("Content-Length: {}\r\n", body.len())),
+            "content-length disagrees with the {} byte body:\n{headers}",
+            body.len()
+        );
+        rmp_serde::from_slice::<Snapshot>(body).expect("framed body is not a snapshot");
+    }
+
+    /// Writes what `/metrics/binary` serves to `$CACHECANNON_MSGPACK_FIXTURE`,
+    /// for decoding by a consumer built against metriken-exposition 0.19 --
+    /// the version `rezolus record` links, which cannot be a dependency here.
+    ///
+    ///     CACHECANNON_MSGPACK_FIXTURE=/tmp/snap.msgpack \
+    ///       cargo test --lib dump_msgpack_fixture -- --ignored
+    #[test]
+    #[ignore = "writes a fixture file for out-of-tree decoding"]
+    fn dump_msgpack_fixture() {
+        let _ = crate::metrics::RESPONSE_LATENCY.increment(12_345);
+        let path = std::env::var("CACHECANNON_MSGPACK_FIXTURE")
+            .expect("set CACHECANNON_MSGPACK_FIXTURE to the output path");
+
+        let AdminBody::Msgpack(bytes) = respond("/metrics/binary") else {
+            panic!("/metrics/binary did not serve msgpack");
+        };
+        std::fs::write(&path, &bytes).expect("failed to write the fixture");
+        eprintln!("wrote {} bytes to {path}", bytes.len());
+    }
 }
