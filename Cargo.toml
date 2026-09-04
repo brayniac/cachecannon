@@ -48,7 +48,11 @@ http = "1"
 ctrlc = { version = "3", features = ["termination"] }
 
 # I/O event loop (io_uring on Linux, mio on other platforms)
-ringline = "0.5.2"
+# 0.6.1 minimum: fixes an io_uring liveness bug where a worker reaped zero
+# completions for as long as any task stayed runnable (under DEFER_TASKRUN
+# neither the non-blocking submit nor the skipped flush set GETEVENTS), so no
+# send-pool slots were recycled and a wait-for-capacity loop never woke.
+ringline = "0.6.1"
 
 # Consistent hashing
 ketama = "0.0.1"
@@ -57,15 +61,21 @@ ketama = "0.0.1"
 crossbeam-channel = "0.5"
 
 # Protocol implementations
-resp-proto = { version = "0.0.1", features = ["resp3"] }
+# Must stay in lockstep with the `resp-proto` that `ringline-redis` depends on.
+# These are pre-1.0, so 0.0.1 and 0.0.2 are semver-incompatible: a mismatch
+# puts two copies in the graph and `Request` from one will not typecheck
+# against the other's `cmd()`.
+resp-proto = { version = "0.0.2", features = ["resp3"] }
 
 # Client crates
-# 0.6.5 minimum: RESP3 null (`_\r\n`) GET-miss parsing (ringline #294) lands in
-# 0.6.5; the uniform recv_meta reply-metadata path (RespMeta / recv_meta,
-# ringline #288) landed in 0.6.4.
-ringline-redis = "0.6.5"
-ringline-memcache = "0.6.4"
-ringline-ping = "0.5.2"
+# 0.7.0 minimum: the ringline 0.6.0 coordinated breaking release (opaque
+# PoolConfig, `ConnCtx: !Send`, `recv_accumulator_max` defaulting to 1 GiB).
+# Carries forward the 0.6.5 RESP3 null (`_\r\n`) GET-miss parsing (ringline
+# #294) and the uniform recv_meta reply-metadata path (RespMeta / recv_meta,
+# ringline #288, 0.6.4).
+ringline-redis = "0.7.0"
+ringline-memcache = "0.7.1"
+ringline-ping = "0.6.0"
 
 # Metrics
 histogram = "1.1"
@@ -90,10 +100,10 @@ rand_xoshiro = "0.7"
 
 # Kernel SO_TIMESTAMPING support is Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]
-ringline = { version = "0.5.2", features = ["timestamps"] }
-ringline-redis = { version = "0.6.5", features = ["timestamps"] }
-ringline-memcache = { version = "0.6.4", features = ["timestamps"] }
-ringline-ping = { version = "0.5.2", features = ["timestamps"] }
+ringline = { version = "0.6.1", features = ["timestamps"] }
+ringline-redis = { version = "0.7.0", features = ["timestamps"] }
+ringline-memcache = { version = "0.7.1", features = ["timestamps"] }
+ringline-ping = { version = "0.6.0", features = ["timestamps"] }
 
 # Jemalloc allocator (glibc only — not needed on musl/macOS/Windows).
 tikv-jemallocator = "0.6"
