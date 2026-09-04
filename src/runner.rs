@@ -246,8 +246,12 @@ pub fn run_benchmark_full(
         None
     };
 
+    let standalone_task_capacity =
+        standalone_task_capacity(config.connection.total_connections(), num_threads);
+
     let mut ringline_builder = ringline::ConfigBuilder::new()
         .workers(num_threads)
+        .standalone_task_capacity(standalone_task_capacity)
         .pin_to_core(false) // We pin in create_for_worker instead
         .core_offset(0)
         .tcp_nodelay(true);
@@ -944,5 +948,75 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+/// Standalone-task slab capacity to request from ringline, per worker.
+///
+/// Every connection is a standalone task (`worker::spawn_connection_tasks`
+/// spawns one per connection), and ringline's default capacity is 256 per
+/// worker — so a run asking for more than 256 connections on any one worker
+/// silently lost the excess: `ringline::spawn` returns `Err` once the slab is
+/// full, and those connections were never created while the run still reported
+/// success. A 4096-connection run over 8 threads established exactly 2040
+/// (8 × 255) and reported "0 failed".
+///
+/// Derived from the workload rather than set to a large constant, so the
+/// ceiling tracks the connection count instead of becoming a new silent cap at
+/// some higher number. Never drops below ringline's own 256 default, since a
+/// small run should not end up with *less* headroom than before.
+fn standalone_task_capacity(total_connections: usize, num_threads: usize) -> u32 {
+    /// Slack for non-connection standalone tasks. Capacity 256 admitted 255
+    /// connections, so at least one slot is held elsewhere.
+    const HEADROOM: usize = 16;
+    /// ringline's own default; the floor for small runs.
+    const RINGLINE_DEFAULT: usize = 256;
+    /// ringline rejects `standalone_task_capacity >= 1 << 31`.
+    const RINGLINE_MAX: usize = (1 << 31) - 1;
+
+    let per_worker = total_connections.div_ceil(num_threads.max(1));
+    let capacity = per_worker
+        .saturating_add(HEADROOM)
+        .clamp(RINGLINE_DEFAULT, RINGLINE_MAX);
+    capacity as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::standalone_task_capacity;
+
+    #[test]
+    fn covers_the_connection_count_that_was_silently_capped() {
+        // The regression: 4096 connections over 8 threads needs 512 per worker,
+        // but ringline's 256 default admitted only 255, so the run established
+        // 2040 and reported success.
+        let capacity = standalone_task_capacity(4096, 8);
+        assert!(
+            capacity as usize >= 4096usize.div_ceil(8),
+            "capacity {capacity} must cover 512 connections per worker"
+        );
+    }
+
+    #[test]
+    fn uneven_split_covers_the_busiest_worker() {
+        // 4097 over 8 gives one worker 513; ceiling division must not round down.
+        assert!(standalone_task_capacity(4097, 8) as usize >= 513);
+    }
+
+    #[test]
+    fn small_runs_keep_the_ringline_default_as_a_floor() {
+        assert_eq!(standalone_task_capacity(8, 8), 256);
+        assert_eq!(standalone_task_capacity(0, 8), 256);
+    }
+
+    #[test]
+    fn zero_threads_does_not_divide_by_zero() {
+        assert_eq!(standalone_task_capacity(64, 0), 256);
+    }
+
+    #[test]
+    fn absurd_connection_counts_stay_within_ringline_limits() {
+        // ringline rejects >= 1 << 31 at config validation.
+        assert!((standalone_task_capacity(usize::MAX, 1) as u64) < (1 << 31));
     }
 }
