@@ -312,5 +312,18 @@ jobs:
       - name: Build
         run: cargo build --release
 
+      # Splits "memcached + our TLS client" from "certificate verification":
+      # the Valkey TLS job passes with tls_verify = false, so if this passes
+      # and the verifying run below fails, the fault is in verification.
+      - name: Diagnose - TLS without certificate verification
+        run: |
+          sed 's|^tls_ca_file = .*|tls_verify = false|' config/memcache-tls-ci.toml > /tmp/noverify.toml
+          echo "--- config ---"; grep -E "^tls|^protocol|^endpoints" /tmp/noverify.toml
+          if ./target/release/cachecannon /tmp/noverify.toml; then
+            echo "DIAGNOSE: no-verify PASSED"
+          else
+            echo "DIAGNOSE: no-verify FAILED"
+          fi
+
       - name: Run benchmark against Memcache TLS
         run: ./target/release/cachecannon config/memcache-tls-ci.toml
