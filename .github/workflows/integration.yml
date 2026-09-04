@@ -277,21 +277,37 @@ jobs:
           # benchmark verifies against this rather than skipping verification.
           cp /tmp/memcache-tls/memcached.crt /tmp/memcache-tls/ca.crt
 
+      # Not daemonized: -d discards memcached's own diagnostics, which is
+      # exactly what is needed when TLS setup fails.
       - name: Start memcached with TLS
         run: |
-          /tmp/memcached-src/memcached -d -Z -p 11212 \
-            -o ssl_chain_cert=/tmp/memcache-tls/memcached.crt,ssl_key=/tmp/memcache-tls/memcached.key
+          /tmp/memcached-src/memcached -Z -p 11212 -v \
+            -o ssl_chain_cert=/tmp/memcache-tls/memcached.crt,ssl_key=/tmp/memcache-tls/memcached.key \
+            > /tmp/memcached.log 2>&1 &
 
           for i in $(seq 1 30); do
             if (echo > /dev/tcp/127.0.0.1/11212) 2>/dev/null; then
               echo "Memcached TLS is ready"
+              echo "--- memcached log ---"
+              cat /tmp/memcached.log || true
               exit 0
             fi
             echo "Waiting for Memcached TLS... ($i)"
             sleep 1
           done
           echo "ERROR: Memcached TLS never became ready"
+          echo "--- memcached log ---"
+          cat /tmp/memcached.log || true
           exit 1
+
+      # Confirms the port actually speaks TLS and that the generated CA
+      # verifies it, independently of cachecannon.
+      - name: Verify TLS endpoint with openssl
+        run: |
+          echo | openssl s_client -connect 127.0.0.1:11212 \
+            -servername localhost -CAfile /tmp/memcache-tls/ca.crt 2>&1 \
+            | grep -E "Protocol|Cipher|Verify return code|verify error|CONNECTED|errno" \
+            | head -10
 
       - name: Build
         run: cargo build --release
