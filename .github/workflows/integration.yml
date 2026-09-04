@@ -325,7 +325,13 @@ jobs:
             echo "DIAGNOSE: no-verify FAILED"
           fi
 
-      - name: Run benchmark against Memcache TLS
+      # Target-scoped directive: main.rs adds a global INFO directive after
+      # reading RUST_LOG, so a bare `debug` is overridden and handshake
+      # failures (logged at debug) never appear.
+      - name: Diagnose - verifying run with debug logging
         env:
-          RUST_LOG: debug
+          RUST_LOG: cachecannon=debug,ringline=debug
+        run: ./target/release/cachecannon config/memcache-tls-ci.toml 2>&1 | tail -40 || true
+
+      - name: Run benchmark against Memcache TLS
         run: ./target/release/cachecannon config/memcache-tls-ci.toml
