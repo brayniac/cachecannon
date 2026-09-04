@@ -83,6 +83,21 @@ pub struct Target {
     /// Set to false for self-signed certificates (e.g., CI testing).
     #[serde(default = "default_tls_verify")]
     pub tls_verify: bool,
+    /// PEM file of CA certificates used to verify the server. When set it
+    /// *replaces* the public root store rather than adding to it, so only
+    /// these CAs are trusted. Needed for a server whose certificate chains to
+    /// a private CA, which the public roots cannot verify.
+    #[serde(default)]
+    pub tls_ca_file: Option<PathBuf>,
+    /// PEM client certificate chain, presented for mutual TLS. Required by
+    /// servers that verify client certificates. Must be set together with
+    /// `tls_key_file`.
+    #[serde(default)]
+    pub tls_cert_file: Option<PathBuf>,
+    /// PEM private key matching `tls_cert_file`. Must be unencrypted; rustls
+    /// cannot read password-protected keys.
+    #[serde(default)]
+    pub tls_key_file: Option<PathBuf>,
     /// Enable Valkey/Redis Cluster mode: discover topology via CLUSTER SLOTS
     /// and route by hash slot instead of ketama consistent hashing.
     #[serde(default)]
@@ -520,6 +535,38 @@ impl Config {
 
         if self.general.threads == 0 {
             return Err(ConfigError::Validation("threads must be >= 1".to_string()));
+        }
+
+        // A client certificate is useless without its key and vice versa, and
+        // rustls takes them as a pair. Catch a half-configured client identity
+        // rather than at connect time, where it would surface as a handshake
+        // failure against every endpoint.
+        match (&self.target.tls_cert_file, &self.target.tls_key_file) {
+            (Some(_), None) => {
+                return Err(ConfigError::Validation(
+                    "tls_cert_file requires tls_key_file (the client key for mutual TLS)"
+                        .to_string(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(ConfigError::Validation(
+                    "tls_key_file requires tls_cert_file (the client certificate chain)"
+                        .to_string(),
+                ));
+            }
+            _ => {}
+        }
+
+        // Certificate options only take effect on a TLS connection. Silently
+        // ignoring them would look like the CA file was honored.
+        if !self.target.tls
+            && (self.target.tls_ca_file.is_some()
+                || self.target.tls_cert_file.is_some()
+                || self.target.tls_key_file.is_some())
+        {
+            return Err(ConfigError::Validation(
+                "tls_ca_file / tls_cert_file / tls_key_file require tls = true".to_string(),
+            ));
         }
 
         if self.connection.total_connections() == 0 {
@@ -1036,5 +1083,73 @@ mod color_mode_serde {
     {
         let s = String::deserialize(deserializer)?;
         s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tls_config_tests {
+    use super::Config;
+
+    /// Minimal valid document; individual tests append `[target]` keys.
+    fn config_with_target(extra: &str) -> Result<Config, super::ConfigError> {
+        let doc = format!(
+            r#"
+[target]
+endpoints = ["127.0.0.1:11211"]
+{extra}
+
+[connection]
+connections = 1
+"#
+        );
+        let config: Config = toml::from_str(&doc).expect("test config should parse");
+        config.validate().map(|()| config)
+    }
+
+    #[test]
+    fn client_cert_without_key_is_rejected() {
+        let err = config_with_target("tls = true\ntls_cert_file = \"client.crt\"")
+            .expect_err("a client cert without its key must not validate");
+        assert!(
+            format!("{err:?}").contains("tls_key_file"),
+            "error should name the missing option: {err:?}"
+        );
+    }
+
+    #[test]
+    fn client_key_without_cert_is_rejected() {
+        let err = config_with_target("tls = true\ntls_key_file = \"client.key\"")
+            .expect_err("a client key without its cert must not validate");
+        assert!(
+            format!("{err:?}").contains("tls_cert_file"),
+            "error should name the missing option: {err:?}"
+        );
+    }
+
+    #[test]
+    fn cert_options_without_tls_are_rejected() {
+        // Silently ignoring these would look like the CA file was honored.
+        let err = config_with_target("tls_ca_file = \"ca.pem\"")
+            .expect_err("cert options without tls = true must not validate");
+        assert!(
+            format!("{err:?}").contains("tls = true"),
+            "error should say TLS must be enabled: {err:?}"
+        );
+    }
+
+    #[test]
+    fn matched_cert_and_key_with_tls_validates() {
+        config_with_target(
+            "tls = true\ntls_ca_file = \"ca.pem\"\ntls_cert_file = \"c.crt\"\ntls_key_file = \"c.key\"",
+        )
+        .expect("a complete client-auth config should validate");
+    }
+
+    #[test]
+    fn tls_options_remain_optional() {
+        let config = config_with_target("").expect("plain config should validate");
+        assert!(config.target.tls_ca_file.is_none());
+        assert!(config.target.tls_cert_file.is_none());
+        assert!(config.target.tls_key_file.is_none());
     }
 }

@@ -43,12 +43,27 @@ endpoints = ["127.0.0.1:6379"]
 # "resp" - Valkey/Redis RESP2 protocol
 # "resp3" - Valkey/Redis RESP3 protocol
 # "memcache" - Memcache ASCII protocol
-# "memcache_binary" - Memcache binary protocol
+# "memcache-binary" - Memcache binary protocol
 # "ping" - Simple PING/PONG
 protocol = "resp"
 
 # Enable TLS encryption
 tls = false
+
+# Explicit SNI hostname (endpoint IP is used when unset)
+# tls_hostname = "cache.example.com"
+
+# Verify the server certificate. Default true.
+# tls_verify = true
+
+# PEM CA bundle used to verify the server. Replaces the public root store
+# rather than adding to it, so only these CAs are trusted.
+# tls_ca_file = "ca.pem"
+
+# PEM client certificate chain and its unencrypted private key, for servers
+# that require mutual TLS. Both must be set together.
+# tls_cert_file = "client.crt"
+# tls_key_file = "client.key"
 
 # Enable Valkey/Redis Cluster mode (see guide.md for details)
 cluster = false
@@ -288,7 +303,7 @@ Supported commands:
 - `get key` — Retrieve value (supports multi-get)
 - `set key flags exptime bytes\r\nvalue` — Store value
 
-ASCII protocol by default. Use `protocol = "memcache_binary"` for binary protocol.
+ASCII protocol by default. Use `protocol = "memcache-binary"` for binary protocol.
 
 ### Ping
 

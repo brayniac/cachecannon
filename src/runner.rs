@@ -225,20 +225,7 @@ pub fn run_benchmark_full(
     // protocol framing data, so the default 16KB slot size is sufficient.
     let needs_tls = config.target.tls;
     let tls_client = if needs_tls {
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-        let tls_config = if config.target.tls_verify {
-            rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth()
-        } else {
-            rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(std::sync::Arc::new(NoCertificateVerification))
-                .with_no_client_auth()
-        };
-
+        let tls_config = build_tls_client_config(&config.target)?;
         Some(ringline::TlsClientConfig::new(std::sync::Arc::new(
             tls_config,
         )))
@@ -910,6 +897,92 @@ fn max_from_histogram(hist: &Histogram) -> f64 {
     0.0
 }
 
+/// Build the rustls client config from the target's TLS settings.
+///
+/// Two independent axes:
+///
+/// * **Server trust** (`tls_ca_file`) — which CAs verify the server. An
+///   explicit CA file replaces the public roots rather than adding to them,
+///   so a private CA is trusted and the public ones are not. This is what
+///   `tls_verify = false` used to be the only workaround for, and unlike that
+///   flag it still authenticates the server.
+/// * **Client identity** (`tls_cert_file` + `tls_key_file`) — the certificate
+///   presented for mutual TLS. Applied on both verification paths, so a
+///   self-signed server and client auth can be used together.
+fn build_tls_client_config(
+    target: &crate::config::Target,
+) -> Result<rustls::ClientConfig, Box<dyn std::error::Error>> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let mut root_store = rustls::RootCertStore::empty();
+    if let Some(ca_path) = &target.tls_ca_file {
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(ca_path)
+            .map_err(|e| format!("tls_ca_file {}: {e}", ca_path.display()))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("tls_ca_file {}: {e}", ca_path.display()))?;
+
+        // A CA file that parses but yields nothing would silently leave an
+        // empty root store, failing every handshake with an opaque error.
+        if certs.is_empty() {
+            return Err(
+                format!("tls_ca_file {} contains no certificates", ca_path.display()).into(),
+            );
+        }
+        let (added, ignored) = root_store.add_parsable_certificates(certs);
+        if added == 0 {
+            return Err(format!(
+                "tls_ca_file {} contains no usable CA certificates ({ignored} rejected)",
+                ca_path.display()
+            )
+            .into());
+        }
+        if ignored > 0 {
+            tracing::warn!(
+                "tls_ca_file {}: {ignored} certificate(s) rejected, {added} loaded",
+                ca_path.display()
+            );
+        }
+    } else {
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+
+    let builder = if target.tls_verify {
+        rustls::ClientConfig::builder().with_root_certificates(root_store)
+    } else {
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(NoCertificateVerification))
+    };
+
+    let tls_config = match (&target.tls_cert_file, &target.tls_key_file) {
+        (Some(cert_path), Some(key_path)) => {
+            let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
+                .map_err(|e| format!("tls_cert_file {}: {e}", cert_path.display()))?
+                .collect::<Result<_, _>>()
+                .map_err(|e| format!("tls_cert_file {}: {e}", cert_path.display()))?;
+            if chain.is_empty() {
+                return Err(format!(
+                    "tls_cert_file {} contains no certificates",
+                    cert_path.display()
+                )
+                .into());
+            }
+            // rustls cannot read password-protected keys; an encrypted PEM
+            // fails here rather than at handshake time.
+            let key = PrivateKeyDer::from_pem_file(key_path)
+                .map_err(|e| format!("tls_key_file {}: {e}", key_path.display()))?;
+            builder
+                .with_client_auth_cert(chain, key)
+                .map_err(|e| format!("client certificate rejected: {e}"))?
+        }
+        // Half-configured pairs are rejected by config validation.
+        _ => builder.with_no_client_auth(),
+    };
+
+    Ok(tls_config)
+}
+
 /// No-op certificate verifier for `tls_verify = false` (e.g., self-signed certs in CI).
 #[derive(Debug)]
 struct NoCertificateVerification;
@@ -1018,5 +1091,136 @@ mod tests {
     fn absurd_connection_counts_stay_within_ringline_limits() {
         // ringline rejects >= 1 << 31 at config validation.
         assert!((standalone_task_capacity(usize::MAX, 1) as u64) < (1 << 31));
+    }
+}
+
+#[cfg(test)]
+mod tls_tests {
+    use super::build_tls_client_config;
+    use crate::config::{Protocol, Target};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn target() -> Target {
+        Target {
+            endpoints: vec!["127.0.0.1:11211".parse().unwrap()],
+            protocol: Protocol::Memcache,
+            tls: true,
+            tls_hostname: None,
+            tls_verify: true,
+            tls_ca_file: None,
+            tls_cert_file: None,
+            tls_key_file: None,
+            cluster: false,
+        }
+    }
+
+    fn tmpdir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cc-tls-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// Generate a self-signed cert+key with openssl. Returns None when openssl
+    /// is unavailable, so the suite still runs on a machine without it.
+    fn gen_cert(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+        let crt = dir.join("c.crt");
+        let key = dir.join("c.key");
+        let out = Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-sha256",
+                "-days",
+                "3650",
+                "-nodes",
+                "-keyout",
+                key.to_str()?,
+                "-out",
+                crt.to_str()?,
+                "-subj",
+                "/CN=cachecannon-test",
+                "-addext",
+                "subjectAltName=DNS:localhost,IP:127.0.0.1",
+            ])
+            .output()
+            .ok()?;
+        out.status.success().then_some((crt, key))
+    }
+
+    #[test]
+    fn no_cert_options_uses_public_roots() {
+        build_tls_client_config(&target()).expect("plain TLS config should build");
+    }
+
+    #[test]
+    fn missing_ca_file_errors_with_the_path() {
+        let dir = tmpdir("missing-ca");
+        let mut t = target();
+        t.tls_ca_file = Some(dir.join("does-not-exist.pem"));
+        let err = build_tls_client_config(&t).expect_err("a missing CA file must not be ignored");
+        assert!(
+            err.to_string().contains("does-not-exist.pem"),
+            "error should name the file: {err}"
+        );
+    }
+
+    #[test]
+    fn ca_file_without_certificates_is_rejected() {
+        // An empty/garbage CA file would otherwise leave an empty root
+        // store and fail every handshake with an opaque error.
+        let dir = tmpdir("empty-ca");
+        let ca = dir.join("empty.pem");
+        std::fs::write(&ca, b"not a certificate\n").unwrap();
+        let mut t = target();
+        t.tls_ca_file = Some(ca);
+        build_tls_client_config(&t).expect_err("a CA file with no certs must not build");
+    }
+
+    #[test]
+    fn private_ca_is_accepted_as_a_root() {
+        let dir = tmpdir("ca");
+        let Some((crt, _key)) = gen_cert(&dir) else {
+            return; // openssl unavailable
+        };
+        let mut t = target();
+        t.tls_ca_file = Some(crt);
+        build_tls_client_config(&t).expect("a private CA should load as a trust root");
+    }
+
+    #[test]
+    fn client_certificate_is_accepted_for_mutual_tls() {
+        let dir = tmpdir("mtls");
+        let Some((crt, key)) = gen_cert(&dir) else {
+            return;
+        };
+        let mut t = target();
+        t.tls_cert_file = Some(crt.clone());
+        t.tls_key_file = Some(key.clone());
+        build_tls_client_config(&t).expect("a client certificate should build");
+
+        // Client auth must also apply on the unverified-server path, so a
+        // self-signed server and client auth can be used together.
+        t.tls_verify = false;
+        build_tls_client_config(&t).expect("client auth should apply with tls_verify = false");
+    }
+
+    #[test]
+    fn missing_client_key_file_errors_with_the_path() {
+        let dir = tmpdir("mtls-nokey");
+        let Some((crt, _key)) = gen_cert(&dir) else {
+            return;
+        };
+        let mut t = target();
+        t.tls_cert_file = Some(crt);
+        t.tls_key_file = Some(dir.join("absent.key"));
+        let err = build_tls_client_config(&t).expect_err("a missing client key must error");
+        assert!(
+            err.to_string().contains("absent.key"),
+            "error should name the file: {err}"
+        );
     }
 }
