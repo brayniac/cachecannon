@@ -326,4 +326,6 @@ jobs:
           fi
 
       - name: Run benchmark against Memcache TLS
+        env:
+          RUST_LOG: debug
         run: ./target/release/cachecannon config/memcache-tls-ci.toml
