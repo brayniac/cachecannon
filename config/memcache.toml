@@ -9,7 +9,7 @@ threads = 4  # Number of worker threads
 [target]
 endpoints = ["127.0.0.1:11211"]
 protocol = "memcache"         # Memcache ASCII protocol
-# protocol = "memcache_binary" # Alternative: Memcache binary protocol
+# protocol = "memcache-binary" # Alternative: Memcache binary protocol
 
 [connection]
 connections = 16     # Total number of connections (distributed across threads)
