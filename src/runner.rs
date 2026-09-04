@@ -73,6 +73,13 @@ pub fn run_benchmark_full(
     formatter: Box<dyn OutputFormatter>,
     running: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Fix the key format (hex vs UUID) before any key is generated, so the
+    // key writer sees the configured format for the whole run.
+    crate::worker::KEY_FORMAT.store(
+        config.workload.keyspace.format as u8,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
     // Cluster mode: discover topology and replace endpoints with primaries
     let slot_table = if config.target.cluster {
         match config.target.protocol {

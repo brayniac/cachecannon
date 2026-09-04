@@ -327,6 +327,9 @@ pub struct Keyspace {
     pub count: usize,
     #[serde(default)]
     pub distribution: Distribution,
+    /// How key ids are rendered into key bytes (`hex` default, or `uuid`).
+    #[serde(default)]
+    pub format: KeyFormat,
 }
 
 impl Default for Keyspace {
@@ -335,6 +338,7 @@ impl Default for Keyspace {
             length: default_key_length(),
             count: default_key_count(),
             distribution: Distribution::default(),
+            format: KeyFormat::default(),
         }
     }
 }
@@ -353,6 +357,32 @@ pub enum Distribution {
     #[default]
     Uniform,
     Zipf,
+}
+
+/// How a key id is rendered into the on-wire key bytes.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+#[repr(u8)]
+pub enum KeyFormat {
+    /// Right-aligned lowercase hex of the id, zero-padded to `length` (default,
+    /// the historical behavior).
+    #[default]
+    Hex = 0,
+    /// Canonical 8-4-4-4-12 dashed UUID derived from the id. Requires
+    /// `length = 36`. Needed by servers that key by UUID and drop the
+    /// connection on a non-UUID key.
+    Uuid = 1,
+}
+
+impl KeyFormat {
+    /// Recover a `KeyFormat` from its `repr(u8)` discriminant (for the
+    /// run-scoped atomic that carries it to `write_key`).
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => KeyFormat::Uuid,
+            _ => KeyFormat::Hex,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -501,6 +531,12 @@ impl Config {
         if self.workload.values.length == 0 {
             return Err(ConfigError::Validation(
                 "workload.values.length must be >= 1".to_string(),
+            ));
+        }
+
+        if self.workload.keyspace.format == KeyFormat::Uuid && self.workload.keyspace.length != 36 {
+            return Err(ConfigError::Validation(
+                "keyspace.format = uuid requires keyspace.length = 36".to_string(),
             ));
         }
 
@@ -698,6 +734,36 @@ mod validation_tests {
         )
         .expect("memcache-binary config should be valid");
         assert_eq!(cfg.target.protocol, Protocol::MemcacheBinary);
+    }
+
+    #[test]
+    fn accepts_uuid_keyspace() {
+        let cfg = parse_config(
+            r#"
+            [target]
+            endpoints = ["127.0.0.1:11211"]
+            [workload.keyspace]
+            length = 36
+            format = "uuid"
+            "#,
+        )
+        .expect("uuid keyspace with length 36 should be valid");
+        assert_eq!(cfg.workload.keyspace.format, KeyFormat::Uuid);
+    }
+
+    #[test]
+    fn rejects_uuid_keyspace_wrong_length() {
+        let err = parse_config(
+            r#"
+            [target]
+            endpoints = ["127.0.0.1:11211"]
+            [workload.keyspace]
+            length = 16
+            format = "uuid"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("length = 36"));
     }
 
     #[test]

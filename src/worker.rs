@@ -2135,8 +2135,31 @@ pub(crate) fn build_endpoint_keys(
 }
 
 /// Write a numeric key ID into the buffer as hex.
+/// Run-scoped key rendering format (0 = hex, 1 = uuid), set from config in
+/// `run_benchmark_full` before any key is generated. See `config::KeyFormat`.
+pub(crate) static KEY_FORMAT: AtomicU8 = AtomicU8::new(0);
+
 fn write_key(buf: &mut [u8], id: usize) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
+    // Canonical UUID form: 8-4-4-4-12 hex with dashes at indices 8/13/18/23.
+    // A typical UUID parser accepts any hex in those positions, and the trailing
+    // hex chars stay hex, so servers that shard their directories by the key's
+    // last hex chars spread keys evenly across them.
+    if crate::config::KeyFormat::from_u8(KEY_FORMAT.load(Ordering::Relaxed))
+        == crate::config::KeyFormat::Uuid
+        && buf.len() == 36
+    {
+        let mut n = id as u128;
+        for (i, byte) in buf.iter_mut().enumerate().rev() {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                *byte = b'-';
+            } else {
+                *byte = HEX[(n & 0xf) as usize];
+                n >>= 4;
+            }
+        }
+        return;
+    }
     let mut n = id;
     for byte in buf.iter_mut().rev() {
         *byte = HEX[n & 0xf];
