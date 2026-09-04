@@ -647,7 +647,11 @@ fn spawn_protocol_tasks(
         let state = Arc::clone(worker_state);
         let session_seed = 42 + worker_id as u64 * 10000 + i as u64;
 
-        let _ = ringline::spawn(async move {
+        // A failed spawn means this connection never exists. Discarding the
+        // error made an over-capacity run look like a clean success with fewer
+        // connections than requested, so count and log it: the report shows
+        // them as failed rather than silently missing.
+        if let Err(e) = ringline::spawn(async move {
             match protocol {
                 CacheProtocol::Resp | CacheProtocol::Resp3 => {
                     resp_connection_task(state, endpoint_idx, session_seed).await;
@@ -659,7 +663,14 @@ fn spawn_protocol_tasks(
                     ping_connection_task(state, endpoint_idx, session_seed).await;
                 }
             }
-        });
+        }) {
+            tracing::error!(
+                worker = worker_id,
+                conn = global_conn_idx,
+                "failed to spawn connection task: {e}"
+            );
+            metrics::CONNECTIONS_FAILED.increment();
+        }
     }
 }
 
