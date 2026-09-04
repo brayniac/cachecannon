@@ -177,3 +177,124 @@ jobs:
 
       - name: Run benchmark against Valkey TLS
         run: ./target/release/cachecannon config/valkey-tls-ci.toml
+
+  memcache:
+    name: Memcache
+    runs-on: ubuntu-latest
+    services:
+      memcached:
+        image: memcached:latest
+        ports:
+          - 11211:11211
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # memcached ships no CLI to health-check with, so probe the mapped port
+      # from the runner instead of using a container health-cmd.
+      - name: Wait for Memcached
+        run: |
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/11211) 2>/dev/null; then
+              echo "Memcached is ready"
+              exit 0
+            fi
+            echo "Waiting for Memcached... ($i)"
+            sleep 1
+          done
+          echo "ERROR: Memcached never became ready"
+          exit 1
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Run benchmark against Memcache
+        run: ./target/release/cachecannon config/memcache-ci.toml
+
+  memcache-binary:
+    name: Memcache (binary)
+    runs-on: ubuntu-latest
+    services:
+      memcached:
+        image: memcached:latest
+        ports:
+          - 11211:11211
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Wait for Memcached
+        run: |
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/11211) 2>/dev/null; then
+              echo "Memcached is ready"
+              exit 0
+            fi
+            echo "Waiting for Memcached... ($i)"
+            sleep 1
+          done
+          echo "ERROR: Memcached never became ready"
+          exit 1
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Run benchmark against Memcache (binary protocol)
+        run: ./target/release/cachecannon config/memcache-binary-ci.toml
+
+  memcache-tls:
+    name: Memcache TLS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Ubuntu's memcached package is built without TLS, so build from source.
+      - name: Build memcached with TLS support
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libevent-dev libssl-dev pkg-config
+          curl -fsSL https://memcached.org/latest -o /tmp/memcached.tar.gz
+          mkdir -p /tmp/memcached-src
+          tar xzf /tmp/memcached.tar.gz -C /tmp/memcached-src --strip-components=1
+          cd /tmp/memcached-src
+          ./configure --enable-tls
+          make -j"$(nproc)"
+          ./memcached --version
+
+      - name: Generate TLS certificates
+        run: |
+          mkdir -p /tmp/memcache-tls
+          openssl req -x509 -newkey rsa:4096 -sha256 -days 1 \
+            -nodes -keyout /tmp/memcache-tls/memcached.key \
+            -out /tmp/memcache-tls/memcached.crt \
+            -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+          # The server certificate is self-signed, so it is its own CA. The
+          # benchmark verifies against this rather than skipping verification.
+          cp /tmp/memcache-tls/memcached.crt /tmp/memcache-tls/ca.crt
+
+      - name: Start memcached with TLS
+        run: |
+          /tmp/memcached-src/memcached -d -Z -p 11212 \
+            -o ssl_chain_cert=/tmp/memcache-tls/memcached.crt,ssl_key=/tmp/memcache-tls/memcached.key
+
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/11212) 2>/dev/null; then
+              echo "Memcached TLS is ready"
+              exit 0
+            fi
+            echo "Waiting for Memcached TLS... ($i)"
+            sleep 1
+          done
+          echo "ERROR: Memcached TLS never became ready"
+          exit 1
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Run benchmark against Memcache TLS
+        run: ./target/release/cachecannon config/memcache-tls-ci.toml
