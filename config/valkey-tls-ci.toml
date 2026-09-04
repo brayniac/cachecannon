@@ -9,7 +9,9 @@ threads = 2
 endpoints = ["127.0.0.1:6380"]
 protocol = "resp"
 tls = true
-tls_verify = false
+tls_hostname = "localhost"
+# Verify against the CA the job generates, rather than skipping verification.
+tls_ca_file = "/tmp/valkey-tls/ca.crt"
 
 [connection]
 connections = 4

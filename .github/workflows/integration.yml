@@ -138,13 +138,32 @@ jobs:
             sudo apt-get update && sudo apt-get install -y valkey-server
           }
 
+          # A CA signing a separate server certificate, rather than one
+          # self-signed certificate used as both. `openssl req -x509` defaults
+          # to basicConstraints CA:TRUE and -addext only *adds* to those
+          # defaults, so a certificate made that way is a CA — and presenting a
+          # CA as the server's leaf is rejected with CaUsedAsEndEntity once the
+          # client actually verifies rather than skipping verification.
           mkdir -p /tmp/valkey-tls
-          openssl req -x509 -newkey rsa:4096 -sha256 -days 1 \
-            -nodes -keyout /tmp/valkey-tls/valkey.key \
-            -out /tmp/valkey-tls/valkey.crt \
-            -subj "/CN=localhost" \
-            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
-          cp /tmp/valkey-tls/valkey.crt /tmp/valkey-tls/ca.crt
+          cd /tmp/valkey-tls
+
+          openssl req -x509 -newkey rsa:2048 -sha256 -days 1 -nodes \
+            -keyout ca.key -out ca.crt \
+            -subj "/CN=cachecannon-test-ca" \
+            -addext "basicConstraints=critical,CA:TRUE"
+
+          openssl req -newkey rsa:2048 -nodes \
+            -keyout valkey.key -out valkey.csr \
+            -subj "/CN=localhost"
+
+          printf 'subjectAltName = DNS:localhost,IP:127.0.0.1\nbasicConstraints = critical,CA:FALSE\n' > server.ext
+
+          openssl x509 -req -in valkey.csr -CA ca.crt -CAkey ca.key \
+            -CAcreateserial -out valkey.crt -days 1 -sha256 \
+            -extfile server.ext
+
+          echo "--- server certificate ---"
+          openssl x509 -in valkey.crt -noout -subject -issuer -ext subjectAltName,basicConstraints
 
       - name: Start Valkey with TLS
         run: |
