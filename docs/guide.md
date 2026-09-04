@@ -358,9 +358,48 @@ protocol = "resp"
 tls = true
 ```
 
-Cachecannon uses the system's trusted CA certificates (via `webpki-roots`) to verify the server. Self-signed certificates are not supported — the server must present a certificate signed by a publicly trusted CA, or you must ensure your system's trust store includes the CA.
+By default cachecannon verifies the server against the public CA roots (via `webpki-roots`).
 
-TLS works with all protocols (RESP, Memcache, Ping) and with cluster mode. It adds some latency overhead from the TLS handshake and encryption, so enable it when your server requires it rather than for local benchmarking.
+### Private CAs and mutual TLS
+
+A server whose certificate chains to a private CA, or that requires a client
+certificate, needs the certificate options:
+
+```toml
+[target]
+endpoints = ["cache.internal:11212"]
+protocol = "memcache-binary"
+tls = true
+
+# CA certificates that verify the server.
+tls_ca_file = "ca.pem"
+
+# Client certificate presented for mutual TLS.
+tls_cert_file = "client.crt"
+tls_key_file  = "client.key"
+```
+
+All three are PEM. `tls_ca_file` **replaces** the public roots rather than
+adding to them: when set, only those CAs are trusted. `tls_cert_file` and
+`tls_key_file` must be set together, and the key must be unencrypted — rustls
+cannot read password-protected keys.
+
+`tls_verify = false` skips server verification entirely. It is for self-signed
+certificates in local testing; prefer `tls_ca_file`, which still authenticates
+the server. Client certificates work with either setting.
+
+Two rustls requirements are worth checking before debugging a failed
+handshake:
+
+- **The server certificate must carry `subjectAltName`.** rustls has no
+  fallback to the Common Name, so a CN-only certificate fails with
+  `NotValidForName` regardless of the CA configuration; the fix is reissuing it
+  with a SAN. Check with
+  `openssl x509 -in server.crt -text -noout | grep -A1 "Subject Alternative Name"`.
+- **Only TLS 1.2/1.3 with modern cipher suites** — no RSA key exchange, no
+  3DES or CBC-SHA1. An older server may have nothing to negotiate.
+
+TLS works with all protocols (RESP, Memcache, Ping) and with cluster mode. It adds some latency overhead from the TLS handshake and encryption, so enable it when your server requires it rather than for local benchmarking. On memcache SET, TLS also costs the zero-copy value path: encryption has to copy, so `SendGuard` no longer avoids a copy.
 
 ## Memcache Protocol Selection
 
@@ -369,12 +408,12 @@ Cachecannon supports both Memcache protocol variants:
 ```toml
 [target]
 protocol = "memcache"         # ASCII text protocol (default)
-# protocol = "memcache_binary" # Binary protocol
+# protocol = "memcache-binary" # Binary protocol
 ```
 
 **ASCII protocol** (`memcache`) is the original text-based protocol. It's human-readable, widely supported, and the default for most Memcache deployments.
 
-**Binary protocol** (`memcache_binary`) is a more compact binary encoding. It has slightly lower parsing overhead and is used by some high-performance deployments, but not all servers support it.
+**Binary protocol** (`memcache-binary`) is a more compact binary encoding. It has slightly lower parsing overhead and is used by some high-performance deployments, but not all servers support it.
 
 Use ASCII unless your server specifically requires or benefits from the binary protocol.
 
