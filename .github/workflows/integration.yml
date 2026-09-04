@@ -265,17 +265,33 @@ jobs:
           make -j"$(nproc)"
           ./memcached --version
 
+      # A CA certificate signing a separate server certificate, rather than one
+      # self-signed certificate used as both. `openssl req -x509` defaults to
+      # basicConstraints CA:TRUE and -addext only *adds* to those defaults, so
+      # a self-signed cert made that way is a CA — and presenting a CA as the
+      # server's leaf is rejected with CaUsedAsEndEntity.
       - name: Generate TLS certificates
         run: |
           mkdir -p /tmp/memcache-tls
-          openssl req -x509 -newkey rsa:4096 -sha256 -days 1 \
-            -nodes -keyout /tmp/memcache-tls/memcached.key \
-            -out /tmp/memcache-tls/memcached.crt \
-            -subj "/CN=localhost" \
-            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
-          # The server certificate is self-signed, so it is its own CA. The
-          # benchmark verifies against this rather than skipping verification.
-          cp /tmp/memcache-tls/memcached.crt /tmp/memcache-tls/ca.crt
+          cd /tmp/memcache-tls
+
+          openssl req -x509 -newkey rsa:2048 -sha256 -days 1 -nodes \
+            -keyout ca.key -out ca.crt \
+            -subj "/CN=cachecannon-test-ca" \
+            -addext "basicConstraints=critical,CA:TRUE"
+
+          openssl req -newkey rsa:2048 -nodes \
+            -keyout memcached.key -out memcached.csr \
+            -subj "/CN=localhost"
+
+          printf 'subjectAltName = DNS:localhost,IP:127.0.0.1\nbasicConstraints = critical,CA:FALSE\n' > server.ext
+
+          openssl x509 -req -in memcached.csr -CA ca.crt -CAkey ca.key \
+            -CAcreateserial -out memcached.crt -days 1 -sha256 \
+            -extfile server.ext
+
+          echo "--- server certificate ---"
+          openssl x509 -in memcached.crt -noout -subject -issuer -ext subjectAltName,basicConstraints
 
       # Not daemonized: -d discards memcached's own diagnostics, which is
       # exactly what is needed when TLS setup fails.
@@ -311,27 +327,6 @@ jobs:
 
       - name: Build
         run: cargo build --release
-
-      # Splits "memcached + our TLS client" from "certificate verification":
-      # the Valkey TLS job passes with tls_verify = false, so if this passes
-      # and the verifying run below fails, the fault is in verification.
-      - name: Diagnose - TLS without certificate verification
-        run: |
-          sed 's|^tls_ca_file = .*|tls_verify = false|' config/memcache-tls-ci.toml > /tmp/noverify.toml
-          echo "--- config ---"; grep -E "^tls|^protocol|^endpoints" /tmp/noverify.toml
-          if ./target/release/cachecannon /tmp/noverify.toml; then
-            echo "DIAGNOSE: no-verify PASSED"
-          else
-            echo "DIAGNOSE: no-verify FAILED"
-          fi
-
-      # Target-scoped directive: main.rs adds a global INFO directive after
-      # reading RUST_LOG, so a bare `debug` is overridden and handshake
-      # failures (logged at debug) never appear.
-      - name: Diagnose - verifying run with debug logging
-        env:
-          RUST_LOG: cachecannon=debug,ringline=debug
-        run: ./target/release/cachecannon config/memcache-tls-ci.toml 2>&1 | tail -40 || true
 
       - name: Run benchmark against Memcache TLS
         run: ./target/release/cachecannon config/memcache-tls-ci.toml
