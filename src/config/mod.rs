@@ -488,12 +488,6 @@ impl Config {
             ));
         }
 
-        if self.target.protocol == Protocol::MemcacheBinary {
-            return Err(ConfigError::Validation(
-                "memcache-binary protocol is not yet implemented".to_string(),
-            ));
-        }
-
         if self.general.threads == 0 {
             return Err(ConfigError::Validation("threads must be >= 1".to_string()));
         }
@@ -692,16 +686,18 @@ mod validation_tests {
     }
 
     #[test]
-    fn rejects_memcache_binary() {
-        let err = parse_config(
+    fn accepts_memcache_binary() {
+        // memcache-binary is a supported protocol (driven via ringline-memcache's
+        // BinaryClient), so it must parse and validate like the other protocols.
+        let cfg = parse_config(
             r#"
             [target]
             endpoints = ["127.0.0.1:11211"]
             protocol = "memcache-binary"
             "#,
         )
-        .unwrap_err();
-        assert!(err.to_string().contains("memcache-binary"));
+        .expect("memcache-binary config should be valid");
+        assert_eq!(cfg.target.protocol, Protocol::MemcacheBinary);
     }
 
     #[test]
