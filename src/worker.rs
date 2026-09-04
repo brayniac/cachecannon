@@ -460,9 +460,7 @@ impl AsyncEventHandler for BenchHandler {
                     spawn_protocol_tasks(&worker_state, my_connections, worker_id);
                 }
                 CacheProtocol::MemcacheBinary => {
-                    tracing::error!(
-                        "MemcacheBinary protocol is not supported; use Memcache (ASCII) instead"
-                    );
+                    spawn_protocol_tasks(&worker_state, my_connections, worker_id);
                 }
             }
             worker_state.task_state.shared.mark_worker_started();
@@ -654,13 +652,12 @@ fn spawn_protocol_tasks(
                 CacheProtocol::Resp | CacheProtocol::Resp3 => {
                     resp_connection_task(state, endpoint_idx, session_seed).await;
                 }
-                CacheProtocol::Memcache => {
+                CacheProtocol::Memcache | CacheProtocol::MemcacheBinary => {
                     memcache_connection_task(state, endpoint_idx, session_seed).await;
                 }
                 CacheProtocol::Ping => {
                     ping_connection_task(state, endpoint_idx, session_seed).await;
                 }
-                _ => unreachable!(),
             }
         });
     }
@@ -1315,7 +1312,65 @@ fn check_resp_redirect_parsed(redirect: &resp_proto::Redirect, state: &Arc<Share
 
 // ── Memcache connection task ─────────────────────────────────────────────
 
-/// A single Memcache (ASCII) connection task.
+/// The two ringline-memcache client flavors behind one type, so a single drive
+/// loop serves both the ASCII and binary protocols. `Client` and `BinaryClient`
+/// expose the same fire/recv pipelining surface (only the ASCII client adds the
+/// high-level request API and `version()`), so each method here just forwards.
+enum McClient {
+    Ascii(ringline_memcache::Client),
+    Binary(ringline_memcache::BinaryClient),
+}
+
+impl McClient {
+    #[inline]
+    fn pending_count(&self) -> usize {
+        match self {
+            McClient::Ascii(c) => c.pending_count(),
+            McClient::Binary(c) => c.pending_count(),
+        }
+    }
+
+    #[inline]
+    fn fire_get(&mut self, key: &[u8], user_data: u64) -> Result<(), ringline_memcache::Error> {
+        match self {
+            McClient::Ascii(c) => c.fire_get(key, user_data),
+            McClient::Binary(c) => c.fire_get(key, user_data),
+        }
+    }
+
+    #[inline]
+    fn fire_set_with_guard<G: SendGuard>(
+        &mut self,
+        key: &[u8],
+        guard: G,
+        flags: u32,
+        exptime: u32,
+        user_data: u64,
+    ) -> Result<(), ringline_memcache::Error> {
+        match self {
+            McClient::Ascii(c) => c.fire_set_with_guard(key, guard, flags, exptime, user_data),
+            McClient::Binary(c) => c.fire_set_with_guard(key, guard, flags, exptime, user_data),
+        }
+    }
+
+    #[inline]
+    fn fire_delete(&mut self, key: &[u8], user_data: u64) -> Result<(), ringline_memcache::Error> {
+        match self {
+            McClient::Ascii(c) => c.fire_delete(key, user_data),
+            McClient::Binary(c) => c.fire_delete(key, user_data),
+        }
+    }
+
+    #[inline]
+    async fn recv(&mut self) -> Result<ringline_memcache::CompletedOp, ringline_memcache::Error> {
+        match self {
+            McClient::Ascii(c) => c.recv().await,
+            McClient::Binary(c) => c.recv().await,
+        }
+    }
+}
+
+/// A single Memcache connection task (ASCII or binary, per protocol).
 async fn memcache_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: usize, seed: u64) {
     let endpoint = state.task_state.endpoints[endpoint_idx];
     let config = &state.task_state.config;
@@ -1348,7 +1403,12 @@ async fn memcache_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: u
         #[cfg(target_os = "linux")]
         let builder =
             builder.kernel_timestamps(matches!(config.timestamps.mode, TimestampMode::Software));
-        let mut client = builder.build();
+        let binary = matches!(config.target.protocol, CacheProtocol::MemcacheBinary);
+        let mut client = if binary {
+            McClient::Binary(builder.build_binary())
+        } else {
+            McClient::Ascii(builder.build())
+        };
 
         tracing::debug!(
             worker = state.task_state.worker_id,
@@ -1359,7 +1419,14 @@ async fn memcache_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: u
 
         // Precheck: send VERSION to verify connectivity
         if state.task_state.shared.phase() == Phase::Precheck && !state.is_precheck_done() {
-            match client.version().await {
+            let precheck = match &mut client {
+                McClient::Ascii(c) => c.version().await.map(|_| ()),
+                // The binary subset has no VERSION opcode (valcache drops the
+                // connection on it) and BinaryClient exposes no version(); a live
+                // connection is a sufficient precheck.
+                McClient::Binary(_) => Ok(()),
+            };
+            match precheck {
                 Ok(_version) => {
                     tracing::debug!(
                         worker = state.task_state.worker_id,
@@ -1416,7 +1483,7 @@ async fn memcache_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: u
 
 /// Drive the Memcache workload on a connected client using fire/recv pipelining.
 async fn drive_memcache_workload(
-    client: &mut ringline_memcache::Client,
+    client: &mut McClient,
     state: &Arc<SharedWorkerState>,
     endpoint_idx: usize,
     rng: &mut Xoshiro256PlusPlus,
