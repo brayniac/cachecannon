@@ -1067,9 +1067,8 @@ fn standalone_task_capacity(total_connections: usize, num_threads: usize) -> u32
 /// A sibling of the slab above: another per-worker ringline pool defaulting to
 /// 256 and sized independently of the workload. Connection tasks take a timer
 /// for request timeouts and for retry sleeps, so the pool scales with
-/// connections — and unlike the task slab, exhausting it **panics** the worker:
-///
-///     timer slot pool exhausted (256 slots) — raise Config::timer_slots
+/// connections — and unlike the task slab, exhausting it **panics** the worker
+/// with `timer slot pool exhausted (256 slots) — raise Config::timer_slots`.
 ///
 /// Sizing only the task slab moved the ceiling from a silent cap at 2040
 /// connections to a hard abort at 4096, which is how this was found.
