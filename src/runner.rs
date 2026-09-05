@@ -233,12 +233,14 @@ pub fn run_benchmark_full(
         None
     };
 
-    let standalone_task_capacity =
-        standalone_task_capacity(config.connection.total_connections(), num_threads);
+    let total_conns = config.connection.total_connections();
+    let standalone_task_capacity = standalone_task_capacity(total_conns, num_threads);
+    let timer_slots = timer_slots(total_conns, num_threads);
 
     let mut ringline_builder = ringline::ConfigBuilder::new()
         .workers(num_threads)
         .standalone_task_capacity(standalone_task_capacity)
+        .timer_slots(timer_slots)
         .pin_to_core(false) // We pin in create_for_worker instead
         .core_offset(0)
         .tcp_nodelay(true);
@@ -1024,6 +1026,23 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
     }
 }
 
+/// Connections handled by the busiest worker.
+///
+/// Connections are split evenly across workers with the remainder spread one
+/// each, so ceiling division is the count the busiest worker sees.
+fn connections_per_worker(total_connections: usize, num_threads: usize) -> usize {
+    total_connections.div_ceil(num_threads.max(1))
+}
+
+/// ringline rejects per-worker pool sizes at or above `1 << 31`.
+const RINGLINE_POOL_MAX: usize = (1 << 31) - 1;
+/// ringline's own default for the pools sized here; the floor for small runs,
+/// so a small run never ends up with *less* headroom than the default.
+const RINGLINE_POOL_DEFAULT: usize = 256;
+/// Slack above the per-worker connection count, for pool users that are not
+/// 1:1 with connections.
+const POOL_HEADROOM: usize = 16;
+
 /// Standalone-task slab capacity to request from ringline, per worker.
 ///
 /// Every connection is a standalone task (`worker::spawn_connection_tasks`
@@ -1036,27 +1055,37 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
 ///
 /// Derived from the workload rather than set to a large constant, so the
 /// ceiling tracks the connection count instead of becoming a new silent cap at
-/// some higher number. Never drops below ringline's own 256 default, since a
-/// small run should not end up with *less* headroom than before.
+/// some higher number.
 fn standalone_task_capacity(total_connections: usize, num_threads: usize) -> u32 {
-    /// Slack for non-connection standalone tasks. Capacity 256 admitted 255
-    /// connections, so at least one slot is held elsewhere.
-    const HEADROOM: usize = 16;
-    /// ringline's own default; the floor for small runs.
-    const RINGLINE_DEFAULT: usize = 256;
-    /// ringline rejects `standalone_task_capacity >= 1 << 31`.
-    const RINGLINE_MAX: usize = (1 << 31) - 1;
+    connections_per_worker(total_connections, num_threads)
+        .saturating_add(POOL_HEADROOM)
+        .clamp(RINGLINE_POOL_DEFAULT, RINGLINE_POOL_MAX) as u32
+}
 
-    let per_worker = total_connections.div_ceil(num_threads.max(1));
-    let capacity = per_worker
-        .saturating_add(HEADROOM)
-        .clamp(RINGLINE_DEFAULT, RINGLINE_MAX);
-    capacity as u32
+/// Timer slot capacity to request from ringline, per worker.
+///
+/// A sibling of the slab above: another per-worker ringline pool defaulting to
+/// 256 and sized independently of the workload. Connection tasks take a timer
+/// for request timeouts and for retry sleeps, so the pool scales with
+/// connections — and unlike the task slab, exhausting it **panics** the worker
+/// with `timer slot pool exhausted (256 slots) — raise Config::timer_slots`.
+///
+/// Sizing only the task slab moved the ceiling from a silent cap at 2040
+/// connections to a hard abort at 4096, which is how this was found.
+///
+/// Allows two concurrent timers per connection. A connection can hold a request
+/// timeout and a retry sleep across its lifecycle, and timer slots are small
+/// enough that the margin costs nothing next to being one short.
+fn timer_slots(total_connections: usize, num_threads: usize) -> u32 {
+    connections_per_worker(total_connections, num_threads)
+        .saturating_mul(2)
+        .saturating_add(POOL_HEADROOM)
+        .clamp(RINGLINE_POOL_DEFAULT, RINGLINE_POOL_MAX) as u32
 }
 
 #[cfg(test)]
 mod tests {
-    use super::standalone_task_capacity;
+    use super::{standalone_task_capacity, timer_slots};
 
     #[test]
     fn covers_the_connection_count_that_was_silently_capped() {
@@ -1085,6 +1114,35 @@ mod tests {
     #[test]
     fn zero_threads_does_not_divide_by_zero() {
         assert_eq!(standalone_task_capacity(64, 0), 256);
+    }
+
+    #[test]
+    fn timer_slots_cover_the_connection_count_that_panicked() {
+        // ringline panics the worker when the timer pool is exhausted, and the
+        // default 256 aborted a 4096-connection run over 8 threads.
+        let slots = timer_slots(4096, 8);
+        assert!(
+            slots as usize >= 4096usize.div_ceil(8),
+            "timer slots {slots} must cover 512 connections per worker"
+        );
+    }
+
+    #[test]
+    fn timer_slots_allow_more_than_one_timer_per_connection() {
+        // A connection can hold a request timeout and a retry sleep at once.
+        assert!(timer_slots(4096, 8) as usize >= 2 * 4096usize.div_ceil(8));
+    }
+
+    #[test]
+    fn timer_slots_keep_the_ringline_default_as_a_floor() {
+        assert_eq!(timer_slots(8, 8), 256);
+        assert_eq!(timer_slots(0, 8), 256);
+    }
+
+    #[test]
+    fn timer_slots_survive_zero_threads_and_absurd_counts() {
+        assert_eq!(timer_slots(64, 0), 256);
+        assert!((timer_slots(usize::MAX, 1) as u64) < (1 << 31));
     }
 
     #[test]
