@@ -589,6 +589,36 @@ mode = "software"          # Lower measurement overhead
 Pinning is the main reason to set `threads` by hand: the count has to match the
 `cpu_list`. Everywhere else, leave it at the default.
 
+### Sizing the recv buffer ring
+
+Each worker receives responses through a ring of provided buffers, shared by
+every connection on that worker. Both halves are exposed:
+
+```toml
+[general]
+recv_ring_size = 256       # buffers per worker, power of two
+recv_buffer_size = 16384   # bytes per buffer
+```
+
+Unset, both take ringline's defaults, which is almost certainly what you want.
+Check what a run resolved to with `format = "verbose"`:
+
+```
+recv_buffer: 256 x 16384 bytes per worker (4 buffers per response)
+```
+
+A response spanning several buffers costs one recv CQE per buffer, and more
+than one buffer per response is worth noticing — but it is not, on its own, a
+problem. A buffer is held only between a completion and the client draining it,
+not for the life of a connection, so a 256-buffer ring serves thousands of
+connections without running dry. Measured on a 16-worker generator at 10,000
+connections and 20,000 req/s of 56 KiB values — four buffers per response —
+every worker reported zero `ENOBUFS` parks.
+
+So reach for these keys to *test* a hypothesis, not to fix a slow run. If you
+do change them, confirm the effect with `ringline/pool{op="recv_parked"}` and
+client CPU rather than by reading latency, for the reason in the next section.
+
 ### Sizing connections
 
 `connections` is a total, split evenly across workers — each worker carries

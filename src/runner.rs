@@ -281,6 +281,8 @@ pub fn run_benchmark_full(
     let standalone_task_capacity = standalone_task_capacity(total_conns, num_threads);
     let timer_slots = timer_slots(total_conns, num_threads);
 
+    let (recv_ring_size, recv_buffer_size) = resolved_recv_geometry(&config);
+
     let mut ringline_builder = ringline::ConfigBuilder::new()
         .workers(num_threads)
         .standalone_task_capacity(standalone_task_capacity)
@@ -288,15 +290,8 @@ pub fn run_benchmark_full(
         .pin_to_core(false) // We pin in create_for_worker instead
         .core_offset(0)
         .tcp_nodelay(true)
+        .recv_buffer(recv_ring_size, recv_buffer_size)
         .loop_diag(config.general.ringline_diag);
-    // No recv-buffer override: ringline's default geometry is used. The old
-    // value-size-derived override (256 × 256KiB for large values) compensated
-    // for a per-CQE-buffer-size starvation cliff that ringline's fallback-recv
-    // (#274) + segmented recv (#286) have since eliminated. A/B verified
-    // (2026-07-21, 2× c8gn.16xlarge, valkey 9.1.0 io-threads=16): with vs
-    // without the override, GET at 1M/16M/64M values both saturate 200 GbE
-    // (201 Gbps, 3/3 reps, byte-identical) — the override buys nothing on
-    // current ringline, so the generator stays out of ringline's recv tuning.
     if let Some(tls_client) = tls_client {
         ringline_builder = ringline_builder.tls_client(tls_client);
     }
@@ -1206,9 +1201,62 @@ fn timer_slots(total_connections: usize, num_threads: usize) -> u32 {
         .clamp(RINGLINE_POOL_DEFAULT, RINGLINE_POOL_MAX) as u32
 }
 
+/// ringline's own defaults for the recv ring, restated so the resolved geometry
+/// is visible in one place and so the verbose line can print it.
+///
+/// Neither is derived. An earlier revision of this change sized `buffer_size`
+/// from the value length so one response fit one buffer, on the theory that a
+/// multi-buffer response shrinks the ring's effective depth and invites
+/// `ENOBUFS` parking. Rig measurement refuted it: at 10,000 connections and
+/// 20,000 req/s of 56 KiB values -- four buffers per response against a
+/// 256-buffer ring -- every worker reported `parks=0 fallbacks=0`. The ring
+/// never ran dry, because buffers are held only for the instant between a
+/// completion and the client draining it, not for the life of a connection.
+///
+/// The CQE argument does not rescue it either: that generator was spending
+/// ~12M CQEs/s to move 20k requests, of which request I/O is under 1%. Sizing
+/// the buffer to the response removes three recv CQEs per response, about 0.5%
+/// of the total -- unmeasurable on a generator that is CPU-bound elsewhere.
+///
+/// So the geometry stays ringline's until something measures otherwise. The
+/// config keys exist to make that measurement a one-line change.
+const RECV_RING_SIZE_DEFAULT: u16 = 256;
+const RECV_BUFFER_SIZE_DEFAULT: u32 = 16 * 1024;
+
+/// The recv-ring geometry a run will actually use: `(ring_size, buffer_size)`,
+/// taken from config where set and ringline's default otherwise.
+///
+/// Shared with the verbose formatter so the printed geometry is the one handed
+/// to ringline rather than a second, drifting derivation of it.
+pub(crate) fn resolved_recv_geometry(config: &Config) -> (u16, u32) {
+    (
+        config
+            .general
+            .recv_ring_size
+            .unwrap_or(RECV_RING_SIZE_DEFAULT),
+        config
+            .general
+            .recv_buffer_size
+            .unwrap_or(RECV_BUFFER_SIZE_DEFAULT),
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{standalone_task_capacity, timer_slots};
+    use super::{
+        RECV_BUFFER_SIZE_DEFAULT, RECV_RING_SIZE_DEFAULT, resolved_recv_geometry,
+        standalone_task_capacity, timer_slots,
+    };
+    use crate::config::Config;
+
+    /// A minimal parsed config with the two recv keys set as given.
+    fn test_config(ring: Option<u16>, buffer: Option<u32>) -> Config {
+        let mut config: Config = toml::from_str("[target]\nendpoints = [\"127.0.0.1:6379\"]\n")
+            .expect("test config must parse");
+        config.general.recv_ring_size = ring;
+        config.general.recv_buffer_size = buffer;
+        config
+    }
 
     #[test]
     fn covers_the_connection_count_that_was_silently_capped() {
@@ -1260,6 +1308,33 @@ mod tests {
     fn timer_slots_keep_the_ringline_default_as_a_floor() {
         assert_eq!(timer_slots(8, 8), 256);
         assert_eq!(timer_slots(0, 8), 256);
+    }
+
+    #[test]
+    fn recv_geometry_falls_back_to_ringlines_defaults() {
+        // Unset must mean "exactly what ringline would have done", so that
+        // merging this knob changes no existing run's behaviour.
+        let config = test_config(None, None);
+        assert_eq!(
+            resolved_recv_geometry(&config),
+            (RECV_RING_SIZE_DEFAULT, RECV_BUFFER_SIZE_DEFAULT)
+        );
+    }
+
+    #[test]
+    fn recv_geometry_takes_each_half_from_config_independently() {
+        assert_eq!(
+            resolved_recv_geometry(&test_config(Some(4096), None)),
+            (4096, RECV_BUFFER_SIZE_DEFAULT)
+        );
+        assert_eq!(
+            resolved_recv_geometry(&test_config(None, Some(65536))),
+            (RECV_RING_SIZE_DEFAULT, 65536)
+        );
+        assert_eq!(
+            resolved_recv_geometry(&test_config(Some(16), Some(262144))),
+            (16, 262144)
+        );
     }
 
     #[test]
