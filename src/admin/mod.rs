@@ -236,7 +236,11 @@ fn generate_prometheus_output() -> String {
     let mut output = String::new();
 
     for metric in metriken::metrics().iter() {
-        let name = metric.name();
+        // Every cachecannon metric name is already a legal Prometheus name, so
+        // this is a no-op for all of them (asserted in `every_local_metric_name_
+        // is_already_prometheus_legal`). ringline's are not -- `ringline/pool`
+        // -- and they reach this endpoint via the `CounterGroup` arm below.
+        let name = &sanitize_name(metric.name());
         let value = match metric.value() {
             Some(v) => v,
             None => continue,
@@ -254,6 +258,38 @@ fn generate_prometheus_output() -> String {
                 write_help(&mut output, name, description);
                 let _ = writeln!(output, "# TYPE {} gauge", name);
                 let _ = writeln!(output, "{} {}", name, v);
+            }
+            // Counter groups are one registry entry holding N labelled slots.
+            // ringline exposes its whole runtime this way -- `ringline/pool`
+            // carries RECV_PARKED and BUFFER_RING_EMPTY, `ringline/bytes`
+            // carries FALLBACK_RECEIVED -- so without this arm the generator's
+            // own saturation signals were counted at runtime and then dropped
+            // here, which is exactly how a buffer-starved run reads as server
+            // latency. Same silent-drop the `Histogram` arm above was added to
+            // fix; groups were left behind.
+            //
+            // Slot labels come from ringline's `init_metadata()`, which its
+            // worker startup calls, so only slots the runtime declared are
+            // emitted -- an unlabelled group renders nothing rather than a
+            // column of bare indices.
+            metriken::Value::CounterGroup(group) => {
+                let mut rows: Vec<(String, u64)> = group
+                    .metadata_snapshot()
+                    .into_iter()
+                    .filter_map(|(idx, slot)| {
+                        group.counter_value(idx).map(|v| (format_labels(&slot), v))
+                    })
+                    .collect();
+                if !rows.is_empty() {
+                    // `metadata_snapshot()` order is unspecified; sort so a
+                    // scrape diff reflects value changes, not map iteration.
+                    rows.sort();
+                    write_help(&mut output, name, description);
+                    let _ = writeln!(output, "# TYPE {} counter", name);
+                    for (labels, v) in rows {
+                        let _ = writeln!(output, "{}{} {}", name, labels, v);
+                    }
+                }
             }
             // metriken-core 0.2 carries histograms in a dedicated `Histogram`
             // variant, so this -- not the `Other` arm below -- is what every
@@ -323,6 +359,56 @@ fn write_histogram_summary(
 
 /// Emit a `# HELP` line if `description` is non-empty. The text is escaped
 /// per the Prometheus exposition format: backslashes and newlines only.
+/// Sanitize a metric name for Prometheus, which requires
+/// `[a-zA-Z_:][a-zA-Z0-9_:]*`.
+///
+/// Matches `metriken_exposition::prometheus`'s sanitizer so the two renderings
+/// of the same metric agree on a name.
+fn sanitize_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == ':' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Render one counter-group slot's metadata as a Prometheus label set,
+/// `{op="recv_parked"}`. Returns an empty string for a slot with no labels, so
+/// the caller can concatenate unconditionally.
+///
+/// Keys are sorted: `metadata_snapshot()` hands back a `HashMap` per slot, and
+/// unsorted labels would reorder between scrapes for no reason.
+fn format_labels(metadata: &HashMap<String, String>) -> String {
+    if metadata.is_empty() {
+        return String::new();
+    }
+
+    let mut pairs: Vec<String> = metadata
+        .iter()
+        .map(|(k, v)| format!("{}=\"{}\"", k, escape_label_value(v)))
+        .collect();
+    pairs.sort();
+    format!("{{{}}}", pairs.join(","))
+}
+
+/// Escape a Prometheus label value: backslash, double quote and newline.
+fn escape_label_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn write_help(out: &mut String, name: &str, description: Option<&str>) {
     use std::fmt::Write as _;
 
@@ -402,6 +488,34 @@ fn create_snapshot() -> Snapshot {
                         name: name.to_string(),
                         value: hist,
                         metadata,
+                    });
+                }
+            }
+            // The recording half of the counter-group fix; see the matching arm
+            // in `generate_prometheus_output`. Flattened one series per slot,
+            // because `SnapshotV2` has no group representation -- counters,
+            // gauges and histograms are the only three things it can carry.
+            //
+            // Naming follows metriken-exposition's own snapshotter: the slot
+            // index is appended as `x{idx}`, the base name stays in the `metric`
+            // metadata key, and the slot's labels (`op = recv_parked`) are
+            // merged in. Getting this right now means a recording written today
+            // still lines up when cachecannon moves off 0.16.
+            Some(metriken::Value::CounterGroup(group)) => {
+                let mut slots = group.metadata_snapshot();
+                // Unspecified iteration order upstream; keep parquet column
+                // order stable across snapshots within a run.
+                slots.sort_by_key(|(idx, _)| *idx);
+                for (idx, slot) in slots {
+                    let Some(value) = group.counter_value(idx) else {
+                        continue;
+                    };
+                    let mut slot_metadata = metadata.clone();
+                    slot_metadata.extend(slot);
+                    counters.push(SnapCounter {
+                        name: format!("{name}x{idx}"),
+                        value,
+                        metadata: slot_metadata,
                     });
                 }
             }
@@ -642,6 +756,175 @@ mod tests {
             body.len()
         );
         rmp_serde::from_slice::<Snapshot>(body).expect("framed body is not a snapshot");
+    }
+
+    // Two fixtures rather than one: the test binary runs these in parallel
+    // against the one global registry, and a shared group would make each
+    // test's expected value depend on whether the other had run yet.
+    #[metriken::metric(
+        name = "test_prometheus_group",
+        description = "Counter-group fixture for the exposition endpoint"
+    )]
+    static TEST_PROMETHEUS_GROUP: metriken::ShardedCounterGroup =
+        metriken::ShardedCounterGroup::new(2);
+
+    #[metriken::metric(
+        name = "test_snapshot_group",
+        description = "Counter-group fixture for the msgpack snapshot"
+    )]
+    static TEST_SNAPSHOT_GROUP: metriken::ShardedCounterGroup =
+        metriken::ShardedCounterGroup::new(2);
+
+    #[test]
+    fn counter_groups_reach_the_prometheus_endpoint() {
+        TEST_PROMETHEUS_GROUP.insert_metadata(0, "op".into(), "recv_parked".into());
+        assert!(TEST_PROMETHEUS_GROUP.add(0, 7));
+
+        let output = generate_prometheus_output();
+
+        assert!(
+            output.contains("# TYPE test_prometheus_group counter"),
+            "counter group missing from the exposition output:\n{output}"
+        );
+        assert!(
+            output.contains("test_prometheus_group{op=\"recv_parked\"} 7"),
+            "slot not rendered as a labelled series:\n{output}"
+        );
+        // Slot 1 was never written, so it has no metadata and no value. An
+        // unwritten slot must not appear as a zero -- that would read as
+        // "measured, and it was fine".
+        assert!(
+            !output.contains("test_prometheus_group 0"),
+            "unwritten slot rendered as a bare zero:\n{output}"
+        );
+    }
+
+    #[test]
+    fn counter_groups_reach_the_msgpack_snapshot() {
+        TEST_SNAPSHOT_GROUP.insert_metadata(1, "op".into(), "fallback_received".into());
+        assert!(TEST_SNAPSHOT_GROUP.add(1, 9));
+
+        let AdminBody::Msgpack(bytes) = respond("/metrics/binary") else {
+            panic!("/metrics/binary did not serve msgpack");
+        };
+        let mut snapshot: Snapshot =
+            rmp_serde::from_slice(&bytes).expect("msgpack body is not a snapshot");
+
+        // Flattened as `{name}x{idx}`, matching metriken-exposition's own
+        // snapshotter so the column survives the eventual version bump.
+        let slot = snapshot
+            .counters()
+            .iter()
+            .find(|c| c.name == "test_snapshot_groupx1")
+            .expect("counter group slot missing from the decoded snapshot")
+            .clone();
+
+        assert_eq!(slot.value, 9);
+        assert_eq!(
+            slot.metadata.get("op").map(String::as_str),
+            Some("fallback_received")
+        );
+        // The base name stays queryable via the `metric` key; the slot is
+        // distinguished by its label, not by the column name.
+        assert_eq!(
+            slot.metadata.get("metric").map(String::as_str),
+            Some("test_snapshot_group")
+        );
+    }
+
+    /// The fixtures above prove this module's own logic. This one proves the
+    /// integration: that ringline's real group, with the real slot labels its
+    /// `init_metadata()` registers, survives the name sanitizer and comes out
+    /// the far end queryable. A ringline upgrade that renamed `op` or the
+    /// `ringline/pool` namespace would fail here rather than silently going
+    /// missing from a dashboard again.
+    ///
+    /// `RECV_PARKED` is the specific counter that distinguishes a
+    /// buffer-starved generator from a slow server, which is why it is the one
+    /// pinned here.
+    #[test]
+    fn ringlines_own_pool_group_is_exposed_with_its_labels() {
+        // Backend-agnostic: ringline registers slot labels from `launch()`, but
+        // a unit test never launches a worker, so do it directly. Idempotent.
+        ringline::metrics::init_metadata();
+        ringline::metrics::POOL.add(ringline::metrics::pool::RECV_PARKED, 3);
+
+        let output = generate_prometheus_output();
+
+        assert!(
+            output.contains("# TYPE ringline_pool counter"),
+            "ringline/pool missing from the exposition output:\n{output}"
+        );
+        assert!(
+            output.contains("ringline_pool{op=\"recv_parked\"}"),
+            "recv_parked not rendered as a labelled series:\n{output}"
+        );
+    }
+
+    #[test]
+    fn every_local_metric_name_is_already_prometheus_legal() {
+        for metric in metriken::metrics().iter() {
+            let name = metric.name();
+            // ringline namespaces its metrics with `/`, which is what the
+            // sanitizer is for. Everything else is ours.
+            if name.starts_with("ringline/") {
+                continue;
+            }
+            assert_eq!(
+                sanitize_name(name),
+                name,
+                "`{name}` is renamed by sanitization, which moves its series"
+            );
+        }
+    }
+
+    /// The invariant the sanitizer exists to hold, checked against the rendered
+    /// output rather than against the name list -- the regression it catches was
+    /// a foreign metric (`ringline/connections/active`, registered merely by
+    /// linking ringline) reaching the endpoint through an arm that never
+    /// considered names it did not own.
+    #[test]
+    fn exposition_output_has_no_illegal_metric_names() {
+        ringline::metrics::init_metadata();
+
+        let output = generate_prometheus_output();
+
+        for line in output.lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            // `name{labels} value` or `name value`.
+            let name = line.split(['{', ' ']).next().unwrap_or(line);
+            assert!(
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':'),
+                "`{name}` is not a legal Prometheus metric name, which makes the \
+                 whole exposition body unparseable:\n{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_name_replaces_illegal_characters() {
+        assert_eq!(sanitize_name("ringline/pool"), "ringline_pool");
+        assert_eq!(sanitize_name("with.dots"), "with_dots");
+        assert_eq!(sanitize_name("response_latency"), "response_latency");
+        assert_eq!(sanitize_name("has:colon"), "has:colon");
+    }
+
+    #[test]
+    fn labels_are_sorted_and_escaped() {
+        let metadata = HashMap::from([
+            ("op".to_string(), "recv_parked".to_string()),
+            ("id".to_string(), "a\"b".to_string()),
+        ]);
+        assert_eq!(
+            format_labels(&metadata),
+            "{id=\"a\\\"b\",op=\"recv_parked\"}"
+        );
+        assert_eq!(format_labels(&HashMap::new()), "");
     }
 
     /// Writes what `/metrics/binary` serves to `$CACHECANNON_MSGPACK_FIXTURE`,

@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Counter-group metrics no longer vanish between the registry and the wire.
+  `ShardedCounterGroup::value()` returns `Value::CounterGroup`, and both
+  exposition sites -- the Prometheus endpoint and the msgpack/parquet snapshot
+  -- matched only `Counter`, `Gauge` and `Histogram` before falling through to
+  a catch-all. ringline publishes its entire runtime as counter groups, so
+  everything it measures about the generator was counted at runtime and then
+  dropped: `ringline/pool` carries RECV_PARKED (a connection's multishot recv
+  hit ENOBUFS and parked while its socket stayed readable) and
+  BUFFER_RING_EMPTY, `ringline/bytes` carries FALLBACK_RECEIVED (traffic
+  arriving through the degraded path because a single response exceeded the
+  provided buffer ring), `ringline/ring` carries SQE_SUBMIT_FAILURES.
+
+  Those are precisely the counters that separate a buffer-starved generator
+  from a slow server, and their absence is not neutral: a generator that cannot
+  reap responses reports the delay as latency, so a saturated client reads as a
+  degraded target. A 56 KiB-response characterisation run attributed 72% of its
+  p50 at 10k connections to the server before client-side `tcp_packet_latency`
+  showed the delay was the generator's own. None of it was recoverable from the
+  recording afterwards.
+
+  Groups are now flattened one series per populated slot. Prometheus renders
+  them as labelled series (`ringline_pool{op="recv_parked"}`); the snapshot
+  appends the slot index (`ringline/poolx4`) and keeps the base name in the
+  `metric` metadata key, matching metriken-exposition's own snapshotter so the
+  columns survive the eventual dependency bump. Slot labels come from the
+  runtime's own metadata, so a slot that was never written emits nothing rather
+  than a zero -- an unwritten counter must not read as "measured, and fine".
+
+- The Prometheus endpoint served invalid exposition text on every run. Metric
+  names must match `[a-zA-Z_:][a-zA-Z0-9_:]*`; linking ringline registers
+  `ringline/connections/active`, which the gauge arm emitted verbatim, so
+  `/metrics` carried `ringline/connections/active 0` whether or not ringline
+  was doing anything. Names are now sanitized on the way out, as
+  metriken-exposition does. Every cachecannon metric name was already legal and
+  is unaffected -- asserted by a test, alongside one that scans the whole
+  rendered body for illegal names.
+
 ## [0.0.22] - 2026-09-10
 
 Two measurement-correctness fixes. Both concern the saturation search
