@@ -489,11 +489,14 @@ Use round-robin unless you're specifically testing pipeline batching behavior.
 
 ```toml
 [general]
-threads = 8
+# `threads` is deliberately absent: it defaults to the machine's CPU count,
+# which is what you want here. Setting it explicitly caps the generator, and
+# nothing in the output tells you that you did — see "Is the generator the
+# bottleneck?" below.
 io_engine = "uring"
 
 [connection]
-connections = 64           # 8 per thread
+connections = 64           # see "Sizing connections" below
 pipeline_depth = 64        # High pipelining
 
 [workload.keyspace]
@@ -508,7 +511,7 @@ length = 64                # Small values
 
 ```toml
 [general]
-threads = 4
+threads = 4                # Deliberate: must match the cpu_list below
 cpu_list = "0-3"           # Pin to dedicated cores
 io_engine = "uring"
 
@@ -519,6 +522,21 @@ pipeline_depth = 1         # No pipelining
 [timestamps]
 mode = "software"          # Lower measurement overhead
 ```
+
+Pinning is the main reason to set `threads` by hand: the count has to match the
+`cpu_list`. Everywhere else, leave it at the default.
+
+### Sizing connections
+
+`connections` is a total, split evenly across workers — each worker carries
+`connections / threads`. That per-worker number, not the total, is what governs
+generator cost: every connection is its own task, and the runtime's per-worker
+pools are sized from it.
+
+Connections are not free. Raising the count raises generator CPU whether or not
+it raises offered load, so a wide sweep can walk the generator into saturation
+while the request rate stays flat. Sweep connections with the generator-bound
+check below in the loop, not after it.
 
 ## Troubleshooting
 
@@ -541,9 +559,50 @@ If prefill appears stuck:
 ### Rate Limit Not Achieved
 
 If actual throughput is lower than `rate_limit`:
-1. Increase `connections` and `pipeline_depth`
-2. Add more `threads`
+1. Confirm `threads` is unset, so it picks up the full CPU count
+2. Increase `pipeline_depth`, then `connections`
 3. Check target server capacity
+
+Take these in order. Reaching for `connections` first adds generator CPU
+whether or not it adds throughput, and can convert a shortfall into a
+generator-bound measurement — see the next entry.
+
+### Is the generator the bottleneck?
+
+A load generator that cannot keep up does not report an error — it reports
+latency. Time spent waiting for cachecannon to read a response that already
+arrived is indistinguishable, in the benchmark's own numbers, from time the
+server spent producing it.
+
+Check this before attributing any latency to the server under test. With
+client-side Rezolus telemetry (see [Correlating with Rezolus](#correlating-with-rezolus)),
+compare `tcp_packet_latency` against the latency cachecannon reports:
+
+- `tcp_packet_latency` measures socket-becomes-readable to userspace-reads-it.
+- That is pure generator delay. Subtract it from reported latency; what is left
+  is the server's share.
+
+If `tcp_packet_latency` is a large fraction of reported latency, the
+measurement is generator-bound and the server numbers are not usable. In one
+characterisation run, 72% of reported p50 at 10,000 connections was this
+reaping delay, while TCP srtt stayed flat — most of the "latency collapse"
+under load was the generator, not the server.
+
+Corroborating signals, all from client-side Rezolus:
+
+- **TCP srtt flat while reported latency climbs** — the network is fine, so the
+  delay is above it.
+- **Total generator CPU plateaus** as connections rise, especially below the
+  core count. A plateau at roughly one core per worker thread is a thread-count
+  ceiling, not a machine ceiling.
+- **Context switches collapse** as connections rise. Worker threads that stop
+  sleeping are saturated, not idle.
+
+What to do about it:
+
+1. Leave `threads` unset so it picks up the full CPU count.
+2. Re-run the point that looked bad and confirm `tcp_packet_latency` dropped.
+3. Only then compare servers.
 
 ### High Latency Variance
 
