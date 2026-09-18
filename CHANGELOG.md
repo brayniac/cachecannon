@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The per-connection idle poll no longer jitters its sleep. #153 (shipped in
+  0.0.23, and undocumented here) replaced a fixed 100 us poll with one that
+  scales as `connections / (64 * rate)`, so the fleet-wide wakeup rate tracks
+  the token rate instead of the connection count. That part stands. The jitter
+  wrapped around it does not.
+
+  Measured afterwards, cores at 20,000 req/s: at 64 connections 0.54 without
+  the backoff, 1.10 with backoff+jitter, 0.51 with backoff alone; at 2048
+  connections 3.50 / 1.27 / 0.51. At 64 the sleep is already at the floor, so
+  the jitter was the only variable and it doubled CPU on the case the floor
+  exists to leave alone. Both points fit timer coalescing: uniform sleeps share
+  a slot and collapse into one wakeup, jittered ones smear across +/-25% of the
+  sleep and each needs its own expiry.
+
+  Two regimes matter because `idle_sleep` returns the floor when `rate == 0`
+  (no `rate_limit` and no `[workload.saturation_search]`, i.e. closed-loop). In
+  a rate-limited run the scaling does real work and dropping the jitter takes
+  1.27 to 0.51; in a closed-loop run the scaling is inert and the jitter was
+  pure cost. So this is better than 0.0.23 in both, with no workload preferring
+  the jittered version. Corroborated on Linux/io_uring, where a 4096-connection
+  closed-loop cell saturated every worker at 1.00 core.
+
+  This gives up thundering-herd protection when a saturation-search rate step
+  releases every waiter at once -- speculative when written, expensive when
+  measured, and self-reporting if it occurs, since unclaimed tokens are limiter
+  backlog and backlog is what `schedule_slip` measures.
+
 ### Added
 - `general.recv_ring_size` and `general.recv_buffer_size` expose the per-worker
   provided recv-buffer ring, which was previously ringline's default with no way

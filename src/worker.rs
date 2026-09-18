@@ -388,20 +388,6 @@ fn idle_sleep(total_connections: usize, rate: u64) -> Duration {
     Duration::from_nanos(nanos).clamp(IDLE_SLEEP_MIN, IDLE_SLEEP_MAX)
 }
 
-/// Spread the idle sleep over `[0.75, 1.25]` of its nominal value.
-///
-/// Connection phases drift apart on their own, but a mid-run rate change (the
-/// saturation search steps the rate) releases every waiter at once and would
-/// re-synchronise them into a herd that wakes together and finds one token.
-fn jittered_idle_sleep(base: Duration, rng: &mut Xoshiro256PlusPlus) -> Duration {
-    let nanos = base.as_nanos() as u64;
-    let spread = nanos / 4;
-    if spread == 0 {
-        return base;
-    }
-    Duration::from_nanos(nanos - spread + rng.random_range(0..=2 * spread))
-}
-
 /// Borrow a random `value_len`-byte slice of the value pool, for the
 /// copy-based `fire_set` path (the bytes are copied into the send pool
 /// synchronously, so the borrow only needs to outlive the fire call).
@@ -1338,7 +1324,7 @@ async fn drive_resp_workload(
                 .as_ref()
                 .map_or(0, |rl| rl.rate());
             let base = idle_sleep(total_connections, rate);
-            ringline::sleep(jittered_idle_sleep(base, rng)).await;
+            ringline::sleep(base).await;
             continue;
         }
 
@@ -1919,7 +1905,7 @@ async fn drive_memcache_workload(
                 .as_ref()
                 .map_or(0, |rl| rl.rate());
             let base = idle_sleep(total_connections, rate);
-            ringline::sleep(jittered_idle_sleep(base, rng)).await;
+            ringline::sleep(base).await;
             continue;
         }
 
@@ -3223,37 +3209,6 @@ mod tests {
             "10k connections still sleeps only {sleep:?}"
         );
         assert!(sleep < IDLE_SLEEP_MAX);
-    }
-
-    #[test]
-    fn jitter_stays_within_a_quarter_and_varies() {
-        let mut rng = Xoshiro256PlusPlus::seed_from_u64(7);
-        let base = Duration::from_millis(8);
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..1000 {
-            let d = jittered_idle_sleep(base, &mut rng);
-            assert!(
-                d >= base * 3 / 4 && d <= base * 5 / 4,
-                "{d:?} outside [0.75, 1.25] of {base:?}"
-            );
-            seen.insert(d);
-        }
-        assert!(
-            seen.len() > 100,
-            "jitter barely varies: {} values",
-            seen.len()
-        );
-    }
-
-    #[test]
-    fn jitter_leaves_the_floor_alone() {
-        // At 100us the spread is 25us, which is meaningful; at a hypothetical
-        // sub-4ns base it would round to zero and must return the base intact.
-        let mut rng = Xoshiro256PlusPlus::seed_from_u64(1);
-        assert_eq!(
-            jittered_idle_sleep(Duration::from_nanos(3), &mut rng),
-            Duration::from_nanos(3)
-        );
     }
 
     /// Build a minimal TaskSharedState + SharedWorkerState for testing prefill logic.
