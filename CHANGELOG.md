@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `general.recv_ring_size` and `general.recv_buffer_size` expose the per-worker
+  provided recv-buffer ring, which was previously ringline's default with no way
+  to change it. Both default to exactly what ringline would have used (256 x
+  16 KiB), so no existing run changes behaviour. `format = "verbose"` prints the
+  resolved geometry and the buffers-per-response it implies.
+
+  These are instrumentation, not a fix. An earlier draft of this change also
+  derived `recv_buffer_size` from `workload.values.length` so one response fit
+  one buffer, on the theory that multi-buffer responses shrink the ring's
+  effective depth and invite `ENOBUFS` parking at high connection counts. Rig
+  measurement refuted it: 10,000 connections, 20,000 req/s, 56 KiB values, four
+  buffers per response against a 256-buffer ring -- every worker reported
+  `parks=0 fallbacks=0`. Buffers are held only between a completion and the
+  client draining it, so connection count does not consume them. The CQE
+  argument does not rescue the derivation either: that generator spent ~12M
+  CQEs/s to move 20k req/s, request I/O under 1% of it, so fitting a response in
+  one buffer moves ~0.5% of the budget. The geometry stays ringline's until
+  something measures otherwise; these keys are what make that measurable.
+
 ## [0.0.23] - 2026-09-17
 
 ### Fixed

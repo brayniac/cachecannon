@@ -34,6 +34,20 @@ io_engine = "auto"
 # (`[ringline diag]` iteration mix and `[ringline stall]` stall buckets).
 # io_uring only; off by default.
 ringline_diag = false
+
+# Provided recv-buffer ring, per worker. Both default to ringline's own values;
+# the resolved geometry is printed by `format = "verbose"`.
+#
+# Buffers in the ring, shared by every connection on the worker. Must be a
+# power of two. Default: 256. A buffer is held only between a completion and
+# the client draining it, not for the life of a connection, so this serves
+# thousands of connections without running dry — measured at 10,000 connections
+# and 20,000 req/s of 56 KiB values with zero ENOBUFS parks.
+# recv_ring_size = 256
+
+# Bytes per buffer. Default: 16384. A response larger than this spans several
+# buffers and costs one recv CQE each.
+# recv_buffer_size = 16384
 ```
 
 ### Target Settings

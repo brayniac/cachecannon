@@ -35,6 +35,30 @@ pub struct General {
     /// and `[ringline stall]`) to stderr at shutdown. io_uring only.
     #[serde(default)]
     pub ringline_diag: bool,
+    /// Buffers in the per-worker provided recv ring. Must be a power of two.
+    /// Unset uses ringline's default of 256.
+    ///
+    /// The ring is shared by every connection on a worker. A buffer is held
+    /// only between a completion and the client draining it -- not for the life
+    /// of a connection -- which is why a ring this size serves thousands of
+    /// connections without running dry. Measured: 10,000 connections at 20,000
+    /// req/s of 56 KiB values, four buffers per response, `parks=0` on every
+    /// worker.
+    ///
+    /// Exposed for the case where that does not hold (ringline's own server-side
+    /// sweeps reach millions of `ENOBUFS` parks at small ring depths), not
+    /// because cachecannon has a reason to move it.
+    #[serde(default)]
+    pub recv_ring_size: Option<u16>,
+    /// Bytes per buffer in the per-worker provided recv ring. Unset uses
+    /// ringline's default of 16 KiB.
+    ///
+    /// A response larger than this spans several buffers and costs one recv CQE
+    /// each. That is real but small: a generator at 20,000 req/s was observed
+    /// spending ~12M CQEs/s in total, of which request I/O was under 1%, so
+    /// sizing the buffer to the response moves ~0.5% of the CQE budget.
+    #[serde(default)]
+    pub recv_buffer_size: Option<u32>,
 }
 
 impl Default for General {
@@ -45,6 +69,8 @@ impl Default for General {
             threads: default_threads(),
             cpu_list: None,
             ringline_diag: false,
+            recv_ring_size: None,
+            recv_buffer_size: None,
         }
     }
 }
@@ -716,6 +742,28 @@ impl Config {
             return Err(ConfigError::Validation("threads must be >= 1".to_string()));
         }
 
+        // io_uring's provided-buffer ring is indexed by a mask, so ringline
+        // rejects a non-power-of-two. Catching it here names the config key
+        // that is wrong instead of failing later as a ring-setup error.
+        if let Some(ring_size) = self.general.recv_ring_size {
+            if ring_size == 0 {
+                return Err(ConfigError::Validation(
+                    "recv_ring_size must be >= 1".to_string(),
+                ));
+            }
+            if !ring_size.is_power_of_two() {
+                return Err(ConfigError::Validation(format!(
+                    "recv_ring_size must be a power of two (got {ring_size})"
+                )));
+            }
+        }
+
+        if self.general.recv_buffer_size == Some(0) {
+            return Err(ConfigError::Validation(
+                "recv_buffer_size must be >= 1".to_string(),
+            ));
+        }
+
         // A client certificate is useless without its key and vice versa, and
         // rustls takes them as a pair. Catch a half-configured client identity
         // rather than at connect time, where it would surface as a handshake
@@ -1187,6 +1235,74 @@ mod validation_tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("threads"));
+    }
+
+    #[test]
+    fn rejects_a_non_power_of_two_recv_ring() {
+        // io_uring masks the ring index, so ringline rejects this too -- but as
+        // a ring-setup error that never names the config key.
+        let err = parse_config(
+            r#"
+            [general]
+            recv_ring_size = 300
+            [target]
+            endpoints = ["127.0.0.1:6379"]
+            "#,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("recv_ring_size"), "{msg}");
+        assert!(msg.contains("power of two"), "{msg}");
+    }
+
+    #[test]
+    fn rejects_empty_recv_geometry() {
+        for key in ["recv_ring_size", "recv_buffer_size"] {
+            let err = parse_config(&format!(
+                r#"
+                [general]
+                {key} = 0
+                [target]
+                endpoints = ["127.0.0.1:6379"]
+                "#
+            ))
+            .unwrap_err();
+            assert!(
+                err.to_string().contains(key),
+                "{key} not named in the error"
+            );
+        }
+    }
+
+    #[test]
+    fn recv_geometry_is_unset_by_default() {
+        // Unset is what selects the derived buffer size and ringline's ring
+        // depth; a stray default here would silently pin both.
+        let config = parse_config(
+            r#"
+            [target]
+            endpoints = ["127.0.0.1:6379"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.general.recv_ring_size, None);
+        assert_eq!(config.general.recv_buffer_size, None);
+    }
+
+    #[test]
+    fn recv_geometry_round_trips_from_toml() {
+        let config = parse_config(
+            r#"
+            [general]
+            recv_ring_size = 4096
+            recv_buffer_size = 65536
+            [target]
+            endpoints = ["127.0.0.1:6379"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.general.recv_ring_size, Some(4096));
+        assert_eq!(config.general.recv_buffer_size, Some(65536));
     }
 
     #[test]
