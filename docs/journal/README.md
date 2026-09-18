@@ -19,5 +19,6 @@ Conventions:
 
 | Date | Effort | Status |
 |------|--------|--------|
+| 2026-09-18 | [Generator saturation at high connection counts](2026-09-18-generator-saturation.md) | OPEN — recv-ring starvation refuted (`parks=0`), idle-sleep jitter measured and removed (#158, v0.0.24); the pinned core at 4096 closed-loop is still unexplained and traces to `IDLE_WAKEUPS_PER_TOKEN` |
 | 2026-09-10 | [Adaptive post-prefill quiesce](2026-09-10-adaptive-prefill-quiesce.md) | OPEN — deferred, pre-build. A fixed `prefill_settle` window shipped instead (#137); records the measured-quiesce alternative and what would justify building it |
 | 2026-09-10 | [Cache trace replay](2026-09-10-trace-replay.md) | OPEN — scoping, pre-build. Replay a real access sequence instead of a stationary synthetic distribution; records why key-sequence replay is the primary mode and why a miss-ratio curve may make it unnecessary |
