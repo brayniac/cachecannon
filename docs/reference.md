@@ -314,8 +314,8 @@ returns 404.
 
 `/metrics/stream` is metriken-exposition's stream route. A request names its
 frame interval and layout, `/metrics/stream?interval=500ms&layout=long`
-(defaults `1s` and `wide`); a zero or malformed interval or an unknown layout
-is refused with 400. The response has no `Content-Length`: it is dendro's
+(defaults `1s` and `wide`); a zero or malformed interval, an interval below
+the 10 ms update floor, or an unknown layout is refused with 400. The response has no `Content-Length`: it is dendro's
 preamble and a handshake (`source=cachecannon`, the version in its metadata),
 then one frame per interval, aligned to the Unix epoch, until the client
 disconnects. The `x-metriken-frame-interval`, `x-metriken-update-floor` (10 ms)
