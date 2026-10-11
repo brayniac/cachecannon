@@ -1,7 +1,7 @@
 use metriken_exposition::{
-    Counter as SnapCounter, Gauge as SnapGauge, Histogram as SnapHistogram, MsgpackToParquet,
-    ParquetOptions, Snapshot, SnapshotV2,
+    Counter as SnapCounter, Gauge as SnapGauge, Histogram as SnapHistogram, Snapshot, SnapshotV2,
 };
+use metriken_storage::convert::{MsgpackToParquet, ParquetOptions};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{self, BufWriter, Write};
@@ -456,18 +456,10 @@ fn create_snapshot() -> Snapshot {
 
         match value {
             Some(metriken::Value::Counter(v)) => {
-                counters.push(SnapCounter {
-                    name: name.to_string(),
-                    value: v,
-                    metadata,
-                });
+                counters.push(SnapCounter::new(name.to_string(), v, metadata));
             }
             Some(metriken::Value::Gauge(v)) => {
-                gauges.push(SnapGauge {
-                    name: name.to_string(),
-                    value: v,
-                    metadata,
-                });
+                gauges.push(SnapGauge::new(name.to_string(), v, metadata));
             }
             // metriken-core 0.2 carries histograms in a dedicated `Histogram`
             // variant. Without this arm every latency histogram fell through to
@@ -484,11 +476,7 @@ fn create_snapshot() -> Snapshot {
                         "max_value_power".to_string(),
                         h.config().max_value_power().to_string(),
                     );
-                    histograms.push(SnapHistogram {
-                        name: name.to_string(),
-                        value: hist,
-                        metadata,
-                    });
+                    histograms.push(SnapHistogram::new(name.to_string(), hist, metadata));
                 }
             }
             // The recording half of the counter-group fix; see the matching arm
@@ -512,11 +500,11 @@ fn create_snapshot() -> Snapshot {
                     };
                     let mut slot_metadata = metadata.clone();
                     slot_metadata.extend(slot);
-                    counters.push(SnapCounter {
-                        name: format!("{name}x{idx}"),
+                    counters.push(SnapCounter::new(
+                        format!("{name}x{idx}"),
                         value,
-                        metadata: slot_metadata,
-                    });
+                        slot_metadata,
+                    ));
                 }
             }
             // Retained for metrics that still surface as `Other`.
@@ -540,11 +528,7 @@ fn create_snapshot() -> Snapshot {
                         h.config().max_value_power().to_string(),
                     );
 
-                    histograms.push(SnapHistogram {
-                        name: name.to_string(),
-                        value: h,
-                        metadata,
-                    });
+                    histograms.push(SnapHistogram::new(name.to_string(), h, metadata));
                 }
             }
             _ => {}
@@ -925,6 +909,60 @@ mod tests {
             "{id=\"a\\\"b\",op=\"recv_parked\"}"
         );
         assert_eq!(format_labels(&HashMap::new()), "");
+    }
+
+    /// `--parquet`'s path end to end with the crates it now uses: snapshots
+    /// staged as msgpack, converted by metriken-storage, and read back by the
+    /// metriken-query reader `cachecannon view` opens.
+    #[test]
+    fn parquet_recording_reads_back_through_the_viewer_reader() {
+        use metriken_query::{MetricsSource, QueryResult};
+
+        let dir = std::env::temp_dir().join(format!(
+            "cachecannon-parquet-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let staged = dir.join("run.msgpack");
+        let parquet = dir.join("run.parquet");
+
+        let mut writer = BufWriter::new(std::fs::File::create(&staged).unwrap());
+        for _ in 0..3 {
+            // A quantile reads the change between rows, so each row adds one.
+            let _ = crate::metrics::RESPONSE_LATENCY.increment(12_345);
+            append_snapshot(&mut writer, &create_snapshot()).unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(writer);
+        let rows = MsgpackToParquet::with_options(ParquetOptions::new())
+            .metadata("sampling_interval_ms".to_string(), "5".to_string())
+            .metadata("source".to_string(), "cachecannon".to_string())
+            .convert_file_path(&staged, &parquet)
+            .unwrap();
+        assert_eq!(rows, 3);
+
+        let reader = metriken_query::ParquetReader::open(&parquet).unwrap();
+        assert_eq!(reader.source(), "cachecannon");
+        assert!(reader.has_histogram("response_latency"));
+        let (start, end) = reader.time_range().unwrap();
+        let result = reader
+            .query_range(
+                "histogram_quantile(0.5, response_latency)",
+                start,
+                end,
+                0.001,
+            )
+            .unwrap();
+        let QueryResult::Matrix { result } = result else {
+            panic!("not a matrix: {result:?}");
+        };
+        assert!(
+            result.iter().any(|s| !s.values.is_empty()),
+            "no response_latency quantile read back"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Writes what `/metrics/binary` serves to `$CACHECANNON_MSGPACK_FIXTURE`,

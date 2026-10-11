@@ -14,6 +14,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nonzero.
 
 ### Changed
+- metriken 0.9 → 0.11.3 (metriken-core 0.3), metriken-exposition 0.16 → 0.22,
+  metriken-query 0.9 → 0.36, and metriken-storage 0.2 for `--parquet`'s
+  msgpack-to-parquet conversion, which left metriken-exposition. No SQLite is
+  compiled: metriken-query is built without its `archive` feature until
+  `cachecannon view` reads `.dendro`. metriken-query 0.36 has no HTTP layer,
+  so the viewer serves `/api/v1/query`, `query_range`, `labels`,
+  `label/{name}/values` and `metadata` itself, with 0.9's request parameters
+  and response bodies. Query results differ where the engine changed: points
+  are at the recording's own timestamps rather than rounded to a one-second
+  grid, `irate` divides by the measured spacing (2000 req/s reads 1997–2001
+  where 0.9 read 2003–2007), a range ends at the last sample rather than one
+  grid step past it, `/api/v1/metadata` gives the first and last sample times
+  exactly rather than in whole seconds, and matrix results carry `intervals`
+  and `bands`, which the frontend ignores. The dashboards' section JSON is
+  byte-identical.
 - Built against unreleased ringline main (ringline-rs/ringline `1be7049`:
   ringline 0.7.0-alpha.0, ringline-redis 0.7.0, ringline-memcache 0.7.2,
   ringline-ping 0.6.0) through `[patch.crates-io]`, until those changes are

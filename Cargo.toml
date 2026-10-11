@@ -8,8 +8,11 @@ repository = "https://github.com/cachecannon/cachecannon"
 description = "High-performance cache protocol benchmark tool"
 
 [dependencies]
-# Metrics query engine (used by viewer)
-metriken-query = { version = "0.9", features = ["http"] }
+# Metrics query engine (used by viewer). `archive` (a default) reads dendro
+# archives and compiles SQLite; the viewer reads parquet only, so it is off
+# until the viewer opens `.dendro` (docs/journal/2026-10-08-dendro-recording.md,
+# step 5). `lz4` reads lz4-compressed parquet, which rezolus recordings may be.
+metriken-query = { version = "0.36", default-features = false, features = ["lz4"] }
 
 # Configuration
 toml = "0.8"
@@ -84,8 +87,13 @@ ndarray = { version = "0.17", optional = true }
 
 # Metrics
 histogram = "1.1"
-metriken = "0.9"
-metriken-exposition = { version = "0.16", features = ["parquet", "msgpack"] }
+# metriken-core declares `links`, so the graph holds one metriken-core: every
+# metriken crate moves together (core 0.3 here).
+metriken = "0.11.3"
+# `msgpack`: the `/metrics/binary` snapshot.
+metriken-exposition = { version = "0.22", default-features = false, features = ["msgpack"] }
+# `MsgpackToParquet` for `--parquet`; `convert` alone compiles no SQLite.
+metriken-storage = { version = "0.2", default-features = false, features = ["convert"] }
 
 # TLS
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
@@ -187,7 +195,12 @@ rmp-serde = "1"
 # match a 0.7 pre-release, and cargo then builds a second ringline from
 # crates.io alongside the patched one the client crates use.
 [patch.crates-io]
-ringline = { git = "https://github.com/ringline-rs/ringline", rev = "1be7049" }
-ringline-redis = { git = "https://github.com/ringline-rs/ringline", rev = "1be7049" }
-ringline-memcache = { git = "https://github.com/ringline-rs/ringline", rev = "1be7049" }
-ringline-ping = { git = "https://github.com/ringline-rs/ringline", rev = "1be7049" }
+# NOT FOR MERGE: ringline 1be7049 depends on metriken 0.9 (metriken-core 0.2),
+# and metriken-core declares `links`, so cachecannon cannot move to metriken
+# 0.11 until ringline does. This points at 1be7049 plus that one-line bump
+# (local branch `chore/metriken-0.11-at-1be7049`, 4b589eb). Replace with the
+# ringline rev that carries the bump once it lands upstream.
+ringline = { path = "../ringline-m11/ringline" }
+ringline-redis = { path = "../ringline-m11/ringline-redis" }
+ringline-memcache = { path = "../ringline-m11/ringline-memcache" }
+ringline-ping = { path = "../ringline-m11/ringline-ping" }
