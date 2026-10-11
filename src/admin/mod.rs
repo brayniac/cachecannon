@@ -1033,7 +1033,11 @@ mod tests {
 
             let mut conn = std::net::TcpStream::connect(self.addr).unwrap();
             conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            write!(conn, "GET {target} HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+            // One write: the server reads the request with a single `read`, and
+            // `write!` on a TcpStream sends each format piece as its own
+            // write, so the server could read `GET ` alone and answer 404.
+            let request = format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n");
+            conn.write_all(request.as_bytes()).unwrap();
 
             // Byte at a time, so nothing after the head is consumed.
             let mut head = Vec::new();
