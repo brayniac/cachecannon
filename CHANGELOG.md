@@ -8,24 +8,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `[admin] listen` serves `GET /metrics/stream[?interval=..&layout=wide|long]`,
+  metriken-exposition's stream route: dendro replication frames
+  (`application/vnd.metriken.replication.v1+dendro`), a handshake with
+  `source=cachecannon`, then one frame per interval until the client
+  disconnects. A rezolus recorder that reads this content type records the
+  benchmark into a `.dendro` archive beside agents, with the latency histograms
+  as histograms. Every metric is in one windowless group, `cachecannon/main`.
+  `/metrics` and `/metrics/binary` are unchanged.
 - `requests_send_failed` counts RESP and memcache main-workload requests not
   sent because a send failed, and is included in `offered`. It is in the
   JSON result, and the clean and verbose outputs print it when it is
   nonzero.
 
 ### Changed
-- Built against unreleased ringline main (ringline-rs/ringline `1be7049`:
+- metriken 0.9 → 0.11.3 (metriken-core 0.3), metriken-exposition 0.16 → 0.22,
+  metriken-query 0.9 → 0.36, and metriken-storage 0.2 for `--parquet`'s
+  msgpack-to-parquet conversion, which left metriken-exposition. No SQLite is
+  compiled: metriken-query is built without its `archive` feature until
+  `cachecannon view` reads `.dendro`. metriken-query 0.36 has no HTTP layer,
+  so the viewer serves `/api/v1/query`, `query_range`, `labels`,
+  `label/{name}/values` and `metadata` itself, with 0.9's request parameters
+  and response bodies. Query results differ where the engine changed: points
+  are at the recording's own timestamps rather than rounded to a one-second
+  grid, `irate` divides by the measured spacing (2000 req/s reads 1997–2001
+  where 0.9 read 2003–2007), a range ends at the last sample rather than one
+  grid step past it, `/api/v1/metadata` gives the first and last sample times
+  exactly rather than in whole seconds, and matrix results carry `intervals`
+  and `bands`, which the frontend ignores. The dashboards' section JSON is
+  byte-identical.
+- Built against unreleased ringline main (ringline-rs/ringline `dfff2e5`:
   ringline 0.7.0-alpha.0, ringline-redis 0.7.0, ringline-memcache 0.7.2,
   ringline-ping 0.6.0) through `[patch.crates-io]`, until those changes are
-  released. `1be7049` includes ringline-rs/ringline#515: from `0a536e0`
-  until that fix, ringline scanned every connection slot on every event-loop
-  iteration, which cost 1.3–2.2× the cycles per request of ringline 0.6.2. main is now the 0.1 development line; 0.0 patch releases come from
-  the `0.0.x` branch. Ringline's connection-handle redesign changes three
-  things here: handlers take an owned `ringline::Connection` in `on_accept`;
-  client construction is fallible, and a failure is counted and retried like a
-  failed connect; and clients no longer expose their `ConnCtx`, so cachecannon
-  keeps the one from `connect()` for closing on a request timeout and for
-  logging.
+  released. `dfff2e5` is the first ringline main on metriken 0.11
+  (ringline-rs/ringline#649); metriken-core declares `links`, so cachecannon
+  and ringline move to metriken 0.11 together. It includes
+  ringline-rs/ringline#515: from `0a536e0` until that fix, ringline scanned
+  every connection slot on every event-loop iteration, which cost 1.3–2.2× the
+  cycles per request of ringline 0.6.2. main is now the 0.1 development line;
+  0.0 patch releases come from the `0.0.x` branch. The ringline changes this
+  takes in:
+  - Handlers take an owned `ringline::Connection` in `on_accept`.
+  - `connect` returns a builder that resolves to a `Connection`, with TLS set
+    by `.tls(name)` (ringline-rs/ringline#533). The client crates take that
+    `Connection`, and building a client no longer fails. Clients do not
+    expose their `ConnCtx`, so cachecannon keeps `Connection::as_conn()` for
+    closing on a request timeout and for logging. `connect_timeout` still
+    bounds the TCP connect and the TLS handshake together, through
+    `try_timeout`; the builder's own `timeout` would cover only the TCP
+    connect. A connect ringline cannot submit (no free connection slot) now
+    fails when first polled, so it is logged at debug as `connect failed`
+    and counted in `disconnects_connect_failed` as well as
+    `connections_failed`; before, it was a `connect initiation failed`
+    warning counted in `connections_failed` only.
+  - On io_uring, ringline arms one-shot TCP receives by default
+    (ringline-rs/ringline#647). cachecannon sets `recv_multishot(true)`, so
+    its connections keep the multishot receives every earlier cachecannon
+    build used. Other ringline changes in this range change the default
+    io_uring path, including ringline-rs/ringline#637 (queued copy sends
+    merged across send calls) and #639 and #640 (the receive throttle); see
+    ringline's CHANGELOG for the rest. No io_uring run has compared results
+    before and after. ringline made one-shot
+    the default for servers with many connections and large messages, where
+    a multishot receive lets some connections hold the receive ring while
+    others get no buffers; one-shot costs an SQE per received buffer. With
+    `[timestamps] mode = "software"` (Linux), every receive is multishot
+    `recvmsg` in either mode.
+  - `valkey-lab search`: a query task that panicked or was cancelled resolves
+    its `JoinHandle` to a `JoinError` (ringline-rs/ringline#557), reported as
+    a `query worker:` error.
 
 ### Fixed
 - A connection the server closed while it had no requests in flight now

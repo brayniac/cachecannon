@@ -14,7 +14,7 @@ use crate::limiters::WorkerLimiter;
 use crate::metrics;
 use ratelimit::{Ratelimiter, TryWaitError};
 
-use ringline::{AsyncEventHandler, ConnCtx, DriverCtx, RegionId, SendGuard};
+use ringline::{AsyncEventHandler, ConnCtx, Connection, DriverCtx, RegionId, SendGuard};
 
 use rand::prelude::*;
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -972,71 +972,67 @@ fn spawn_protocol_tasks(
 // ── Connection establishment helper ──────────────────────────────────────
 
 /// Try to connect to an endpoint, returning Ok(conn) or Err with retry sleep.
-/// When `tls_server_name` is Some, uses TLS via `ringline::connect_tls`.
+/// When `tls_server_name` is Some, the connection terminates TLS with that
+/// SNI name.
 ///
 /// The attempt is bounded by `connect_timeout` (zero disables the bound).
 /// Without it a SYN to a host that never answers hangs the task for the
 /// kernel's own connect timeout, minutes on Linux, and the precheck deadline
 /// in the runner only covers the first attempt of the run, not reconnects.
+///
+/// The bound is `ringline::try_timeout` around the whole connect future rather
+/// than the connect builder's `timeout`: the builder's window covers the TCP
+/// connect only, and the connect future resolves after the TLS handshake, so
+/// this one covers both, as it did before ringline #533.
+///
+/// A connect that ringline cannot submit (no free connection slot, no TLS
+/// client config) fails when the future is first polled, so it is counted and
+/// logged as a failed connect like any other.
 async fn establish_connection(
     endpoint: SocketAddr,
     worker_id: usize,
     tls_server_name: Option<&str>,
     connect_timeout: Duration,
-) -> Result<ConnCtx, DisconnectReason> {
-    let connect_result = if let Some(server_name) = tls_server_name {
-        ringline::connect_tls(endpoint, server_name)
-    } else {
-        ringline::connect(endpoint)
-    };
+) -> Result<Connection, DisconnectReason> {
+    let mut connect = ringline::connect(endpoint);
+    if let Some(server_name) = tls_server_name {
+        connect = connect.tls(server_name);
+    }
+    let future = connect.into_future();
 
-    match connect_result {
-        Ok(future) => {
-            let outcome = if connect_timeout.is_zero() {
-                Some(future.await)
-            } else {
-                match ringline::try_timeout(connect_timeout, future) {
-                    Ok(bounded) => bounded.await.ok(),
-                    // Timer pool exhausted. The attempt was consumed by the
-                    // failed arm, so report it as a failed connect and let the
-                    // caller's retry loop try again.
-                    Err(_) => Some(connect_timer_exhausted()),
-                }
-            };
-            match outcome {
-                Some(Ok(conn)) => Ok(conn),
-                Some(Err(e)) => {
-                    tracing::debug!(
-                        worker = worker_id,
-                        endpoint = %endpoint,
-                        "connect failed: {}",
-                        e
-                    );
-                    metrics::CONNECTIONS_FAILED.increment();
-                    metrics::DISCONNECTS_CONNECT_FAILED.increment();
-                    Err(DisconnectReason::ConnectFailed)
-                }
-                None => {
-                    tracing::debug!(
-                        worker = worker_id,
-                        endpoint = %endpoint,
-                        timeout = ?connect_timeout,
-                        "connect timed out"
-                    );
-                    metrics::CONNECTIONS_FAILED.increment();
-                    metrics::DISCONNECTS_CONNECT_FAILED.increment();
-                    Err(DisconnectReason::ConnectFailed)
-                }
-            }
+    let outcome = if connect_timeout.is_zero() {
+        Some(future.await)
+    } else {
+        match ringline::try_timeout(connect_timeout, future) {
+            Ok(bounded) => bounded.await.ok(),
+            // Timer pool exhausted. The connect builder submits on its first
+            // poll, so nothing was submitted; report it as a failed connect
+            // and let the caller's retry loop try again.
+            Err(_) => Some(connect_timer_exhausted()),
         }
-        Err(e) => {
-            tracing::warn!(
+    };
+    match outcome {
+        Some(Ok(conn)) => Ok(conn),
+        Some(Err(e)) => {
+            tracing::debug!(
                 worker = worker_id,
                 endpoint = %endpoint,
-                "connect initiation failed: {}",
+                "connect failed: {}",
                 e
             );
             metrics::CONNECTIONS_FAILED.increment();
+            metrics::DISCONNECTS_CONNECT_FAILED.increment();
+            Err(DisconnectReason::ConnectFailed)
+        }
+        None => {
+            tracing::debug!(
+                worker = worker_id,
+                endpoint = %endpoint,
+                timeout = ?connect_timeout,
+                "connect timed out"
+            );
+            metrics::CONNECTIONS_FAILED.increment();
+            metrics::DISCONNECTS_CONNECT_FAILED.increment();
             Err(DisconnectReason::ConnectFailed)
         }
     }
@@ -1144,7 +1140,7 @@ async fn resp_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: usize
             return;
         }
 
-        let conn = match establish_connection(
+        let connection = match establish_connection(
             endpoint,
             state.task_state.worker_id,
             tls_name.as_deref(),
@@ -1159,8 +1155,9 @@ async fn resp_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: usize
             }
         };
 
+        let conn = connection.as_conn();
         metrics::CONNECTIONS_ACTIVE.increment();
-        let builder = ringline_redis::Client::builder(conn).on_result(make_resp_callback());
+        let builder = ringline_redis::Client::builder(connection).on_result(make_resp_callback());
         #[cfg(target_os = "linux")]
         let builder =
             builder.kernel_timestamps(matches!(config.timestamps.mode, TimestampMode::Software));
@@ -1169,25 +1166,9 @@ async fn resp_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: usize
         // without materializing it (zero-copy on io_uring, streaming-drain on
         // mio). `fire_*` is unchanged and metrics are identical (recorded by the
         // `on_result` callback above).
-        let mut client = match builder
+        let mut client = builder
             .max_batch_size(config.connection.effective_batch_size())
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(
-                    worker = state.task_state.worker_id,
-                    endpoint = %endpoint,
-                    "RESP client setup failed: {}",
-                    e
-                );
-                conn.close();
-                metrics::CONNECTIONS_ACTIVE.decrement();
-                metrics::CONNECTIONS_FAILED.increment();
-                ringline::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-        };
+            .build();
         log_resp_recv_path_once();
 
         tracing::debug!(
@@ -1902,7 +1883,7 @@ async fn memcache_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: u
             return;
         }
 
-        let conn = match establish_connection(
+        let connection = match establish_connection(
             endpoint,
             state.task_state.worker_id,
             tls_name.as_deref(),
@@ -1917,34 +1898,19 @@ async fn memcache_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: u
             }
         };
 
+        let conn = connection.as_conn();
         metrics::CONNECTIONS_ACTIVE.increment();
-        let builder = ringline_memcache::Client::builder(conn)
+        let builder = ringline_memcache::Client::builder(connection)
             .on_result(make_memcache_callback())
             .max_batch_size(config.connection.effective_batch_size());
         #[cfg(target_os = "linux")]
         let builder =
             builder.kernel_timestamps(matches!(config.timestamps.mode, TimestampMode::Software));
         let binary = matches!(config.target.protocol, CacheProtocol::MemcacheBinary);
-        let built = if binary {
-            builder.build_binary().map(|c| McClient::Binary(c, conn))
+        let mut client = if binary {
+            McClient::Binary(builder.build_binary(), conn)
         } else {
-            builder.build().map(|c| McClient::Ascii(c, conn))
-        };
-        let mut client = match built {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(
-                    worker = state.task_state.worker_id,
-                    endpoint = %endpoint,
-                    "Memcache client setup failed: {}",
-                    e
-                );
-                conn.close();
-                metrics::CONNECTIONS_ACTIVE.decrement();
-                metrics::CONNECTIONS_FAILED.increment();
-                ringline::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
+            McClient::Ascii(builder.build(), conn)
         };
 
         tracing::debug!(
@@ -2444,7 +2410,7 @@ async fn ping_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: usize
             return;
         }
 
-        let conn = match establish_connection(
+        let connection = match establish_connection(
             endpoint,
             state.task_state.worker_id,
             tls_name.as_deref(),
@@ -2459,27 +2425,13 @@ async fn ping_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: usize
             }
         };
 
+        let conn = connection.as_conn();
         metrics::CONNECTIONS_ACTIVE.increment();
-        let builder = ringline_ping::Client::builder(conn).on_result(make_ping_callback());
+        let builder = ringline_ping::Client::builder(connection).on_result(make_ping_callback());
         #[cfg(target_os = "linux")]
         let builder =
             builder.kernel_timestamps(matches!(config.timestamps.mode, TimestampMode::Software));
-        let mut client = match builder.build() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(
-                    worker = state.task_state.worker_id,
-                    endpoint = %endpoint,
-                    "Ping client setup failed: {}",
-                    e
-                );
-                conn.close();
-                metrics::CONNECTIONS_ACTIVE.decrement();
-                metrics::CONNECTIONS_FAILED.increment();
-                ringline::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-        };
+        let mut client = builder.build();
 
         tracing::debug!(
             worker = state.task_state.worker_id,
@@ -2866,7 +2818,7 @@ async fn resp_append_task(state: Arc<SharedWorkerState>, endpoint_idx: usize, se
             return;
         }
 
-        let conn = match establish_connection(
+        let connection = match establish_connection(
             endpoint,
             state.task_state.worker_id,
             tls_name.as_deref(),
@@ -2881,27 +2833,14 @@ async fn resp_append_task(state: Arc<SharedWorkerState>, endpoint_idx: usize, se
             }
         };
 
+        let conn = connection.as_conn();
         metrics::APPEND_CONNECTIONS_ACTIVE.increment();
-        let builder = ringline_redis::Client::builder(conn).on_result(make_resp_append_callback());
+        let builder =
+            ringline_redis::Client::builder(connection).on_result(make_resp_append_callback());
         #[cfg(target_os = "linux")]
         let builder =
             builder.kernel_timestamps(matches!(config.timestamps.mode, TimestampMode::Software));
-        let mut client = match builder.max_batch_size(append.pipeline_depth).build() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(
-                    worker = state.task_state.worker_id,
-                    endpoint = %endpoint,
-                    "RESP append writer client setup failed: {}",
-                    e
-                );
-                conn.close();
-                metrics::APPEND_CONNECTIONS_ACTIVE.decrement();
-                metrics::CONNECTIONS_FAILED.increment();
-                ringline::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-        };
+        let mut client = builder.max_batch_size(append.pipeline_depth).build();
 
         // Same RESP3 negotiation as the reader connections.
         if matches!(config.target.protocol, CacheProtocol::Resp3)
@@ -3094,7 +3033,7 @@ async fn memcache_append_task(state: Arc<SharedWorkerState>, endpoint_idx: usize
             return;
         }
 
-        let conn = match establish_connection(
+        let connection = match establish_connection(
             endpoint,
             state.task_state.worker_id,
             tls_name.as_deref(),
@@ -3109,34 +3048,19 @@ async fn memcache_append_task(state: Arc<SharedWorkerState>, endpoint_idx: usize
             }
         };
 
+        let conn = connection.as_conn();
         metrics::APPEND_CONNECTIONS_ACTIVE.increment();
-        let builder = ringline_memcache::Client::builder(conn)
+        let builder = ringline_memcache::Client::builder(connection)
             .on_result(make_memcache_append_callback())
             .max_batch_size(append.pipeline_depth);
         #[cfg(target_os = "linux")]
         let builder =
             builder.kernel_timestamps(matches!(config.timestamps.mode, TimestampMode::Software));
         let binary = matches!(config.target.protocol, CacheProtocol::MemcacheBinary);
-        let built = if binary {
-            builder.build_binary().map(|c| McClient::Binary(c, conn))
+        let mut client = if binary {
+            McClient::Binary(builder.build_binary(), conn)
         } else {
-            builder.build().map(|c| McClient::Ascii(c, conn))
-        };
-        let mut client = match built {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(
-                    worker = state.task_state.worker_id,
-                    endpoint = %endpoint,
-                    "Memcache append writer client setup failed: {}",
-                    e
-                );
-                conn.close();
-                metrics::APPEND_CONNECTIONS_ACTIVE.decrement();
-                metrics::CONNECTIONS_FAILED.increment();
-                ringline::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
+            McClient::Ascii(builder.build(), conn)
         };
 
         tracing::debug!(
@@ -3505,7 +3429,7 @@ fn timer_exhausted_warn_once() {
 
 /// Connect path when the timer pool is exhausted: warn once, then report the
 /// attempt as failed so the caller's retry loop tries again.
-fn connect_timer_exhausted() -> Result<ConnCtx, std::io::Error> {
+fn connect_timer_exhausted() -> Result<Connection, std::io::Error> {
     timer_exhausted_warn_once();
     Err(std::io::Error::other("timer pool exhausted"))
 }

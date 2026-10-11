@@ -8,8 +8,11 @@ repository = "https://github.com/cachecannon/cachecannon"
 description = "High-performance cache protocol benchmark tool"
 
 [dependencies]
-# Metrics query engine (used by viewer)
-metriken-query = { version = "0.9", features = ["http"] }
+# Metrics query engine (used by viewer). `archive` (a default) reads dendro
+# archives and compiles SQLite; the viewer reads parquet only, so it is off
+# until the viewer opens `.dendro` (docs/journal/2026-10-08-dendro-recording.md,
+# step 5). `lz4` reads lz4-compressed parquet, which rezolus recordings may be.
+metriken-query = { version = "0.36", default-features = false, features = ["lz4"] }
 
 # Configuration
 toml = "0.8"
@@ -84,8 +87,15 @@ ndarray = { version = "0.17", optional = true }
 
 # Metrics
 histogram = "1.1"
-metriken = "0.9"
-metriken-exposition = { version = "0.16", features = ["parquet", "msgpack"] }
+# metriken-core declares `links`, so the graph holds one metriken-core: every
+# metriken crate moves together (core 0.3 here).
+metriken = "0.11.3"
+# `stream`: the `/metrics/stream` route (`src/admin/mod.rs`); dendro's wire
+# without its `archive` feature, so no SQLite. `msgpack`: the
+# `/metrics/binary` snapshot.
+metriken-exposition = { version = "0.22", default-features = false, features = ["msgpack", "stream"] }
+# `MsgpackToParquet` for `--parquet`; `convert` alone compiles no SQLite.
+metriken-storage = { version = "0.2", default-features = false, features = ["convert"] }
 
 # TLS
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
@@ -179,6 +189,9 @@ debug = true
 # two versions cannot coexist), so `dump_msgpack_fixture` writes the bytes for
 # an out-of-tree decode and this dep covers the in-graph half.
 rmp-serde = "1"
+# Decodes what `/metrics/stream` serves: the preamble, the handshake and the
+# rows frames. The wire alone, without the `archive` feature.
+dendro = { version = "0.4", default-features = false }
 
 # Build against unreleased ringline main. Pinned to a commit so builds are
 # reproducible; drop this section once the next ringline release is on crates.io.
@@ -187,7 +200,10 @@ rmp-serde = "1"
 # match a 0.7 pre-release, and cargo then builds a second ringline from
 # crates.io alongside the patched one the client crates use.
 [patch.crates-io]
-ringline = { git = "https://github.com/ringline-rs/ringline", rev = "1be7049" }
-ringline-redis = { git = "https://github.com/ringline-rs/ringline", rev = "1be7049" }
-ringline-memcache = { git = "https://github.com/ringline-rs/ringline", rev = "1be7049" }
-ringline-ping = { git = "https://github.com/ringline-rs/ringline", rev = "1be7049" }
+# dfff2e5 is ringline main after #649, which moved ringline to metriken 0.11.3
+# (metriken-core 0.3). metriken-core declares `links`, so ringline and
+# cachecannon must agree on one metriken-core; 1be7049 was still on metriken 0.9.
+ringline = { git = "https://github.com/ringline-rs/ringline", rev = "dfff2e5" }
+ringline-redis = { git = "https://github.com/ringline-rs/ringline", rev = "dfff2e5" }
+ringline-memcache = { git = "https://github.com/ringline-rs/ringline", rev = "dfff2e5" }
+ringline-ping = { git = "https://github.com/ringline-rs/ringline", rev = "dfff2e5" }
