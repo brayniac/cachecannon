@@ -200,12 +200,10 @@ dendro = { version = "0.4", default-features = false }
 # match a 0.7 pre-release, and cargo then builds a second ringline from
 # crates.io alongside the patched one the client crates use.
 [patch.crates-io]
-# NOT FOR MERGE: ringline 1be7049 depends on metriken 0.9 (metriken-core 0.2),
-# and metriken-core declares `links`, so cachecannon cannot move to metriken
-# 0.11 until ringline does. This points at 1be7049 plus that one-line bump
-# (local branch `chore/metriken-0.11-at-1be7049`, 4b589eb). Replace with the
-# ringline rev that carries the bump once it lands upstream.
-ringline = { path = "../ringline-m11/ringline" }
-ringline-redis = { path = "../ringline-m11/ringline-redis" }
-ringline-memcache = { path = "../ringline-m11/ringline-memcache" }
-ringline-ping = { path = "../ringline-m11/ringline-ping" }
+# dfff2e5 is ringline main after #649, which moved ringline to metriken 0.11.3
+# (metriken-core 0.3). metriken-core declares `links`, so ringline and
+# cachecannon must agree on one metriken-core; 1be7049 was still on metriken 0.9.
+ringline = { git = "https://github.com/ringline-rs/ringline", rev = "dfff2e5" }
+ringline-redis = { git = "https://github.com/ringline-rs/ringline", rev = "dfff2e5" }
+ringline-memcache = { git = "https://github.com/ringline-rs/ringline", rev = "dfff2e5" }
+ringline-ping = { git = "https://github.com/ringline-rs/ringline", rev = "dfff2e5" }
