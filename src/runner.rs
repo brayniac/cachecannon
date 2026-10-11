@@ -316,6 +316,15 @@ pub fn run_benchmark_full(
         .core_offset(0)
         .tcp_nodelay(true)
         .recv_buffer(recv_ring_size, recv_buffer_size)
+        // Multishot TCP receives, as before ringline #647 made one-shot the
+        // default on io_uring. Kept so a run measures the same receive path it
+        // did before the ringline move; one-shot costs an SQE per received
+        // buffer. ringline's reason for the new default is a server with many
+        // connections and large messages, where a multishot receive lets some
+        // connections hold the ring while others get no buffers. With
+        // `timestamps` on, receives are multishot `recvmsg` either way, and
+        // mio ignores the setting.
+        .recv_multishot(true)
         .loop_diag(config.general.ringline_diag);
     if let Some(tls_client) = tls_client {
         ringline_builder = ringline_builder.tls_client(tls_client);

@@ -26,12 +26,9 @@ const HSET_OVERHEAD_BYTES: usize = 64;
 /// Connect, run load -> index -> query, and assemble the report.
 pub(super) async fn run_all(job: &'static Job) -> Result<RunReport, String> {
     let conn = ringline::connect(job.endpoint)
-        .map_err(|e| format!("connect {}: {e}", job.endpoint))?
         .await
         .map_err(|e| format!("connect {}: {e:?}", job.endpoint))?;
-    let mut client = ringline_redis::Client::builder(conn)
-        .build()
-        .map_err(|e| format!("client {}: {e}", job.endpoint))?;
+    let mut client = ringline_redis::Client::builder(conn).build();
     client
         .ping()
         .await
@@ -377,16 +374,10 @@ async fn query_phase(
     for _ in 0..clients {
         let dealer = Rc::clone(&dealer);
         let handle = ringline::spawn_with_handle(async move {
-            let conn = match ringline::connect(job.endpoint) {
-                Ok(f) => match f.await {
-                    Ok(c) => c,
-                    Err(e) => return Err(format!("connect {}: {e:?}", job.endpoint)),
-                },
-                Err(e) => return Err(format!("connect {}: {e}", job.endpoint)),
-            };
-            let mut client = ringline_redis::Client::builder(conn)
-                .build()
-                .map_err(|e| format!("client {}: {e}", job.endpoint))?;
+            let conn = ringline::connect(job.endpoint)
+                .await
+                .map_err(|e| format!("connect {}: {e:?}", job.endpoint))?;
+            let mut client = ringline_redis::Client::builder(conn).build();
             let ctx = QueryCtx::new(job);
             let mut latencies_ns: Vec<u64> = Vec::new();
             let mut recall_sum = 0.0f64;
@@ -410,7 +401,9 @@ async fn query_phase(
     let mut latencies_ns: Vec<u64> = Vec::with_capacity(total);
     let mut recall_sum = 0.0f64;
     for handle in handles {
-        let (lat, recall) = handle.await?;
+        // A query task that panicked or was cancelled resolves its handle
+        // to a `JoinError` (ringline #557).
+        let (lat, recall) = handle.await.map_err(|e| format!("query worker: {e}"))??;
         latencies_ns.extend(lat);
         recall_sum += recall;
     }
