@@ -64,11 +64,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - On io_uring, ringline arms one-shot TCP receives by default
     (ringline-rs/ringline#647). cachecannon sets `recv_multishot(true)`, so
     its connections keep the multishot receives every earlier cachecannon
-    build used, and benchmark results stay comparable. ringline made one-shot
+    build used. Other ringline changes in this range change the default
+    io_uring path (ringline-rs/ringline#637 merges queued copy sends across
+    send calls; #639 and #640 change the receive throttle); no io_uring run
+    has compared results before and after. ringline made one-shot
     the default for servers with many connections and large messages, where
     a multishot receive lets some connections hold the receive ring while
     others get no buffers; one-shot costs an SQE per received buffer. With
-    `timestamps` on, receives are multishot `recvmsg` in either mode.
+    `[timestamps] mode = "software"` (Linux), every receive is multishot
+    `recvmsg` in either mode.
   - `valkey-lab search`: a query task that panicked or was cancelled resolves
     its `JoinHandle` to a `JoinError` (ringline-rs/ringline#557), reported as
     a `query worker:` error.

@@ -322,8 +322,8 @@ pub fn run_benchmark_full(
         // buffer. ringline's reason for the new default is a server with many
         // connections and large messages, where a multishot receive lets some
         // connections hold the ring while others get no buffers. With
-        // `timestamps` on, receives are multishot `recvmsg` either way, and
-        // mio ignores the setting.
+        // `[timestamps] mode = "software"` (Linux), every receive is multishot
+        // `recvmsg` either way, and mio ignores the setting.
         .recv_multishot(true)
         .loop_diag(config.general.ringline_diag);
     if let Some(tls_client) = tls_client {

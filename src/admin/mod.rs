@@ -1162,6 +1162,18 @@ mod tests {
         assert!(!body.is_empty(), "a refusal carries its reason");
     }
 
+    #[test]
+    fn metrics_stream_refuses_an_interval_below_the_floor() {
+        use std::io::Read;
+
+        let server = TestServer::start();
+        let (mut conn, status, _) = server.get("/metrics/stream?interval=1ms");
+        assert!(status.starts_with("HTTP/1.1 400 "), "{status}");
+        let mut body = String::new();
+        conn.read_to_string(&mut body).unwrap();
+        assert!(body.contains("update floor"), "{body}");
+    }
+
     /// The whole-body routes are unchanged by the stream route beside them.
     #[test]
     fn metrics_binary_still_serves_over_a_socket() {

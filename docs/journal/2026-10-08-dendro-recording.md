@@ -132,8 +132,11 @@ ones that reach cachecannon:
   64 KiB values, where multishot let some connections hold the ring and 4.2%
   of requests timed out; it gives no guidance for clients. Whether one-shot
   serves cachecannon better at high connection counts with large values is
-  not measured here. mio (macOS) ignores the setting, and with `timestamps`
-  on every receive is multishot `recvmsg` either way.
+  not measured here. mio (macOS) ignores the setting, and with
+  `[timestamps] mode = "software"` (Linux) every receive is multishot
+  `recvmsg` either way. The other ringline changes in this range (#637's
+  merged copy sends, #639 and #640's receive throttle) change the default
+  io_uring path; no io_uring run has compared results before and after.
 
 **Step 2, versions.** metriken 0.11.3, metriken-exposition 0.22
 (`msgpack`, `stream`, no defaults), metriken-storage 0.2 (`convert` only),

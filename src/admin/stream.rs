@@ -3,10 +3,16 @@
 //!
 //! The response is a status line and headers with no `Content-Length` and
 //! `Connection: close`, then the subscription's opening (dendro's preamble
-//! and the handshake) and one frame per interval until a write fails. This is
-//! what `rezolus record` reads to put cachecannon into a `.dendro` archive as
-//! it puts an agent there: rows stamped here at read time, histograms as
-//! histograms.
+//! and the handshake) and one frame per interval until a write fails. A
+//! rezolus recorder that accepts the
+//! `application/vnd.metriken.replication.v1+dendro` content type reads this
+//! to put cachecannon into a `.dendro` archive as it puts an agent there: rows
+//! stamped here at read time, histograms as histograms.
+//!
+//! An interval below [`UPDATE_FLOOR`] is refused with a 400. Every pass inside
+//! the floor is shared, so such a subscription sends empty frames as fast as
+//! it asks, which costs CPU and a missed-interval warning per frame on the
+//! host generating load.
 //!
 //! Every metric goes through [`DefaultRouter`], so cachecannon's metrics and
 //! the ringline ones linked into it land in one windowless group,
@@ -64,6 +70,17 @@ pub async fn serve<S: AsyncWrite + Unpin>(
         Ok(request) => request,
         Err(refusal) => return socket.write_all(&refusal_response(&refusal)).await,
     };
+    if request.interval < passes.floor() {
+        let refusal = Refusal {
+            status: 400,
+            message: format!(
+                "interval {:?} is below the {:?} update floor",
+                request.interval,
+                passes.floor()
+            ),
+        };
+        return socket.write_all(&refusal_response(&refusal)).await;
+    }
     let layout = request.layout;
     let mut subscription = StreamSubscription::new(request, passes.floor(), labels(), metadata());
 
@@ -98,9 +115,9 @@ fn head(subscription: &StreamSubscription) -> Vec<u8> {
     head.into_bytes()
 }
 
-/// A refused request (a malformed or zero interval, an unknown layout, a
-/// parameter given twice), answered with the status and message the route
-/// gives.
+/// A refused request (a malformed or zero interval, one below the floor, an
+/// unknown layout, a parameter given twice), answered with its status and
+/// message.
 fn refusal_response(refusal: &Refusal) -> Vec<u8> {
     let reason = match refusal.status {
         400 => "Bad Request",
