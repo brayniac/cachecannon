@@ -36,7 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   byte-identical.
 - Requires ringline 0.6.10 (was 0.6.8). metriken-core declares `links`, so the
   graph can hold one metriken-core, and ringline 0.6.9 and earlier depend on
-  metriken 0.9 (core 0.2); 0.6.10 is 0.6.9 with metriken 0.11.3. 0.6.9 fixes
+  metriken 0.9 (core 0.2). 0.6.10 is 0.6.9 with metriken 0.11.3 and two
+  stale-handle fixes: `ConnCtx::close` through a handle whose slot was reused
+  by a new connection used to close that connection and now does nothing (the
+  same for `set_recv_sink`, `take_recv_sink` and `recv_timestamp`;
+  ringline-rs/ringline#535), and `forward_recv_buf` refuses a stale handle
+  before taking the pending buffer (ringline-rs/ringline#544). cachecannon
+  calls `close` on a `ConnCtx` on a request timeout, an exhausted timer pool
+  and a receive error. 0.6.9 fixes
   one io_uring bug: a deferred `shutdown(SHUT_WR)` names its socket by
   registered-file slot, and the `Close` that frees the slot could complete
   first, so the FIN could land on the next connection accepted into that slot

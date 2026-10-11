@@ -52,8 +52,10 @@ ctrlc = { version = "3", features = ["termination"] }
 
 # I/O event loop (io_uring on Linux, mio on other platforms)
 # 0.6.10 minimum: metriken 0.11 (metriken-core 0.3), which every metriken crate
-# here must share; 0.6.9 and earlier are on metriken 0.9 (core 0.2). 0.6.10 is
-# 0.6.9's source with that bump; 0.6.9 holds the `Close` of a connection slot
+# here must share; 0.6.9 and earlier are on metriken 0.9 (core 0.2). 0.6.10 also
+# makes a stale `ConnCtx` (its slot reused) do nothing on `close`,
+# `set_recv_sink`, `take_recv_sink`, `recv_timestamp` and `forward_recv_buf`
+# (ringline #535, #544); 0.6.9 holds the `Close` of a connection slot
 # until its `Shutdown` completes (ringline #518). Carries forward the
 # 0.6.4-0.6.8 io_uring fixes (a SendMsgZc notification expected on every
 # IORING_CQE_F_MORE, send-pool and SQ-full send handling, recv completions
