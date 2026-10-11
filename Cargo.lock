@@ -504,6 +504,7 @@ dependencies = [
  "clap",
  "crossbeam-channel",
  "ctrlc",
+ "dendro",
  "hdf5-metno",
  "histogram 1.4.1",
  "http",
@@ -762,6 +763,12 @@ dependencies = [
  "nix",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "dendro"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c7ee00a1be36806c9d2198457f6da4023710209f3d79cd246fcbd3ea4eb0e86"
 
 [[package]]
 name = "deranged"
@@ -1098,6 +1105,12 @@ name = "httpdate"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
+name = "humantime"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
 
 [[package]]
 name = "hyper"
@@ -1549,14 +1562,18 @@ version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4490aadf5922e994e5ffeb6ae31b9b9f72d46cf761ec64da60fa0e327365e801"
 dependencies = [
+ "bytes",
  "chrono",
+ "dendro",
  "foldhash 0.2.0",
  "histogram 1.4.1",
+ "humantime",
  "metriken",
  "metriken-model",
  "metriken-types",
  "rmp-serde",
  "serde",
+ "tracing",
 ]
 
 [[package]]

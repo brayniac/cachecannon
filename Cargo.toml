@@ -90,8 +90,10 @@ histogram = "1.1"
 # metriken-core declares `links`, so the graph holds one metriken-core: every
 # metriken crate moves together (core 0.3 here).
 metriken = "0.11.3"
-# `msgpack`: the `/metrics/binary` snapshot.
-metriken-exposition = { version = "0.22", default-features = false, features = ["msgpack"] }
+# `stream`: the `/metrics/stream` route (`src/admin/mod.rs`); dendro's wire
+# without its `archive` feature, so no SQLite. `msgpack`: the
+# `/metrics/binary` snapshot.
+metriken-exposition = { version = "0.22", default-features = false, features = ["msgpack", "stream"] }
 # `MsgpackToParquet` for `--parquet`; `convert` alone compiles no SQLite.
 metriken-storage = { version = "0.2", default-features = false, features = ["convert"] }
 
@@ -187,6 +189,9 @@ debug = true
 # two versions cannot coexist), so `dump_msgpack_fixture` writes the bytes for
 # an out-of-tree decode and this dep covers the in-graph half.
 rmp-serde = "1"
+# Decodes what `/metrics/stream` serves: the preamble, the handshake and the
+# rows frames. The wire alone, without the `archive` feature.
+dendro = { version = "0.4", default-features = false }
 
 # Build against unreleased ringline main. Pinned to a commit so builds are
 # reproducible; drop this section once the next ringline release is on crates.io.
