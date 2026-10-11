@@ -134,9 +134,10 @@ ones that reach cachecannon:
   serves cachecannon better at high connection counts with large values is
   not measured here. mio (macOS) ignores the setting, and with
   `[timestamps] mode = "software"` (Linux) every receive is multishot
-  `recvmsg` either way. The other ringline changes in this range (#637's
-  merged copy sends, #639 and #640's receive throttle) change the default
-  io_uring path; no io_uring run has compared results before and after.
+  `recvmsg` either way. Other ringline changes in this range change the
+  default io_uring path, including #637's merged copy sends and #639 and
+  #640's receive throttle (ringline's CHANGELOG has the rest); no io_uring
+  run has compared results before and after.
 
 **Step 2, versions.** metriken 0.11.3, metriken-exposition 0.22
 (`msgpack`, `stream`, no defaults), metriken-storage 0.2 (`convert` only),
@@ -174,7 +175,8 @@ last sample times where 0.9 gave whole seconds; matrix results carry
 floor 10 ms, shared by every subscription. The admin server's hand-written
 HTTP/1 loop routes `GET /metrics/stream` before the whole-body paths:
 `StreamRequest::parse` on the query string (a `Refusal` is answered with its
-status and message), `StreamSubscription::new` with labels
+status and message; an interval below the 10 ms floor gets a 400 before any
+stream bytes), `StreamSubscription::new` with labels
 `source=cachecannon` and metadata `version=<CARGO_PKG_VERSION>`, a status
 line with the subscription's headers and `Connection: close` and no
 `Content-Length`, the opening, then `next_deadline` / `pass` / `frame_at`
@@ -198,7 +200,9 @@ metriken entry's "Left alone").
   version, then three rows frames, each with a `cachecannon/main` row, the
   first naming `response_latency` in its schema, `seq` increasing. Setting the
   source label to another value fails it, and so does dropping every pass.
-  `metrics_stream_refuses_a_zero_interval` checks the 400.
+  `metrics_stream_refuses_a_zero_interval` and
+  `metrics_stream_refuses_an_interval_below_the_floor` check the 400s, and
+  `metrics_stream_accepts_an_interval_at_the_floor` that 10 ms is served.
 - End to end on macOS: cachecannon `ping` at 2000 req/s against a local
   PING/PONG server, recorded by rezolus `feat/stream-route-adopt` (bf365042,
   debug) with `rezolus record --url http://127.0.0.1:19090 -o x.dendro
@@ -212,7 +216,7 @@ metriken entry's "Left alone").
   `recording cachecannon [source=cachecannon]`.
 - `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`,
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`, `cargo test --all` and
-  `cargo test --all --release` pass on macOS (162 lib tests, 1 ignored).
+  `cargo test --all --release` pass on macOS (164 lib tests, 1 ignored).
   Linux CI has not run.
 - Re-run on ringline dfff2e5 (macOS): the same gates, plus
   `cargo clippy --features search --all-targets -- -D warnings`, pass (162

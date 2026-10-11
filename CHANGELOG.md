@@ -65,9 +65,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (ringline-rs/ringline#647). cachecannon sets `recv_multishot(true)`, so
     its connections keep the multishot receives every earlier cachecannon
     build used. Other ringline changes in this range change the default
-    io_uring path (ringline-rs/ringline#637 merges queued copy sends across
-    send calls; #639 and #640 change the receive throttle); no io_uring run
-    has compared results before and after. ringline made one-shot
+    io_uring path, including ringline-rs/ringline#637 (queued copy sends
+    merged across send calls) and #639 and #640 (the receive throttle); see
+    ringline's CHANGELOG for the rest. No io_uring run has compared results
+    before and after. ringline made one-shot
     the default for servers with many connections and large messages, where
     a multishot receive lets some connections hold the receive ring while
     others get no buffers; one-shot costs an SQE per received buffer. With

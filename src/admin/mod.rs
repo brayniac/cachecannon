@@ -1166,6 +1166,22 @@ mod tests {
         assert!(!body.is_empty(), "a refusal carries its reason");
     }
 
+    /// An interval equal to the floor is accepted.
+    #[test]
+    fn metrics_stream_accepts_an_interval_at_the_floor() {
+        use dendro::replicate::Frame;
+        use dendro::replicate::wire::FrameReader;
+
+        let server = TestServer::start();
+        let (conn, status, _) = server.get("/metrics/stream?interval=10ms");
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        let mut reader = FrameReader::new(conn).expect("no dendro preamble");
+        assert!(matches!(
+            reader.next_frame().unwrap(),
+            Some(Frame::Handshake { .. })
+        ));
+    }
+
     #[test]
     fn metrics_stream_refuses_an_interval_below_the_floor() {
         use std::io::Read;

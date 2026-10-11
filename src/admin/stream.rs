@@ -10,9 +10,10 @@
 //! stamped here at read time, histograms as histograms.
 //!
 //! An interval below [`UPDATE_FLOOR`] is refused with a 400. Every pass inside
-//! the floor is shared, so such a subscription sends empty frames as fast as
-//! it asks, which costs CPU and a missed-interval warning per frame on the
-//! host generating load.
+//! the floor is shared, so such a subscription sends mostly empty frames as
+//! fast as it asks, which costs CPU on the host generating load and, at
+//! intervals near the timer's 1 ms resolution, a missed-interval warning for
+//! most frames.
 //!
 //! Every metric goes through [`DefaultRouter`], so cachecannon's metrics and
 //! the ringline ones linked into it land in one windowless group,
@@ -23,7 +24,7 @@ use std::io;
 use std::time::{Duration, SystemTime};
 
 use metriken_exposition::group_builder::{DefaultRouter, GroupBuilder};
-use metriken_exposition::stream::{Refusal, RegistryPasses, StreamRequest, StreamSubscription};
+use metriken_exposition::stream::{RegistryPasses, StreamRequest, StreamSubscription};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 /// The namespace every group is under: `cachecannon/main`.
@@ -68,18 +69,19 @@ pub async fn serve<S: AsyncWrite + Unpin>(
 ) -> io::Result<()> {
     let request = match StreamRequest::parse(query) {
         Ok(request) => request,
-        Err(refusal) => return socket.write_all(&refusal_response(&refusal)).await,
+        Err(refusal) => {
+            return socket
+                .write_all(&refusal_response(refusal.status, &refusal.message))
+                .await;
+        }
     };
     if request.interval < passes.floor() {
-        let refusal = Refusal {
-            status: 400,
-            message: format!(
-                "interval {:?} is below the {:?} update floor",
-                request.interval,
-                passes.floor()
-            ),
-        };
-        return socket.write_all(&refusal_response(&refusal)).await;
+        let message = format!(
+            "interval {:?} is below the {:?} update floor",
+            request.interval,
+            passes.floor()
+        );
+        return socket.write_all(&refusal_response(400, &message)).await;
     }
     let layout = request.layout;
     let mut subscription = StreamSubscription::new(request, passes.floor(), labels(), metadata());
@@ -118,8 +120,8 @@ fn head(subscription: &StreamSubscription) -> Vec<u8> {
 /// A refused request (a malformed or zero interval, one below the floor, an
 /// unknown layout, a parameter given twice), answered with its status and
 /// message.
-fn refusal_response(refusal: &Refusal) -> Vec<u8> {
-    let reason = match refusal.status {
+fn refusal_response(status: u16, message: &str) -> Vec<u8> {
+    let reason = match status {
         400 => "Bad Request",
         _ => "Error",
     };
@@ -130,10 +132,10 @@ fn refusal_response(refusal: &Refusal) -> Vec<u8> {
          Connection: close\r\n\
          \r\n\
          {}",
-        refusal.status,
+        status,
         reason,
-        refusal.message.len(),
-        refusal.message
+        message.len(),
+        message
     )
     .into_bytes()
 }
