@@ -1,8 +1,8 @@
 # Recording cachecannon into `.dendro`
 
 **Status:** OPEN. Plan opened 2026-10-08. Steps 2 and 3 built 2026-10-11 on
-branch `feat/metriken-stream` ("As built"), against a ringline that is not yet
-upstream; steps 1 and 4 to 6 remain. Decided 2026-10-08: `cachecannon view` is
+branch `feat/metriken-stream` ("As built"), against unreleased ringline main
+(dfff2e5) through `[patch.crates-io]`; steps 1 and 4 to 6 remain. Decided 2026-10-08: `cachecannon view` is
 bumped to read `.dendro`, not retired.
 
 Related entries opened the same day: rezolus
@@ -96,19 +96,44 @@ Steps 2 and 3, 2026-10-11, on `feat/metriken-stream` off upstream/main
 (released as metriken-exposition 0.22.0, metriken-storage 0.2.0,
 metriken-query 0.36.0, dendro 0.4.0).
 
-**Step 2 is blocked upstream by ringline.** ringline 1be7049, the rev
-`[patch.crates-io]` pins, depends on `metriken = "0.9"`, and so does ringline
-main (ringline-rs/ringline 5a88595). metriken-core declares `links`, so no
-graph holds metriken 0.9 (core 0.2) and 0.11 (core 0.3). The branch builds
-against 1be7049 plus that one-line bump in `ringline/Cargo.toml` and
-`ringline-bench/Cargo.toml`, a local ringline commit (4b589eb, branch
-`chore/metriken-0.11-at-1be7049`, not pushed), through a `path` patch that
-must become a ringline rev before merge. The metriken items ringline uses
-(`ShardedCounterGroup`, `Gauge`, `set_thread_shard`, `CounterGroupMetric`,
-`#[metric]`) are unchanged in 0.11; `cargo check --all-targets` of ringline,
-ringline-redis, ringline-memcache, ringline-ping and ringline-bench passed on
-macOS. The io_uring backend was not compiled: cross-checking for Linux from
-macOS failed building `ring`.
+**Step 2 needed ringline on metriken 0.11.** metriken-core declares `links`,
+so no graph holds metriken 0.9 (core 0.2) and 0.11 (core 0.3), and ringline
+1be7049, the rev upstream/main pinned, depends on `metriken = "0.9"`. The
+branch first built against 1be7049 plus that one-line bump through a local
+`path` patch. ringline-rs/ringline#649 (dfff2e5, 2026-10-11) moved ringline
+main to metriken 0.11.3, and `[patch.crates-io]` now pins
+`git = "https://github.com/ringline-rs/ringline", rev = "dfff2e5"` for
+ringline, ringline-redis, ringline-memcache and ringline-ping. Their versions
+at dfff2e5 (0.7.0-alpha.0, 0.7.0, 0.7.2, 0.6.0) are the same as at 1be7049
+and match cachecannon's requirements unchanged.
+
+**Step 2, ringline 1be7049 → dfff2e5.** 76 ringline commits; the breaking
+ones that reach cachecannon:
+
+- #533, `connect` returns a builder resolving to `Connection`.
+  `establish_connection` builds `connect(endpoint)` with `.tls(name)` when TLS
+  is on and keeps `try_timeout` around the whole future, because the
+  builder's `timeout` covers the TCP connect only and the connect future
+  resolves after the TLS handshake. The client crates take the `Connection`
+  and their `build` no longer returns `Result`, so the five "client setup
+  failed" arms are gone; each task keeps `Connection::as_conn()` for close
+  and logging. A connect that cannot be submitted now fails on first poll and
+  is counted as a failed connect (`disconnects_connect_failed` too), where it
+  was a separate warning before.
+- #539, `ShutdownHandle` → `Runtime`: cachecannon never names the type.
+- #557, `JoinHandle` resolves to `Result<T, JoinError>`: one site,
+  `valkey-lab search`'s query fan-out. The default `TaskPanicPolicy` is
+  `Contain`, as before.
+- #593, quic `now` arguments: cachecannon does not use ringline-quic.
+- #647, one-shot TCP receives by default on io_uring.
+  `ConfigBuilder::recv_multishot(true)` in `runner.rs` and `search/mod.rs`
+  keeps the multishot receives earlier builds measured with. ringline's
+  measurement for the default is a RESP server with 2048 connections and
+  64 KiB values, where multishot let some connections hold the ring and 4.2%
+  of requests timed out; it gives no guidance for clients. Whether one-shot
+  serves cachecannon better at high connection counts with large values is
+  not measured here. mio (macOS) ignores the setting, and with `timestamps`
+  on every receive is multishot `recvmsg` either way.
 
 **Step 2, versions.** metriken 0.11.3, metriken-exposition 0.22
 (`msgpack`, `stream`, no defaults), metriken-storage 0.2 (`convert` only),
@@ -186,6 +211,18 @@ metriken entry's "Left alone").
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`, `cargo test --all` and
   `cargo test --all --release` pass on macOS (162 lib tests, 1 ignored).
   Linux CI has not run.
+- Re-run on ringline dfff2e5 (macOS): the same gates, plus
+  `cargo clippy --features search --all-targets -- -D warnings`, pass (162
+  lib tests, 1 ignored), and so does `metrics_stream_serves_handshake_and_rows`.
+  End to end with the same ping config and the same rezolus debug binary,
+  `rezolus record --endpoint http://127.0.0.1:19090,source=cachecannon,role=loadgen
+  -o x.dendro --duration 6s` wrote `recording cachecannon [source=cachecannon]`,
+  `cachecannon/main 8 rows ~1.000s`; `sum(rate(responses_received[2s]))`
+  read min 1999.6, mean 2000.2, max 2000.8 over 6 points, and
+  `histogram_quantile(0.5, response_latency)` averaged 123220 ns against a
+  123 µs p50 printed by cachecannon. This exercises mio only: the io_uring
+  code, including `recv_multishot(true)` and the `timestamps` builders, is
+  compiled and tested by Linux CI alone.
 
 Step 1 (the guide) is not done: the guide still shows `-o run.rez` and now
 says a `.dendro` needs a recorder that reads the metriken content type, which
