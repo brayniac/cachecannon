@@ -32,6 +32,7 @@ request_timeout = "1s"    # Per request; on expiry all in-flight requests on tha
 # prefill = true              # Write each key once before test starts
 # prefill_timeout = "300s"    # Timeout for prefill phase (0 to disable)
 # backfill_on_miss = true     # On GET miss, SET the key (cache-aside pattern)
+# read_values = true          # Copy and CRC-32c every GET hit's value, as a client using it would
 # rate_limit = 100000         # Requests/second limit (omit for unlimited)
 
 [workload.keyspace]

@@ -288,6 +288,18 @@ pub struct Workload {
     /// On GET miss, automatically SET the key to backfill the cache (cache-aside pattern).
     #[serde(default, alias = "set_on_miss")]
     pub backfill_on_miss: bool,
+    /// Read every GET hit's value bytes: copy them into a per-connection
+    /// buffer and compute a CRC-32c over the copy. Off by default.
+    ///
+    /// By default the RESP client drains a value without copying it out of
+    /// the receive buffers, so the generator's CPU per request is lower than a
+    /// client that uses the value would spend. With this on, RESP receives
+    /// through ringline-redis `recv`, which assembles each reply into
+    /// contiguous memory, and the value is then copied and checksummed. Memcache
+    /// already assembles values; it gets the copy and checksum. Bytes read are
+    /// counted in `values_read_bytes`.
+    #[serde(default)]
+    pub read_values: bool,
     #[serde(default)]
     pub keyspace: Keyspace,
     #[serde(default)]
@@ -1139,6 +1151,20 @@ mod validation_tests {
         )
         .expect("memcache-binary config should be valid");
         assert_eq!(cfg.target.protocol, Protocol::MemcacheBinary);
+    }
+
+    #[test]
+    fn read_values_defaults_off() {
+        let parse = |workload: &str| {
+            toml::from_str::<Config>(&format!(
+                "[target]\nendpoints = [\"127.0.0.1:6379\"]\n[workload]\n{workload}"
+            ))
+            .expect("parses")
+            .workload
+            .read_values
+        };
+        assert!(!parse(""));
+        assert!(parse("read_values = true"));
     }
 
     #[test]

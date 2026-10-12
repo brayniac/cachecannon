@@ -147,6 +147,16 @@ prefill_timeout = "300s"
 # See guide.md "Backfill on Miss" section for details
 backfill_on_miss = false
 
+# Read every GET hit's value: copy it into a per-connection buffer and compute
+# a CRC-32c over the copy. Off by default. By default the RESP client drains
+# values without copying them out of the receive buffers, so client CPU per
+# request is a lower bound on what a client that uses the value spends. With
+# this on, RESP receives each reply through ringline-redis `recv`, which
+# assembles it into contiguous memory, before the copy. Memcache replies are
+# already assembled. Applies to resp, resp3, memcache and memcache-binary;
+# bytes read are counted in `values_read_bytes`.
+read_values = false
+
 [workload.keyspace]
 # Key size in bytes
 length = 16
@@ -513,6 +523,7 @@ Each snapshot contains the full set of metrics. The file uses the metriken expos
 | `backfill_set_count` | Backfill SET operations (from `backfill_on_miss`) |
 | `bytes_tx` | Total bytes transmitted |
 | `bytes_rx` | Total bytes received |
+| `values_read_bytes` | GET value bytes copied and checksummed by the client (`workload.read_values`); 0 when the option is off |
 | `connections_failed` | Total failed connection attempts |
 | `disconnects_eof` | Disconnects from EOF (server closed connection) |
 | `disconnects_recv_error` | Disconnects from receive errors |
