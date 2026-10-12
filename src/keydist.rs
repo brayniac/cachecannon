@@ -16,6 +16,8 @@
 use rand::Rng;
 use rand::distr::Distribution as _;
 use rand_distr::Zipf as ZipfDist;
+use rand_distr::weighted::WeightedAliasIndex;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -93,6 +95,31 @@ impl KeyDist {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Attach a per-endpoint sampler to a zipf distribution when there is more
+    /// than one endpoint. `endpoint_keys` is the partition from
+    /// `worker::build_endpoint_keys`. Other distributions, and a single
+    /// endpoint, are returned unchanged.
+    pub fn with_endpoint_keys(self, endpoint_keys: &Arc<Vec<Vec<u32>>>) -> Self {
+        match self {
+            KeyDist::Zipf(mut z) if endpoint_keys.len() > 1 => {
+                z.by_endpoint = Some(Arc::new(EndpointZipf::new(
+                    Arc::clone(endpoint_keys),
+                    z.theta,
+                )));
+                KeyDist::Zipf(z)
+            }
+            other => other,
+        }
+    }
+
+    /// The per-endpoint sampler, if `with_endpoint_keys` built one.
+    pub fn endpoint_sampler(&self) -> Option<&EndpointZipf> {
+        match self {
+            KeyDist::Zipf(z) => z.by_endpoint.as_deref(),
+            _ => None,
+        }
     }
 
     /// The shared head for a `recency` sampler, so the append role can publish
@@ -238,6 +265,8 @@ pub struct Zipfian {
     n: usize,
     theta: f64,
     inner: ZipfDist<f64>,
+    /// Set by `KeyDist::with_endpoint_keys` for a multi-endpoint run.
+    by_endpoint: Option<Arc<EndpointZipf>>,
 }
 
 impl Zipfian {
@@ -245,7 +274,12 @@ impl Zipfian {
         assert!(n >= 1, "zipf keyspace must be non-empty");
         let inner = ZipfDist::new(n as f64, theta)
             .expect("zipf parameters must be validated by Config::validate");
-        Self { n, theta, inner }
+        Self {
+            n,
+            theta,
+            inner,
+            by_endpoint: None,
+        }
     }
 
     #[inline]
@@ -257,6 +291,62 @@ impl Zipfian {
 
     pub fn theta(&self) -> f64 {
         self.theta
+    }
+}
+
+/// Zipf restricted to the keys one endpoint owns.
+///
+/// A connection serves one endpoint, so it may only send keys that route
+/// there. Drawing from the global `Zipfian` and discarding keys that route
+/// elsewhere costs about `1 / P(endpoint)` draws, each with a key render and a
+/// route hash; with 48 endpoints that is roughly 50 to 60 of each per request.
+/// The keys that survive that rejection have pmf
+/// `(id + 1)^-theta / sum over the endpoint's ids of (id + 1)^-theta`, and this
+/// samples exactly that pmf in O(1) with an alias table over the endpoint's
+/// ids, weighted by the same `(id + 1)^-theta` that `rand_distr::Zipf` uses
+/// for rank `id + 1`.
+///
+/// Built once by the runner and shared read-only. Memory is 12 bytes per key
+/// (an `f64` odds and a `u32` alias) on top of `endpoint_keys`.
+pub struct EndpointZipf {
+    keys: Arc<Vec<Vec<u32>>>,
+    /// `None` for an endpoint that owns no keys.
+    tables: Vec<Option<WeightedAliasIndex<f64>>>,
+}
+
+impl EndpointZipf {
+    pub fn new(keys: Arc<Vec<Vec<u32>>>, theta: f64) -> Self {
+        let tables = keys
+            .iter()
+            .map(|ids| {
+                if ids.is_empty() {
+                    return None;
+                }
+                let weights = ids
+                    .iter()
+                    .map(|&id| (id as f64 + 1.0).powf(-theta))
+                    .collect();
+                Some(
+                    WeightedAliasIndex::new(weights).expect("zipf weights are finite and positive"),
+                )
+            })
+            .collect();
+        Self { keys, tables }
+    }
+
+    /// A key id owned by endpoint `ep`, or `None` if it owns no keys.
+    #[inline]
+    pub fn sample<R: Rng + ?Sized>(&self, ep: usize, rng: &mut R) -> Option<usize> {
+        let table = self.tables[ep].as_ref()?;
+        Some(self.keys[ep][table.sample(rng)] as usize)
+    }
+}
+
+impl fmt::Debug for EndpointZipf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EndpointZipf")
+            .field("endpoints", &self.tables.len())
+            .finish()
     }
 }
 
@@ -393,6 +483,81 @@ mod tests {
             hot as f64 / 100_000.0
         };
         assert!(share(1.2) > share(0.7));
+    }
+
+    /// The per-endpoint sampler must reproduce what rejection-routing the
+    /// global sampler produces: the same key set and the same conditional pmf.
+    #[test]
+    fn endpoint_zipf_matches_rejection_routing() {
+        let n = 2_000usize;
+        let theta = 0.99;
+        let eps = 4usize;
+        // A scrambled partition, so no endpoint owns a contiguous id range.
+        let owner = |id: usize| (id.wrapping_mul(2_654_435_761) >> 7) % eps;
+        let mut buckets = vec![Vec::new(); eps];
+        for id in 0..n {
+            buckets[owner(id)].push(id as u32);
+        }
+        let keys = Arc::new(buckets);
+        let d = KeyDist::zipf(n, theta).with_endpoint_keys(&keys);
+        let by_ep = d.endpoint_sampler().expect("zipf with 4 endpoints");
+        let samples = 400_000;
+        for ep in 0..eps {
+            let mut r = rng();
+            let mut alias = vec![0usize; n];
+            for _ in 0..samples {
+                let id = by_ep.sample(ep, &mut r).unwrap();
+                assert_eq!(owner(id), ep, "sampled id {id} not owned by endpoint {ep}");
+                alias[id] += 1;
+            }
+            let mut r = rng();
+            let mut reject = vec![0usize; n];
+            let mut kept = 0;
+            while kept < samples {
+                let id = d.sample(&mut r);
+                if owner(id) == ep {
+                    reject[id] += 1;
+                    kept += 1;
+                }
+            }
+            // Hottest ids of this endpoint: each share agrees within 0.5
+            // percentage points (one standard error at 400k draws is <= 0.08).
+            for &id in keys[ep].iter().take(10) {
+                let a = alias[id as usize] as f64 / samples as f64;
+                let b = reject[id as usize] as f64 / samples as f64;
+                assert!(
+                    (a - b).abs() < 0.005,
+                    "ep {ep} id {id}: alias {a:.4} reject {b:.4}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_sampler_only_for_multi_endpoint_zipf() {
+        let two = Arc::new(vec![vec![0u32, 2], vec![1u32, 3]]);
+        let one = Arc::new(vec![vec![0u32, 1, 2, 3]]);
+        assert!(
+            KeyDist::zipf(4, 0.99)
+                .with_endpoint_keys(&two)
+                .endpoint_sampler()
+                .is_some()
+        );
+        assert!(
+            KeyDist::zipf(4, 0.99)
+                .with_endpoint_keys(&one)
+                .endpoint_sampler()
+                .is_none()
+        );
+        assert!(
+            KeyDist::uniform(4)
+                .with_endpoint_keys(&two)
+                .endpoint_sampler()
+                .is_none()
+        );
+        let empty = Arc::new(vec![vec![0u32, 1], Vec::new()]);
+        let d = KeyDist::zipf(2, 0.99).with_endpoint_keys(&empty);
+        assert_eq!(d.endpoint_sampler().unwrap().sample(1, &mut rng()), None);
     }
 
     // ── recency ──────────────────────────────────────────────────────────

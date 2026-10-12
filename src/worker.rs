@@ -1522,16 +1522,14 @@ async fn drive_resp_workload(
                 // list reproduces the global distribution exactly, so the fast
                 // path is free.
                 //
-                // SKEWED + multi-endpoint: the fast path would be WRONG. Drawing
-                // uniformly from each endpoint's own bucket makes every shard see
-                // a uniform workload and equal load, which is precisely the hot-
-                // shard effect a skewed keyspace exists to measure. So draw from
-                // the global distribution and reject-route, exactly as the RESP
-                // path does. A rejected draw must NOT consume a rate-limit token:
-                // because tokens are only spent on a match, each endpoint ends up
-                // receiving traffic in proportion to the share of the key
-                // distribution it owns -- which is the imbalance we want, not an
-                // artifact to correct for.
+                // ZIPF + multi-endpoint: draw from the zipf distribution
+                // restricted to this endpoint's keys (`EndpointZipf`), which is
+                // the distribution rejection-routing produces, in O(1) instead of
+                // ~1/P(endpoint) draw+render+route attempts per request.
+                //
+                // Other skewed distributions (recency, whose head moves) draw
+                // from the global distribution and reject-route. A rejected draw
+                // does not consume a rate-limit token.
                 let key_id = if !multi_endpoint {
                     state.task_state.key_dist.sample(rng)
                 } else if matches!(&*state.task_state.key_dist, KeyDist::Uniform { .. }) {
@@ -1542,6 +1540,12 @@ async fn drive_resp_workload(
                         break;
                     }
                     bucket[rng.random_range(0..bucket.len())] as usize
+                } else if let Some(by_endpoint) = state.task_state.key_dist.endpoint_sampler() {
+                    match by_endpoint.sample(endpoint_idx, rng) {
+                        Some(k) => k,
+                        // Endpoint owns no keys; yield to recv.
+                        None => break,
+                    }
                 } else {
                     let mut attempts = 0usize;
                     let max_attempts = max_routing_attempts(num_endpoints);

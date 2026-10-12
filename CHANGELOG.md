@@ -38,6 +38,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server module dialect, `largeobj` (`BLOB.*`, the default) or `vdma`
   (`DMA.*`). The fabric, buffers, and connection task are the same for both.
 
+### Fixed
+- Multi-endpoint `distribution = "zipf"` drew from the global zipf and
+  discarded keys that routed to another endpoint, about `1 / P(endpoint)`
+  draws, key renders and ketama hashes per request (60.9 at 48 endpoints and
+  100,000 keys; 19–39 µs per request across runs on one core of a shared
+  Apple M-series laptop, not yet measured on a server). That cost alone
+  limits 48 threads to 1.2M–2.5M keys/s, consistent with the ~2.0M req/s
+  ceiling seen with zipf. Each endpoint now samples zipf
+  restricted to its own keys from an alias table built once at startup: the
+  same pmf the rejection produced, in O(1). RESP and DMA only; memcache and
+  `recency` still reject-route.
+
 ### Changed
 - metriken 0.9 → 0.11.3 (metriken-core 0.3), metriken-exposition 0.16 → 0.22,
   metriken-query 0.9 → 0.36, and metriken-storage 0.2 for `--parquet`'s
