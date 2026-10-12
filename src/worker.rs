@@ -3906,7 +3906,7 @@ pub(crate) fn build_prefill_queues(
 /// plain random key-id over the whole keyspace (no routing needed). Routing
 /// uses the same slot table / ketama ring as `build_prefill_queues`, so the
 /// partition matches the prefill partition.
-pub(crate) fn build_endpoint_keys(
+pub fn build_endpoint_keys(
     key_count: usize,
     key_len: usize,
     endpoints: &[SocketAddr],
@@ -3935,7 +3935,7 @@ pub(crate) fn build_endpoint_keys(
 /// `run_benchmark_full` before any key is generated. See `config::KeyFormat`.
 pub(crate) static KEY_FORMAT: AtomicU8 = AtomicU8::new(0);
 
-pub(crate) fn write_key(buf: &mut [u8], id: usize) {
+pub fn write_key(buf: &mut [u8], id: usize) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     // Canonical UUID form: 8-4-4-4-12 hex with dashes at indices 8/13/18/23.
     // A typical UUID parser accepts any hex in those positions, and the trailing

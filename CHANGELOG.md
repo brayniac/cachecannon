@@ -44,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the servers together see the global distribution; with the default `even`,
   every endpoint gets the same share whatever its keys' popularity. Closed
   loop, an endpoint's share also depends on its latency.
+- `examples/zipfbench.rs`: per-key selection cost of the reject-route, alias
+  and uniform multi-endpoint paths on one core, no network.
+  `cargo run --release --example zipfbench -- [keys] [endpoints] [theta]
+  [threads] [base_addr]`.
 
 ### Fixed
 - Multi-endpoint `distribution = "zipf"` drew from the global zipf and
