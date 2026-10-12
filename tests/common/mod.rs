@@ -7,26 +7,47 @@
 // Each test binary uses part of this module.
 #![allow(dead_code)]
 
-use cachecannon::metrics::{CACHE_HITS, VALUES_READ_BYTES};
+use cachecannon::metrics::{CACHE_HITS, GET_COUNT, VALUES_READ_BYTES};
 use cachecannon::{ColorMode, Config, OutputFormat, create_formatter, run_benchmark_full};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-/// Length of the value the fake servers return for every GET.
-pub const VALUE_LEN: usize = 100;
+/// Every third GET on a connection is answered with a miss.
+pub const MISS_EVERY: u64 = 3;
 
-fn value() -> Vec<u8> {
-    (0..VALUE_LEN).map(|i| b'a' + (i % 26) as u8).collect()
+/// Large enough to span several 16 KiB receive buffers.
+pub const LARGE_VALUE_LEN: usize = 256 * 1024;
+
+/// What the fake servers return: a value of `value_len` bytes for each GET,
+/// except every [`MISS_EVERY`]th GET on a connection, which misses.
+#[derive(Clone, Copy)]
+pub struct Server {
+    pub value_len: usize,
+}
+
+impl Server {
+    fn value(self) -> Vec<u8> {
+        (0..self.value_len).map(|i| b'a' + (i % 26) as u8).collect()
+    }
+
+    pub fn spawn_resp(self) -> SocketAddr {
+        spawn(move |stream| serve_resp(stream, self))
+    }
+
+    pub fn spawn_memcache(self) -> SocketAddr {
+        spawn(move |stream| serve_memcache(stream, self))
+    }
 }
 
 /// Accept connections forever, serving each on its own thread.
-pub fn spawn_server(serve: fn(TcpStream)) -> SocketAddr {
+fn spawn(serve: impl Fn(TcpStream) + Clone + Send + 'static) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
+            let serve = serve.clone();
             std::thread::spawn(move || serve(stream));
         }
     });
@@ -43,14 +64,15 @@ fn read_line(reader: &mut impl BufRead) -> Option<Vec<u8>> {
     Some(line)
 }
 
-/// A RESP server: GET hits with [`value`], SET/PING/anything else `+OK`/`+PONG`.
-pub fn serve_resp(stream: TcpStream) {
+/// A RESP2 server: GET hits or misses per [`Server`], DEL `:1`, PING `+PONG`,
+/// anything else `+OK`.
+fn serve_resp(stream: TcpStream, server: Server) {
     let mut writer = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);
-    let value = value();
-    let mut get_reply = format!("${VALUE_LEN}\r\n").into_bytes();
-    get_reply.extend_from_slice(&value);
-    get_reply.extend_from_slice(b"\r\n");
+    let mut hit_reply = format!("${}\r\n", server.value_len).into_bytes();
+    hit_reply.extend_from_slice(&server.value());
+    hit_reply.extend_from_slice(b"\r\n");
+    let mut gets = 0u64;
     while let Some(header) = read_line(&mut reader) {
         let n: usize = std::str::from_utf8(&header[1..]).unwrap().parse().unwrap();
         let mut args = Vec::with_capacity(n);
@@ -66,7 +88,14 @@ pub fn serve_resp(stream: TcpStream) {
             args.push(arg);
         }
         let reply: &[u8] = match args[0].to_ascii_uppercase().as_slice() {
-            b"GET" => &get_reply,
+            b"GET" => {
+                gets += 1;
+                if gets.is_multiple_of(MISS_EVERY) {
+                    b"$-1\r\n"
+                } else {
+                    &hit_reply
+                }
+            }
             b"PING" => b"+PONG\r\n",
             b"DEL" => b":1\r\n",
             _ => b"+OK\r\n",
@@ -77,23 +106,29 @@ pub fn serve_resp(stream: TcpStream) {
     }
 }
 
-/// A memcache ASCII server: every `get` hits with [`value`], everything else
-/// is `STORED`.
-pub fn serve_memcache(stream: TcpStream) {
+/// A memcache ASCII server: `get` hits or misses per [`Server`], `set` is
+/// `STORED`.
+fn serve_memcache(stream: TcpStream, server: Server) {
     let mut writer = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);
-    let value = value();
+    let value = server.value();
+    let mut gets = 0u64;
     while let Some(line) = read_line(&mut reader) {
         let mut words = line.split(|b| *b == b' ');
         let reply = match words.next().unwrap() {
             b"get" => {
-                let key = words.next().unwrap();
-                let mut reply = b"VALUE ".to_vec();
-                reply.extend_from_slice(key);
-                reply.extend_from_slice(format!(" 0 {VALUE_LEN}\r\n").as_bytes());
-                reply.extend_from_slice(&value);
-                reply.extend_from_slice(b"\r\nEND\r\n");
-                reply
+                gets += 1;
+                if gets.is_multiple_of(MISS_EVERY) {
+                    b"END\r\n".to_vec()
+                } else {
+                    let key = words.next().unwrap();
+                    let mut reply = b"VALUE ".to_vec();
+                    reply.extend_from_slice(key);
+                    reply.extend_from_slice(format!(" 0 {}\r\n", server.value_len).as_bytes());
+                    reply.extend_from_slice(&value);
+                    reply.extend_from_slice(b"\r\nEND\r\n");
+                    reply
+                }
             }
             b"set" => {
                 let len: usize = std::str::from_utf8(line.rsplit(|b| *b == b' ').next().unwrap())
@@ -113,9 +148,16 @@ pub fn serve_memcache(stream: TcpStream) {
     }
 }
 
-/// Run a one-second, GET-only benchmark against `addr` and return how many
-/// hits it recorded and how many value bytes it read.
-pub fn run(addr: SocketAddr, protocol: &str, read_values: bool) -> (u64, u64) {
+/// What one run recorded.
+#[derive(Debug)]
+pub struct Counts {
+    pub gets: u64,
+    pub hits: u64,
+    pub read: u64,
+}
+
+/// Run a one-second, GET-only benchmark against `addr`.
+pub fn run(addr: SocketAddr, protocol: &str, read_values: bool) -> Counts {
     let toml = format!(
         r#"
         [general]
@@ -153,8 +195,6 @@ pub fn run(addr: SocketAddr, protocol: &str, read_values: bool) -> (u64, u64) {
     let config = Config::load(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
 
-    let hits_before = CACHE_HITS.value();
-    let read_before = VALUES_READ_BYTES.value();
     run_benchmark_full(
         config,
         None,
@@ -162,8 +202,30 @@ pub fn run(addr: SocketAddr, protocol: &str, read_values: bool) -> (u64, u64) {
         Arc::new(AtomicBool::new(true)),
     )
     .unwrap();
-    (
-        CACHE_HITS.value() - hits_before,
-        VALUES_READ_BYTES.value() - read_before,
-    )
+    Counts {
+        gets: GET_COUNT.value(),
+        hits: CACHE_HITS.value(),
+        read: VALUES_READ_BYTES.value(),
+    }
+}
+
+/// Run with `read_values = true` and check that every hit, and nothing else,
+/// was read: some GETs missed, and bytes read are hits times the value length.
+pub fn assert_every_hit_read(protocol: &str, server: Server) {
+    let addr = match protocol {
+        "resp" => server.spawn_resp(),
+        "memcache" => server.spawn_memcache(),
+        _ => unreachable!(),
+    };
+    let c = run(addr, protocol, true);
+    assert!(c.hits > 0, "no hits recorded: {c:?}");
+    assert!(c.hits < c.gets, "no misses recorded: {c:?}");
+    assert_eq!(
+        c.read,
+        c.hits * server.value_len as u64,
+        "{} hits of {} bytes, but {} bytes read",
+        c.hits,
+        server.value_len,
+        c.read
+    );
 }

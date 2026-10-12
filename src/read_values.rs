@@ -11,14 +11,15 @@ pub fn crc32c(bytes: &[u8]) -> u32 {
 
 /// Per-connection reader for received values.
 ///
-/// [`read`](Self::read) copies the value into a buffer this connection owns,
-/// computes a CRC-32c over the copy, and folds the CRC into
-/// [`digest`](Self::digest). The fold makes each CRC an input to a value the
-/// caller keeps, and the caller passes the digest to `black_box`, so neither the
-/// copy nor the checksum can be removed by the compiler.
+/// [`read`](Self::read) computes a CRC-32c over a value the client has already
+/// assembled into contiguous memory, and folds it into
+/// [`digest`](Self::digest). It makes no copy of its own: the assembly by the
+/// protocol client's `recv` is the one userspace copy a reading client makes.
+/// The fold makes each CRC an input to a value the caller keeps, and the caller
+/// passes the digest to `black_box`, so the checksum cannot be removed by the
+/// compiler.
 #[derive(Debug, Default)]
 pub struct ValueReader {
-    buf: Vec<u8>,
     digest: u32,
 }
 
@@ -27,12 +28,9 @@ impl ValueReader {
         Self::default()
     }
 
-    /// Copy `value`, checksum the copy, and count its bytes in
-    /// `values_read_bytes`.
+    /// Checksum `value` and count its bytes in `values_read_bytes`.
     pub fn read(&mut self, value: &[u8]) {
-        self.buf.clear();
-        self.buf.extend_from_slice(value);
-        self.digest = self.digest.rotate_left(1) ^ crc32c(&self.buf);
+        self.digest = self.digest.rotate_left(1) ^ crc32c(value);
         metrics::VALUES_READ_BYTES.add(value.len() as u64);
     }
 
@@ -57,7 +55,6 @@ mod tests {
         let mut reader = ValueReader::new();
         reader.read(b"123456789");
         assert_eq!(reader.digest(), 0xE306_9283);
-        assert_eq!(reader.buf, b"123456789");
     }
 
     #[test]

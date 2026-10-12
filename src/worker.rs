@@ -1687,8 +1687,8 @@ fn log_resp_recv_path_once(read_values: bool) {
     ONCE.call_once(|| {
         if read_values {
             tracing::info!(
-                "RESP recv: recv — each reply assembled; GET values copied and \
-                 CRC-32c checksummed (workload.read_values)"
+                "RESP recv: recv — each reply assembled; GET values CRC-32c \
+                 checksummed (workload.read_values)"
             );
         } else {
             tracing::info!(

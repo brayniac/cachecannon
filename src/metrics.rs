@@ -91,7 +91,7 @@ pub static BYTES_RX: Counter = Counter::new(&BYTES, bytes::RX);
 
 #[metric(
     name = "values_read_bytes",
-    description = "GET value bytes copied and checksummed by the client (workload.read_values); 0 when off"
+    description = "GET value bytes checksummed by the client (workload.read_values); 0 when off"
 )]
 pub static VALUES_READ_BYTES: Counter = Counter::new(&BYTES, bytes::VALUES_READ);
 

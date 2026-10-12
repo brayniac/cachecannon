@@ -20,13 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sent because a send failed, and is included in `offered`. It is in the
   JSON result, and the clean and verbose outputs print it when it is
   nonzero.
-- `[workload] read_values = true` copies every GET hit's value into a
-  per-connection buffer and computes a CRC-32c over it, so client CPU per
-  request includes reading the value. RESP then receives through
-  ringline-redis `recv`, which assembles each reply, instead of `recv_meta`,
-  which drains values without copying them. Bytes read are counted in the new
-  `values_read_bytes` counter. Off by default; the default recv path is
-  unchanged.
+- `[workload] read_values = true` computes a CRC-32c over every GET hit's
+  value, so client CPU per request includes reading the value. RESP then
+  receives through ringline-redis `recv`, which copies each reply into
+  contiguous memory, instead of `recv_meta`, which drains values without
+  copying them; memcache already received that way. No further copy is made.
+  Bytes read are counted in the new `values_read_bytes` counter. Rejected with
+  `protocol = "ping"`. Off by default; the default recv path is unchanged.
+  `docs/reference.md` "Reading values" lists the timing and error-handling
+  differences.
 
 ### Changed
 - metriken 0.9 → 0.11.3 (metriken-core 0.3), metriken-exposition 0.16 → 0.22,

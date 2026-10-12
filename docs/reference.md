@@ -147,14 +147,8 @@ prefill_timeout = "300s"
 # See guide.md "Backfill on Miss" section for details
 backfill_on_miss = false
 
-# Read every GET hit's value: copy it into a per-connection buffer and compute
-# a CRC-32c over the copy. Off by default. By default the RESP client drains
-# values without copying them out of the receive buffers, so client CPU per
-# request is a lower bound on what a client that uses the value spends. With
-# this on, RESP receives each reply through ringline-redis `recv`, which
-# assembles it into contiguous memory, before the copy. Memcache replies are
-# already assembled. Applies to resp, resp3, memcache and memcache-binary;
-# bytes read are counted in `values_read_bytes`.
+# Read every GET hit's value: CRC-32c over each value as the client returns it.
+# Off by default. See "Reading values" below.
 read_values = false
 
 [workload.keyspace]
@@ -199,6 +193,36 @@ set = 20  # 20% SETs
 # Value size for SET commands (bytes)
 length = 64
 ```
+
+#### Reading values
+
+By default the RESP client receives GET replies with ringline-redis
+`recv_meta`, which parses the reply header and drains the value without
+copying it out of the receive buffers. Client CPU per request is then a lower
+bound on what a client that uses the value spends. `read_values = true` adds
+the work such a client does, per GET hit:
+
+| Protocol | Work per hit with `read_values = true` |
+|----------|----------------------------------------|
+| resp, resp3 | `recv` copies the reply from the receive buffers into ringline's per-connection accumulator (one userspace copy) and returns the value as a slice of it; CRC-32c over that slice. No further copy. |
+| memcache, memcache-binary | `recv` already copies each reply into the accumulator with the option off; the option adds the CRC-32c over the returned slice. No further copy. |
+
+Each CRC is folded into a per-connection value passed to `black_box`, so the
+compiler cannot remove it. `values_read_bytes` counts the bytes checksummed.
+`protocol = "ping"` with `read_values = true` is rejected at config load.
+
+Differences from the default path:
+
+- The CRC runs after the reply's latency is recorded. Under
+  `timestamps.mode = "userspace"` its cost appears in the latency of later
+  replies on the same worker; under `"software"` it appears only in client CPU
+  and achieved throughput.
+- An unexpected reply type to a RESP GET is a per-request error and the
+  connection stays open. With the option off it closes the connection, which
+  is counted in `disconnects_recv_error`.
+- A RESP reply larger than ringline's `recv_accumulator_max` (default 1 GiB)
+  fails only with the option on; `recv_meta` streams the value and has no such
+  limit.
 
 ### Saturation Search Settings
 
@@ -523,7 +547,7 @@ Each snapshot contains the full set of metrics. The file uses the metriken expos
 | `backfill_set_count` | Backfill SET operations (from `backfill_on_miss`) |
 | `bytes_tx` | Total bytes transmitted |
 | `bytes_rx` | Total bytes received |
-| `values_read_bytes` | GET value bytes copied and checksummed by the client (`workload.read_values`); 0 when the option is off |
+| `values_read_bytes` | GET value bytes checksummed by the client (`workload.read_values`); 0 when the option is off |
 | `connections_failed` | Total failed connection attempts |
 | `disconnects_eof` | Disconnects from EOF (server closed connection) |
 | `disconnects_recv_error` | Disconnects from receive errors |
