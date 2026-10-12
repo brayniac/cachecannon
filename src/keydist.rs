@@ -332,7 +332,9 @@ impl EndpointZipf {
                     .collect();
                 shares.push(weights.iter().sum());
                 Some(
-                    WeightedAliasIndex::new(weights).expect("zipf weights are finite and positive"),
+                    WeightedAliasIndex::new(weights).expect(
+                        "zipf weights underflowed; Config::validate bounds zipf_theta to keep them positive",
+                    ),
                 )
             })
             .collect();
@@ -504,7 +506,16 @@ mod tests {
     }
 
     /// The per-endpoint sampler must reproduce what rejection-routing the
-    /// global sampler produces: the same key set and the same conditional pmf.
+    /// global sampler produces: the same key set and the same conditional pmf,
+    /// `(id + 1)^-theta` normalised over the endpoint's ids.
+    ///
+    /// Compared over the whole pmf, in 10 log-spaced bins of the endpoint's
+    /// ids ranked by popularity (1, 1, 2, 4, ... ids per bin), by total
+    /// variation distance against the exact conditional pmf. At 400k draws the
+    /// sampling noise in that distance is about 0.002; a theta off by 1%
+    /// (0.99 * 0.99) moves it by 0.0115. The bound is 0.005. Rejection-routing
+    /// is held to the same bound, which checks that the exact pmf is what the
+    /// old path produced.
     #[test]
     fn endpoint_zipf_matches_rejection_routing() {
         let n = 2_000usize;
@@ -520,7 +531,29 @@ mod tests {
         let d = KeyDist::zipf(n, theta).with_endpoint_keys(&keys);
         let by_ep = d.endpoint_sampler().expect("zipf with 4 endpoints");
         let samples = 400_000;
+        let edges = [0usize, 1, 2, 4, 8, 16, 32, 64, 128, 256, usize::MAX];
+        // Bin of each id: its rank within the endpoint's ascending id list.
+        let binned = |bucket: &[u32], mass: &dyn Fn(usize) -> f64| -> Vec<f64> {
+            let mut out = vec![0.0; edges.len() - 1];
+            for (rank, &id) in bucket.iter().enumerate() {
+                let bin = edges
+                    .windows(2)
+                    .position(|w| rank >= w[0] && rank < w[1])
+                    .unwrap();
+                out[bin] += mass(id as usize);
+            }
+            out
+        };
+        let tvd =
+            |a: &[f64], b: &[f64]| 0.5 * a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum::<f64>();
         for ep in 0..eps {
+            let bucket = &keys[ep];
+            let norm: f64 = bucket
+                .iter()
+                .map(|&id| (id as f64 + 1.0).powf(-theta))
+                .sum();
+            let exact = binned(bucket, &|id| (id as f64 + 1.0).powf(-theta) / norm);
+
             let mut r = rng();
             let mut alias = vec![0usize; n];
             for _ in 0..samples {
@@ -538,16 +571,17 @@ mod tests {
                     kept += 1;
                 }
             }
-            // Hottest ids of this endpoint: each share agrees within 0.5
-            // percentage points (one standard error at 400k draws is <= 0.08).
-            for &id in keys[ep].iter().take(10) {
-                let a = alias[id as usize] as f64 / samples as f64;
-                let b = reject[id as usize] as f64 / samples as f64;
-                assert!(
-                    (a - b).abs() < 0.005,
-                    "ep {ep} id {id}: alias {a:.4} reject {b:.4}"
-                );
-            }
+            let freq = |c: &[usize]| {
+                let c = c.to_vec();
+                binned(bucket, &move |id| c[id] as f64 / samples as f64)
+            };
+            let a = tvd(&freq(&alias), &exact);
+            let b = tvd(&freq(&reject), &exact);
+            assert!(a < 0.005, "endpoint {ep}: alias pmf TVD {a:.4} from exact");
+            assert!(
+                b < 0.005,
+                "endpoint {ep}: rejection pmf TVD {b:.4} from exact"
+            );
         }
     }
 

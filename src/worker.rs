@@ -1048,32 +1048,50 @@ fn spawn_protocol_tasks(
 }
 
 /// Endpoint index for each of `total` global connection indices, with endpoint
-/// `e` getting about `shares[e] * total` connections and at least one.
+/// `e` getting about `shares[e] * total` connections: at least one if it owns
+/// any keys, none if it owns none. A connection to an endpoint with no keys
+/// would claim rate-limit tokens it can never spend.
 ///
-/// Counts: floor of each target, raised to 1, then adjusted one connection at a
-/// time toward the endpoints furthest below (or above) their target until they
-/// sum to `total`. Order: endpoint `e`'s `k`-th connection is placed at
-/// `(k + 0.5) / count_e` and all are sorted by that position, so every
-/// contiguous range of indices (one worker's connections) carries a mix of
-/// endpoints in roughly the same proportions.
+/// Counts: floor of each target, raised to 1 for endpoints with keys, then
+/// adjusted one connection at a time toward the endpoints furthest below (or
+/// above) their target until they sum to `total`. Order: endpoint `e`'s `k`-th
+/// connection is placed at `(k + 0.5) / count_e` and all are sorted by that
+/// position, so every contiguous range of indices (one worker's connections)
+/// carries a mix of endpoints in roughly the same proportions.
 ///
-/// With fewer connections than endpoints the minimum of one each cannot be met;
-/// that falls back to round-robin. Config validation rejects it for a static
-/// endpoint list.
+/// With fewer connections than endpoints that own keys, the minimum of one each
+/// cannot be met; that falls back to round-robin over those endpoints. Config
+/// validation rejects fewer connections than endpoints for a static list.
 pub(crate) fn key_share_endpoints(shares: &[f64], total: usize) -> Vec<usize> {
     let n = shares.len();
-    if n == 0 || total < n {
-        return (0..total).map(|i| i % n.max(1)).collect();
+    let live: Vec<usize> = (0..n).filter(|&e| shares[e] > 0.0).collect();
+    if live.is_empty() || total < live.len() {
+        let pool: Vec<usize> = if live.is_empty() {
+            (0..n.max(1)).collect()
+        } else {
+            live
+        };
+        return (0..total).map(|i| pool[i % pool.len()]).collect();
     }
     let target: Vec<f64> = shares.iter().map(|s| s * total as f64).collect();
-    let mut count: Vec<usize> = target.iter().map(|t| (t.floor() as usize).max(1)).collect();
+    let mut count: Vec<usize> = (0..n)
+        .map(|e| {
+            if shares[e] > 0.0 {
+                (target[e].floor() as usize).max(1)
+            } else {
+                0
+            }
+        })
+        .collect();
     let mut sum: usize = count.iter().sum();
     while sum < total {
-        let e = (0..n)
+        let e = live
+            .iter()
+            .copied()
             .max_by(|&a, &b| {
                 (target[a] - count[a] as f64).total_cmp(&(target[b] - count[b] as f64))
             })
-            .expect("n > 0");
+            .expect("live is not empty");
         count[e] += 1;
         sum += 1;
     }
@@ -1083,7 +1101,7 @@ pub(crate) fn key_share_endpoints(shares: &[f64], total: usize) -> Vec<usize> {
             .min_by(|&a, &b| {
                 (target[a] - count[a] as f64).total_cmp(&(target[b] - count[b] as f64))
             })
-            .expect("total >= n, so some endpoint has more than one");
+            .expect("total >= live endpoints, so some endpoint has more than one");
         count[e] -= 1;
         sum -= 1;
     }
@@ -4059,6 +4077,35 @@ mod tests {
                 "a 32-connection slice covers only {} endpoints",
                 seen.len()
             );
+        }
+    }
+
+    /// 128 keys over 48 endpoints (16 GiB of 128 MiB values): some endpoints
+    /// own no keys and must get no connection, the rest at least one.
+    #[test]
+    fn key_share_gives_keyless_endpoints_no_connections() {
+        let endpoints: Vec<SocketAddr> = (0..48)
+            .map(|i| format!("172.31.0.10:{}", 6379 + i).parse().unwrap())
+            .collect();
+        let keys = Arc::new(build_endpoint_keys(128, 16, &endpoints, &None));
+        let empty = keys.iter().filter(|b| b.is_empty()).count();
+        assert!(empty > 0, "fixture should leave some endpoint without keys");
+        let d = KeyDist::zipf(128, 0.99).with_endpoint_keys(&keys);
+        let a = key_share_endpoints(d.endpoint_sampler().unwrap().shares(), 1_536);
+        assert_eq!(a.len(), 1_536);
+        let mut count = vec![0usize; keys.len()];
+        for &e in &a {
+            count[e] += 1;
+        }
+        for (e, bucket) in keys.iter().enumerate() {
+            if bucket.is_empty() {
+                assert_eq!(count[e], 0, "endpoint {e} owns no keys but has connections");
+            } else {
+                assert!(
+                    count[e] >= 1,
+                    "endpoint {e} owns keys but has no connection"
+                );
+            }
         }
     }
 

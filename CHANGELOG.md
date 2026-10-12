@@ -39,17 +39,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`DMA.*`). The fabric, buffers, and connection task are the same for both.
 - `[connection] endpoint_allocation = "key_share"` (zipf, several endpoints):
   each endpoint gets connections in proportion to the zipf probability its
-  keys carry, at least one each, instead of an equal number. In a
-  rate-limited run each endpoint then receives its zipf share of requests, so
+  keys carry (at least one if it owns keys, none if it owns none) instead of
+  an equal number. In a rate-limited run in which no connection is held back
+  by its pipeline, each endpoint then receives its zipf share of requests, so
   the servers together see the global distribution; with the default `even`,
-  every endpoint gets the same share whatever its keys' popularity. Closed
-  loop, an endpoint's share also depends on its latency.
+  every endpoint gets the same share whatever its keys' popularity. With DMA
+  at MiB values (one transfer per connection) or closed loop, the hot
+  endpoint gets less than its share. `docs/reference.md` says how to check
+  the shares a run achieved.
 - `examples/zipfbench.rs`: per-key selection cost of the reject-route, alias
   and uniform multi-endpoint paths on one core, no network.
   `cargo run --release --example zipfbench -- [keys] [endpoints] [theta]
   [threads] [base_addr]`.
 
 ### Fixed
+- `keyspace.zipf_theta` is now bounded to (0, 10]. A large theta could
+  underflow every key weight on an endpoint, which the per-endpoint alias
+  tables below cannot sample.
+- Known, not fixed: with `endpoint_allocation = "even"` (the default), an
+  endpoint that owns no keys (fewer keys than endpoints, e.g. a 16 GiB
+  keyspace of 128 MiB values over 48 endpoints) still gets connections. In
+  RESP each claims a rate-limit token batch, finds no key and drops it, which
+  lowers the achieved rate. `key_share` gives such endpoints no connections.
 - Multi-endpoint `distribution = "zipf"` drew from the global zipf and
   discarded keys that routed to another endpoint, about `1 / P(endpoint)`
   draws, key renders and ketama hashes per request (60.9 at 48 endpoints and
