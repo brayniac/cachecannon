@@ -2,11 +2,17 @@
 //! connection task can take. No network; nothing is sent.
 //!
 //! ```text
-//! cargo run --release --example zipfbench -- [keys] [endpoints] [theta] [threads] [base_addr]
-//! cargo run --release --example zipfbench -- 100000 48 0.99 48 10.0.0.5:6379
+//! cargo run --release --example zipfbench -- [keys] [endpoints] [theta] [threads] [base_addr] [connections]
+//! cargo run --release --example zipfbench -- 100000 48 0.99 48 10.0.0.5:6379 1536
 //! ```
 //!
-//! Defaults: 100,000 keys, 48 endpoints, theta 0.99, 1 thread, 172.31.0.10:6379.
+//! Defaults: 100,000 keys, 48 endpoints, theta 0.99, 1 thread, 172.31.0.10:6379,
+//! 1,536 connections.
+//!
+//! First prints one line per endpoint: index, address, keys owned, zipf share
+//! (the fraction of requests it should receive), and the connections
+//! `endpoint_allocation = "key_share"` gives it out of `connections`. Compare
+//! a run's per-instance request fractions against the share column.
 //! Endpoint `i` is `base_addr` with port `+ i`, the shape of a run with one
 //! server instance per port; the ketama partition depends on these strings, so
 //! pass the real server address to reproduce a run's partition. Keys are
@@ -23,7 +29,7 @@
 //! `threads > 1` the per-thread figures show whether anything is shared.
 
 use cachecannon::keydist::KeyDist;
-use cachecannon::worker::{build_endpoint_keys, write_key};
+use cachecannon::worker::{build_endpoint_keys, key_share_endpoints, write_key};
 use rand::{Rng, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use std::hint::black_box;
@@ -41,13 +47,23 @@ fn main() {
     let theta: f64 = arg(2, "0.99").parse().expect("theta");
     let threads: usize = arg(3, "1").parse().expect("threads");
     let base: SocketAddr = arg(4, "172.31.0.10:6379").parse().expect("base_addr");
+    let connections: usize = arg(5, "1536").parse().expect("connections");
     assert!(
         eps >= 2,
         "the per-endpoint paths need at least two endpoints"
     );
 
     let endpoints: Vec<SocketAddr> = (0..eps)
-        .map(|i| SocketAddr::new(base.ip(), base.port() + i as u16))
+        .map(|i| {
+            let port = u16::try_from(i)
+                .ok()
+                .and_then(|i| base.port().checked_add(i))
+                .unwrap_or_else(|| {
+                    eprintln!("base port {} + {eps} endpoints exceeds 65535", base.port());
+                    std::process::exit(2);
+                });
+            SocketAddr::new(base.ip(), port)
+        })
         .collect();
     let ids: Vec<String> = endpoints.iter().map(|a| a.to_string()).collect();
     let ring = Arc::new(ketama::Ring::build(
@@ -58,17 +74,33 @@ fn main() {
     let dist = Arc::new(KeyDist::zipf(n, theta).with_endpoint_keys(&keys));
     let build_ms = t.elapsed().as_secs_f64() * 1e3;
     let shares = dist.endpoint_sampler().unwrap().shares().to_vec();
+    // Endpoints that own no keys have share 0 and are left out of min/max.
     let (lo, hi) = shares
         .iter()
+        .filter(|&&s| s > 0.0)
         .fold((f64::MAX, 0.0f64), |(l, h), &s| (l.min(s), h.max(s)));
     let sizes: Vec<usize> = keys.iter().map(|b| b.len()).collect();
     println!(
         "keys={n} endpoints={eps} theta={theta} threads={threads} alias build {build_ms:.1} ms"
     );
     let empty = sizes.iter().filter(|&&s| s == 0).count();
+    let mut conns = vec![0usize; eps];
+    for e in key_share_endpoints(&shares, connections) {
+        conns[e] += 1;
+    }
+    println!("endpoint  address                keys  zipf_share  key_share_conns/{connections}");
+    for e in 0..eps {
+        println!(
+            "{e:>8}  {:<21} {:>6}  {:>10.6}  {:>6}",
+            endpoints[e].to_string(),
+            sizes[e],
+            shares[e],
+            conns[e]
+        );
+    }
     println!(
-        "endpoint keys min {} max {} ({empty} endpoints own none, skipped); \
-         endpoint zipf share min {lo:.4} max {hi:.4}",
+        "endpoint keys min {} max {} ({empty} endpoints own none, skipped below); \
+         zipf share over endpoints with keys min {lo:.4} max {hi:.4}",
         sizes.iter().min().unwrap(),
         sizes.iter().max().unwrap()
     );

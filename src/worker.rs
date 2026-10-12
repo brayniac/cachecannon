@@ -1062,7 +1062,7 @@ fn spawn_protocol_tasks(
 /// With fewer connections than endpoints that own keys, the minimum of one each
 /// cannot be met; that falls back to round-robin over those endpoints. Config
 /// validation rejects fewer connections than endpoints for a static list.
-pub(crate) fn key_share_endpoints(shares: &[f64], total: usize) -> Vec<usize> {
+pub fn key_share_endpoints(shares: &[f64], total: usize) -> Vec<usize> {
     let n = shares.len();
     let live: Vec<usize> = (0..n).filter(|&e| shares[e] > 0.0).collect();
     if live.is_empty() || total < live.len() {

@@ -146,7 +146,10 @@ connections spend most of their time waiting on a transfer and it receives less
 than its share. In a closed-loop run an endpoint's share also depends on its
 latency. Check the shares a run achieved from per-instance server counters, for
 example `cmdstat_get` and `cmdstat_set` calls from `INFO commandstats` on each
-instance, divided by their total, against the shares `zipfbench` prints.
+instance, divided by their total, against the `zipf_share` column that
+`cargo run --release --example zipfbench -- <keys> <endpoints> <theta> 1
+<first endpoint addr> <connections>` prints per endpoint (with the same
+endpoint addresses, since the key partition depends on them).
 
 With `even`, an endpoint that owns no keys (fewer keys than endpoints, or a
 large value size) still gets connections; under a rate limit they claim tokens

@@ -50,17 +50,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `examples/zipfbench.rs`: per-key selection cost of the reject-route, alias
   and uniform multi-endpoint paths on one core, no network.
   `cargo run --release --example zipfbench -- [keys] [endpoints] [theta]
-  [threads] [base_addr]`.
+  [threads] [base_addr] [connections]`; prints each endpoint's keys, zipf
+  share and `key_share` connection count.
 
 ### Fixed
 - `keyspace.zipf_theta` is now bounded to (0, 10]. A large theta could
   underflow every key weight on an endpoint, which the per-endpoint alias
   tables below cannot sample.
-- Known, not fixed: with `endpoint_allocation = "even"` (the default), an
-  endpoint that owns no keys (fewer keys than endpoints, e.g. a 16 GiB
-  keyspace of 128 MiB values over 48 endpoints) still gets connections. In
-  RESP each claims a rate-limit token batch, finds no key and drops it, which
-  lowers the achieved rate. `key_share` gives such endpoints no connections.
 - Multi-endpoint `distribution = "zipf"` drew from the global zipf and
   discarded keys that routed to another endpoint, about `1 / P(endpoint)`
   draws, key renders and ketama hashes per request (60.9 at 48 endpoints and
@@ -71,6 +67,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restricted to its own keys from an alias table built once at startup: the
   same pmf the rejection produced, in O(1). RESP and DMA only; memcache and
   `recency` still reject-route.
+
+### Known issues
+- Known, not fixed: with `endpoint_allocation = "even"` (the default), an
+  endpoint that owns no keys (fewer keys than endpoints, e.g. a 16 GiB
+  keyspace of 128 MiB values over 48 endpoints) still gets connections. In
+  RESP each claims a rate-limit token batch, finds no key and drops it, which
+  lowers the achieved rate. `key_share` gives such endpoints no connections.
 
 ### Changed
 - metriken 0.9 → 0.11.3 (metriken-core 0.3), metriken-exposition 0.16 → 0.22,
