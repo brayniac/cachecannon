@@ -65,8 +65,10 @@ fn main() {
     println!(
         "keys={n} endpoints={eps} theta={theta} threads={threads} alias build {build_ms:.1} ms"
     );
+    let empty = sizes.iter().filter(|&&s| s == 0).count();
     println!(
-        "endpoint keys min {} max {}; endpoint zipf share min {lo:.4} max {hi:.4}",
+        "endpoint keys min {} max {} ({empty} endpoints own none, skipped); \
+         endpoint zipf share min {lo:.4} max {hi:.4}",
         sizes.iter().min().unwrap(),
         sizes.iter().max().unwrap()
     );
@@ -74,7 +76,7 @@ fn main() {
     let handles: Vec<_> = (0..threads)
         .map(|t| {
             let (dist, keys, ring) = (Arc::clone(&dist), Arc::clone(&keys), Arc::clone(&ring));
-            std::thread::spawn(move || bench_thread(t as u64, &dist, &keys, &ring, eps))
+            std::thread::spawn(move || bench_thread(t as u64, &dist, &keys, &ring))
         })
         .collect();
     println!("thread  reject_ns  attempts  alias_ns  uniform_ns");
@@ -103,27 +105,23 @@ fn main() {
 }
 
 /// Returns [reject ns/key, reject attempts/key, alias ns/key, uniform ns/key].
-fn bench_thread(
-    seed: u64,
-    dist: &KeyDist,
-    keys: &[Vec<u32>],
-    ring: &ketama::Ring,
-    eps: usize,
-) -> [f64; 4] {
+fn bench_thread(seed: u64, dist: &KeyDist, keys: &[Vec<u32>], ring: &ketama::Ring) -> [f64; 4] {
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
     let mut kb = [0u8; KEY_LEN];
     // Stands in for `route_key`'s per-call read lock on the slot table.
     let slot_table: RwLock<Option<Vec<u16>>> = RwLock::new(None);
     let by_ep = dist.endpoint_sampler().unwrap();
-    // Round-robin over endpoints, as connections are, so attempts average
-    // 1 / P(endpoint) over all endpoints.
+    // Round-robin over the endpoints that own keys, as connections are, so
+    // attempts average 1 / P(endpoint) over them. An endpoint with no keys has
+    // no key to find (the reject loop would never end) and no alias table.
+    let live: Vec<usize> = (0..keys.len()).filter(|&e| !keys[e].is_empty()).collect();
     let reject_keys = 100_000;
     let fast_keys = 10_000_000;
 
     let mut attempts = 0usize;
     let t = Instant::now();
     for i in 0..reject_keys {
-        let ep = i % eps;
+        let ep = live[i % live.len()];
         loop {
             let c = dist.sample(&mut rng);
             write_key(&mut kb, c);
@@ -140,7 +138,9 @@ fn bench_thread(
 
     let t = Instant::now();
     for i in 0..fast_keys {
-        let id = by_ep.sample(i % eps, &mut rng).unwrap();
+        let id = by_ep
+            .sample(live[i % live.len()], &mut rng)
+            .expect("live endpoints own keys");
         write_key(&mut kb, id);
         black_box(&kb);
     }
@@ -148,7 +148,7 @@ fn bench_thread(
 
     let t = Instant::now();
     for i in 0..fast_keys {
-        let bucket = &keys[i % eps];
+        let bucket = &keys[live[i % live.len()]];
         write_key(&mut kb, bucket[rng.random_range(0..bucket.len())] as usize);
         black_box(&kb);
     }
