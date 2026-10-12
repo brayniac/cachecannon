@@ -106,6 +106,8 @@ ratelimit = "2.0.0"
 
 # Utilities
 bytes = "1.11.1"
+# CRC-32c over received values (`workload.read_values`).
+crc-fast = { version = "1.10", default-features = false, features = ["std"] }
 libc = "0.2"
 socket2 = { version = "0.5", features = ["all"] }
 

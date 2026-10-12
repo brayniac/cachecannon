@@ -12,6 +12,7 @@ use crate::config::{Config, Protocol as CacheProtocol};
 use crate::keydist::KeyDist;
 use crate::limiters::WorkerLimiter;
 use crate::metrics;
+use crate::read_values::ValueReader;
 use ratelimit::{Ratelimiter, TryWaitError};
 
 use ringline::{AsyncEventHandler, ConnCtx, Connection, DriverCtx, RegionId, SendGuard};
@@ -1164,12 +1165,13 @@ async fn resp_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: usize
         // Zero-copy recv is not a builder toggle — it lives in the recv method:
         // the recv loop calls `client.recv_meta()`, which drains each value
         // without materializing it (zero-copy on io_uring, streaming-drain on
-        // mio). `fire_*` is unchanged and metrics are identical (recorded by the
-        // `on_result` callback above).
+        // mio), or `client.recv()` under `workload.read_values`. `fire_*` is
+        // unchanged and metrics are identical (recorded by the `on_result`
+        // callback above).
         let mut client = builder
             .max_batch_size(config.connection.effective_batch_size())
             .build();
-        log_resp_recv_path_once();
+        log_resp_recv_path_once(config.workload.read_values);
 
         tracing::debug!(
             worker = state.task_state.worker_id,
@@ -1289,6 +1291,7 @@ async fn drive_resp_workload(
     let mut carried_tokens: u64 = 0;
     let mut prefill_in_flight: VecDeque<usize> = VecDeque::new();
     let mut inflight = InFlight::new(config.connection.request_timeout, pipeline_depth);
+    let mut value_reader = ReadValues::new(config.workload.read_values);
 
     loop {
         let phase = state.task_state.shared.phase();
@@ -1580,14 +1583,22 @@ async fn drive_resp_workload(
             continue;
         }
 
-        // Zero-copy recv, every reply, every op kind and phase (prefill SETs
-        // included). A load generator never needs value *content* — only the
-        // header (kind / hit-miss / length / error) — so `recv_meta` drains each
-        // value without materializing it: zero-copy over provided buffers on
-        // io_uring, bounded streaming-drain on mio. One uniform call, no config
-        // flag, no cfg split, no workload restriction.
-        let result = match recv_with_timeout(client.recv_meta(), &mut inflight, conn).await {
-            Ok(Ok(meta)) => map_respmeta(meta),
+        // By default, zero-copy recv for every reply, every op kind and phase
+        // (prefill SETs included): only the header (kind / hit-miss / length /
+        // error) is used, so `recv_meta` drains each value without
+        // materializing it — zero-copy over provided buffers on io_uring,
+        // bounded streaming-drain on mio. `workload.read_values` switches to
+        // `recv`, which assembles each reply, and reads every GET hit's value.
+        let received = match value_reader.as_mut() {
+            None => recv_with_timeout(client.recv_meta(), &mut inflight, conn)
+                .await
+                .map(|r| r.map(map_respmeta)),
+            Some(reader) => recv_with_timeout(client.recv(), &mut inflight, conn)
+                .await
+                .map(|r| r.map(|op| map_resp_op(op, reader))),
+        };
+        let result = match received {
+            Ok(Ok(result)) => result,
             Ok(Err(ringline_redis::Error::ConnectionClosed)) => {
                 requeue_drained_prefill(&state.task_state, key_buf, prefill_in_flight.drain(..));
                 return Err(DisconnectReason::Eof);
@@ -1670,15 +1681,153 @@ const BACKFILL_QUEUE_CAP: usize = 1024;
 
 /// Report the RESP recv path once, so a run's output makes the strategy
 /// explicit (transparency: automatic, but observable).
-fn log_resp_recv_path_once() {
+fn log_resp_recv_path_once(read_values: bool) {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        tracing::info!(
-            "RESP recv: recv_meta — value bytes drained, never materialized \
-             (zero-copy on io_uring, bounded streaming-drain on mio)"
-        );
+        if read_values {
+            tracing::info!(
+                "RESP recv: recv — each reply assembled; GET values CRC-32c \
+                 checksummed (workload.read_values)"
+            );
+        } else {
+            tracing::info!(
+                "RESP recv: recv_meta — value bytes drained, never materialized \
+                 (zero-copy on io_uring, bounded streaming-drain on mio)"
+            );
+        }
     });
+}
+
+/// A connection's [`ValueReader`] when `workload.read_values` is on.
+///
+/// Dropping it passes the reader's CRC digest to `black_box`, so the checksums
+/// have an observed result and cannot be optimised out.
+struct ReadValues(Option<ValueReader>);
+
+impl ReadValues {
+    fn new(enabled: bool) -> Self {
+        Self(enabled.then(ValueReader::new))
+    }
+
+    fn as_mut(&mut self) -> Option<&mut ValueReader> {
+        self.0.as_mut()
+    }
+}
+
+impl Drop for ReadValues {
+    fn drop(&mut self) {
+        if let Some(reader) = &self.0 {
+            std::hint::black_box(reader.digest());
+        }
+    }
+}
+
+/// Map a ringline-redis `CompletedOp` (from `recv`, used under
+/// `workload.read_values`) to a `RequestResult`, reading a GET hit's value
+/// through `reader`. Classifies success, hit, markers and redirects as
+/// [`map_respmeta`] does.
+fn map_resp_op(op: ringline_redis::CompletedOp, reader: &mut ValueReader) -> RequestResult {
+    use ringline_redis::CompletedOp;
+    let (request_type, success, hit, user_data, latency_ns, error) = match op {
+        CompletedOp::Get {
+            result,
+            user_data,
+            latency_ns,
+        } => match result {
+            Ok(Some(value)) => {
+                reader.read(&value);
+                (
+                    RequestType::Get,
+                    true,
+                    Some(true),
+                    user_data,
+                    latency_ns,
+                    None,
+                )
+            }
+            Ok(None) => (
+                RequestType::Get,
+                true,
+                Some(false),
+                user_data,
+                latency_ns,
+                None,
+            ),
+            Err(e) => (
+                RequestType::Get,
+                false,
+                None,
+                user_data,
+                latency_ns,
+                Some(e),
+            ),
+        },
+        CompletedOp::Set {
+            result,
+            user_data,
+            latency_ns,
+        } => (
+            RequestType::Set,
+            result.is_ok(),
+            None,
+            user_data,
+            latency_ns,
+            result.err(),
+        ),
+        CompletedOp::Del {
+            result,
+            user_data,
+            latency_ns,
+        } => (
+            RequestType::Delete,
+            result.is_ok(),
+            None,
+            user_data,
+            latency_ns,
+            result.err(),
+        ),
+        // cachecannon only fires Get/Set/Del; `CompletedOp` is #[non_exhaustive].
+        _ => unreachable!("unexpected ringline-redis CompletedOp variant"),
+    };
+    let (backfill, prefill, append, key_id) = match request_type {
+        RequestType::Get => (
+            false,
+            false,
+            false,
+            Some((user_data & USER_DATA_ID_MASK) as usize),
+        ),
+        RequestType::Set => {
+            let backfill = user_data & BACKFILL_MARKER != 0;
+            let prefill = user_data & PREFILL_MARKER != 0;
+            let append = user_data & APPEND_MARKER != 0;
+            let key_id = if prefill || append {
+                Some((user_data & USER_DATA_ID_MASK) as usize)
+            } else {
+                None
+            };
+            (backfill, prefill, append, key_id)
+        }
+        _ => (false, false, false, None),
+    };
+    let redirect = match error {
+        Some(ringline_redis::Error::Redis(msg)) => parse_resp_redirect(&msg),
+        _ => None,
+    };
+    RequestResult {
+        id: 0,
+        success,
+        is_error_response: !success,
+        latency_ns,
+        ttfb_ns: None,
+        request_type,
+        hit,
+        key_id,
+        backfill,
+        prefill,
+        append,
+        redirect,
+    }
 }
 
 /// Map a ringline-redis zero-copy `RespMeta` (from `recv_meta`) to a
@@ -2012,6 +2161,7 @@ async fn drive_memcache_workload(
     let mut carried_tokens: u64 = 0;
     let mut prefill_in_flight: VecDeque<usize> = VecDeque::new();
     let mut inflight = InFlight::new(config.connection.request_timeout, pipeline_depth);
+    let mut value_reader = ReadValues::new(config.workload.read_values);
 
     loop {
         let phase = state.task_state.shared.phase();
@@ -2265,6 +2415,15 @@ async fn drive_memcache_workload(
             }
         };
         inflight.pop();
+
+        if let Some(reader) = value_reader.as_mut()
+            && let ringline_memcache::CompletedOp::Get {
+                result: Ok(Some(value)),
+                ..
+            } = &op
+        {
+            reader.read(&value.data);
+        }
 
         // Map CompletedOp to RequestResult
         let result = map_memcache_op(op);

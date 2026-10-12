@@ -19,6 +19,7 @@ Conventions:
 
 | Date | Effort | Status |
 |------|--------|--------|
+| 2026-10-12 | [Reading received values (`workload.read_values`)](2026-10-12-read-values.md) | OPEN — built and tested on mio locally; client CPU per request with the option on vs off not yet measured (needs Linux, io_uring) |
 | 2026-10-08 | [Recording cachecannon into `.dendro`](2026-10-08-dendro-recording.md) | OPEN — steps 2 and 3 built 2026-10-11 (metriken 0.11 / exposition 0.22 / query 0.36; `/metrics/stream` through metriken's stream route), against ringline main `dfff2e5` through `[patch.crates-io]`. Remaining: step 1 (guide), in-process recording with `metriken-recorder` (#176 with a published crate), `cachecannon view` reads `.dendro`, and the dashboard template moves here and travels in the archive |
 | 2026-09-18 | [Generator saturation at high connection counts](2026-09-18-generator-saturation.md) | CLOSED 2026-09-23 — two causes: per-connection ratelimiter polling (#166) and a per-recv io_uring timeout whose cancel was 69% of generator CPU (#167). 4096 closed-loop went 0.999 -> 0.195 cores/worker; rate-limited cells fell 85-94%. recv-ring starvation refuted (`parks=0`); the closed-loop diagnosis this entry first recorded was wrong |
 | 2026-09-10 | [Adaptive post-prefill quiesce](2026-09-10-adaptive-prefill-quiesce.md) | OPEN — deferred, pre-build. A fixed `prefill_settle` window shipped instead (#137); records the measured-quiesce alternative and what would justify building it |

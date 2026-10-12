@@ -288,6 +288,21 @@ pub struct Workload {
     /// On GET miss, automatically SET the key to backfill the cache (cache-aside pattern).
     #[serde(default, alias = "set_on_miss")]
     pub backfill_on_miss: bool,
+    /// Read every GET hit's value bytes: compute a CRC-32c over each value
+    /// as the protocol client returns it. Off by default.
+    ///
+    /// By default the RESP client drains a value without assembling it, so the
+    /// generator's CPU per request is lower than a client that uses the value
+    /// would spend. With this on, RESP receives through ringline-redis `recv`,
+    /// which holds the whole reply in contiguous memory, and the CRC is computed
+    /// over that. On io_uring that adds one copy out of the provided buffers;
+    /// on mio the reply is copied into the same buffer either way, so only the
+    /// CRC is added. Memcache `recv` already assembles replies; it gets the
+    /// CRC. Bytes read are counted in `values_read_bytes`.
+    /// See `docs/reference.md` "Reading values" for memory, timing and
+    /// error-handling differences.
+    #[serde(default)]
+    pub read_values: bool,
     #[serde(default)]
     pub keyspace: Keyspace,
     #[serde(default)]
@@ -921,6 +936,14 @@ impl Config {
             }
         }
 
+        if self.workload.read_values && matches!(self.target.protocol, Protocol::Ping) {
+            return Err(ConfigError::Validation(
+                "workload.read_values needs a protocol with GET (resp, resp3, memcache, \
+                 memcache-binary); ping has none"
+                    .to_string(),
+            ));
+        }
+
         if self.workload.values.length > crate::runner::VALUE_POOL_SIZE {
             return Err(ConfigError::Validation(format!(
                 "workload.values.length ({}) exceeds the value pool size ({})",
@@ -1139,6 +1162,32 @@ mod validation_tests {
         )
         .expect("memcache-binary config should be valid");
         assert_eq!(cfg.target.protocol, Protocol::MemcacheBinary);
+    }
+
+    #[test]
+    fn read_values_defaults_off() {
+        let parse = |workload: &str| {
+            toml::from_str::<Config>(&format!(
+                "[target]\nendpoints = [\"127.0.0.1:6379\"]\n[workload]\n{workload}"
+            ))
+            .expect("parses")
+            .workload
+            .read_values
+        };
+        assert!(!parse(""));
+        assert!(parse("read_values = true"));
+    }
+
+    #[test]
+    fn read_values_rejected_for_ping() {
+        let err = toml::from_str::<Config>(
+            "[target]\nendpoints = [\"127.0.0.1:6379\"]\nprotocol = \"ping\"\n\
+             [workload]\nread_values = true",
+        )
+        .expect("parses")
+        .validate()
+        .unwrap_err();
+        assert!(err.to_string().contains("read_values"), "{err}");
     }
 
     #[test]

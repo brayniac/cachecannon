@@ -42,6 +42,7 @@ pub mod connection {
 pub mod bytes {
     pub const TX: usize = 0;
     pub const RX: usize = 1;
+    pub const VALUES_READ: usize = 2;
 }
 
 /// Counter slot indices for operation metrics.
@@ -87,6 +88,12 @@ pub static BYTES_TX: Counter = Counter::new(&BYTES, bytes::TX);
 
 #[metric(name = "bytes_rx", description = "Total bytes received")]
 pub static BYTES_RX: Counter = Counter::new(&BYTES, bytes::RX);
+
+#[metric(
+    name = "values_read_bytes",
+    description = "GET value bytes checksummed by the client (workload.read_values); 0 when off"
+)]
+pub static VALUES_READ_BYTES: Counter = Counter::new(&BYTES, bytes::VALUES_READ);
 
 // Operation counters
 #[metric(name = "get_count", description = "Total GET operations")]
