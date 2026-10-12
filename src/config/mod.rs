@@ -194,6 +194,28 @@ pub struct Connection {
     /// How to distribute requests across connections.
     #[serde(default)]
     pub request_distribution: RequestDistribution,
+    /// How connections are assigned to endpoints. See [`EndpointAllocation`].
+    #[serde(default)]
+    pub endpoint_allocation: EndpointAllocation,
+}
+
+/// How connections are assigned to endpoints when there are several.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointAllocation {
+    /// Connection `i` serves endpoint `i % endpoints` (default). Every endpoint
+    /// gets the same number of connections, and so the same request share in a
+    /// rate-limited run, whatever share of the key distribution it owns.
+    #[default]
+    Even,
+    /// Each endpoint gets connections in proportion to the share of zipf
+    /// probability its keys carry, at least one each. In a rate-limited run,
+    /// where every connection gets the same share of tokens, each endpoint then
+    /// receives its zipf share of requests, so the servers together see the
+    /// global zipf distribution. In a closed-loop run an endpoint's share also
+    /// depends on its latency, so the hot endpoint gets less than its share
+    /// once it saturates. Requires `keyspace.distribution = "zipf"`.
+    KeyShare,
 }
 
 /// How requests are distributed across connections.
@@ -232,6 +254,7 @@ impl Default for Connection {
             connect_timeout: default_connect_timeout(),
             request_timeout: default_request_timeout(),
             request_distribution: RequestDistribution::default(),
+            endpoint_allocation: EndpointAllocation::default(),
         }
     }
 }
@@ -949,6 +972,23 @@ impl Config {
             }
         }
 
+        if self.connection.endpoint_allocation == EndpointAllocation::KeyShare {
+            if self.workload.keyspace.distribution != Distribution::Zipf {
+                return Err(ConfigError::Validation(
+                    "connection.endpoint_allocation = \"key_share\" requires \
+                     keyspace.distribution = \"zipf\""
+                        .to_string(),
+                ));
+            }
+            let endpoints = self.target.endpoints.len();
+            if endpoints > 1 && self.connection.total_connections() < endpoints {
+                return Err(ConfigError::Validation(format!(
+                    "connection.endpoint_allocation = \"key_share\" gives every endpoint at \
+                     least one connection, so connections must be >= {endpoints} endpoints"
+                )));
+            }
+        }
+
         let is_recency = self.workload.keyspace.distribution == Distribution::Recency;
         match (&self.workload.append, is_recency) {
             (None, true) => {
@@ -1328,11 +1368,10 @@ mod validation_tests {
 
     #[test]
     fn accepts_zipf_with_multiple_endpoints() {
-        // Skew across a sharded fleet is realistic and supported: hot keys hash
-        // to particular shards and those shards see disproportionate load, which
-        // is the imbalance the setup exists to measure. The worker draws from the
-        // global distribution and reject-routes rather than using the uniform
-        // per-endpoint fast path.
+        // Skew across a sharded fleet is supported. Each connection samples zipf
+        // restricted to its endpoint's keys. Shards see load in proportion to
+        // their zipf share only with `connection.endpoint_allocation =
+        // "key_share"`; the default gives every endpoint the same connections.
         toml::from_str::<Config>(
             r#"
             [target]
@@ -1345,6 +1384,53 @@ mod validation_tests {
         .expect("parses")
         .validate()
         .expect("zipf across shards must be allowed");
+    }
+
+    #[test]
+    fn endpoint_allocation_defaults_to_even_and_parses_key_share() {
+        let base = r#"
+            [target]
+            endpoints = ["127.0.0.1:6379", "127.0.0.1:6380"]
+            protocol = "resp"
+            [workload.keyspace]
+            distribution = "zipf"
+            "#;
+        let cfg: Config = toml::from_str(base).expect("parses");
+        assert_eq!(cfg.connection.endpoint_allocation, EndpointAllocation::Even);
+        let cfg: Config = toml::from_str(&format!(
+            "{base}\n[connection]\nconnections = 2\nendpoint_allocation = \"key_share\"\n"
+        ))
+        .expect("parses");
+        assert_eq!(
+            cfg.connection.endpoint_allocation,
+            EndpointAllocation::KeyShare
+        );
+        cfg.validate().expect("key_share with zipf is valid");
+    }
+
+    #[test]
+    fn key_share_requires_zipf_and_a_connection_per_endpoint() {
+        let cfg = |dist: &str, conns: usize| {
+            toml::from_str::<Config>(&format!(
+                r#"
+                [target]
+                endpoints = ["127.0.0.1:6379", "127.0.0.1:6380", "127.0.0.1:6381"]
+                protocol = "resp"
+                [connection]
+                connections = {conns}
+                endpoint_allocation = "key_share"
+                [workload.keyspace]
+                distribution = "{dist}"
+                "#
+            ))
+            .expect("parses")
+            .validate()
+        };
+        let err = cfg("uniform", 3).unwrap_err();
+        assert!(format!("{err:?}").contains("requires"), "{err:?}");
+        let err = cfg("zipf", 2).unwrap_err();
+        assert!(format!("{err:?}").contains(">= 3"), "{err:?}");
+        cfg("zipf", 3).expect("one connection per endpoint is enough");
     }
 
     #[test]

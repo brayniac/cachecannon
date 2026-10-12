@@ -124,6 +124,15 @@ request_timeout = "1s"
 # "roundrobin" - Distribute requests evenly across connections
 # "greedy" - Fill one connection's pipeline before moving to next
 request_distribution = "roundrobin"
+
+# How connections are assigned to endpoints (several endpoints only)
+# "even"      - connection i serves endpoint i % endpoints (default)
+# "key_share" - each endpoint gets connections in proportion to the zipf
+#               probability its keys carry, at least one each. In a
+#               rate-limited run each endpoint then receives its zipf share of
+#               requests. Requires keyspace.distribution = "zipf" and
+#               connections >= endpoints.
+endpoint_allocation = "even"
 ```
 
 > **Note:** `pool_size` is accepted as a legacy alias for `connections`. If both are specified, `pool_size` takes precedence. Prefer `connections` in new configurations.

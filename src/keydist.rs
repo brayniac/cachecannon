@@ -312,26 +312,44 @@ pub struct EndpointZipf {
     keys: Arc<Vec<Vec<u32>>>,
     /// `None` for an endpoint that owns no keys.
     tables: Vec<Option<WeightedAliasIndex<f64>>>,
+    /// Probability that a global zipf draw lands on each endpoint.
+    shares: Vec<f64>,
 }
 
 impl EndpointZipf {
     pub fn new(keys: Arc<Vec<Vec<u32>>>, theta: f64) -> Self {
+        let mut shares = Vec::with_capacity(keys.len());
         let tables = keys
             .iter()
             .map(|ids| {
                 if ids.is_empty() {
+                    shares.push(0.0);
                     return None;
                 }
-                let weights = ids
+                let weights: Vec<f64> = ids
                     .iter()
                     .map(|&id| (id as f64 + 1.0).powf(-theta))
                     .collect();
+                shares.push(weights.iter().sum());
                 Some(
                     WeightedAliasIndex::new(weights).expect("zipf weights are finite and positive"),
                 )
             })
             .collect();
-        Self { keys, tables }
+        let total: f64 = shares.iter().sum();
+        for s in shares.iter_mut() {
+            *s /= total;
+        }
+        Self {
+            keys,
+            tables,
+            shares,
+        }
+    }
+
+    /// Probability that a global zipf draw lands on each endpoint; sums to 1.
+    pub fn shares(&self) -> &[f64] {
+        &self.shares
     }
 
     /// A key id owned by endpoint `ep`, or `None` if it owns no keys.

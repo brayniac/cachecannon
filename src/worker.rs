@@ -8,7 +8,7 @@
 use crate::client::{RequestResult, RequestType};
 #[cfg(target_os = "linux")]
 use crate::config::TimestampMode;
-use crate::config::{Config, Protocol as CacheProtocol};
+use crate::config::{Config, EndpointAllocation, Protocol as CacheProtocol};
 use crate::keydist::KeyDist;
 use crate::limiters::WorkerLimiter;
 use crate::metrics;
@@ -988,9 +988,28 @@ fn spawn_protocol_tasks(
     let protocol = worker_state.task_state.config.target.protocol;
     let seed = run_seed(&worker_state.task_state.config);
 
+    // `key_share`: every worker computes the same assignment from the shared
+    // sampler and takes its own slice of it. `None` means round-robin.
+    let assignment = match worker_state
+        .task_state
+        .config
+        .connection
+        .endpoint_allocation
+    {
+        EndpointAllocation::KeyShare => worker_state
+            .task_state
+            .key_dist
+            .endpoint_sampler()
+            .map(|z| key_share_endpoints(z.shares(), total_connections)),
+        EndpointAllocation::Even => None,
+    };
+
     for i in 0..my_connections {
         let global_conn_idx = my_start + i;
-        let endpoint_idx = global_conn_idx % num_endpoints;
+        let endpoint_idx = match assignment {
+            Some(ref a) => a[global_conn_idx],
+            None => global_conn_idx % num_endpoints,
+        };
         let state = Arc::clone(worker_state);
         let session_seed = connection_seed(seed, SeedRole::Reader, worker_id, i);
 
@@ -1026,6 +1045,56 @@ fn spawn_protocol_tasks(
             metrics::CONNECTIONS_FAILED.increment();
         }
     }
+}
+
+/// Endpoint index for each of `total` global connection indices, with endpoint
+/// `e` getting about `shares[e] * total` connections and at least one.
+///
+/// Counts: floor of each target, raised to 1, then adjusted one connection at a
+/// time toward the endpoints furthest below (or above) their target until they
+/// sum to `total`. Order: endpoint `e`'s `k`-th connection is placed at
+/// `(k + 0.5) / count_e` and all are sorted by that position, so every
+/// contiguous range of indices (one worker's connections) carries a mix of
+/// endpoints in roughly the same proportions.
+///
+/// With fewer connections than endpoints the minimum of one each cannot be met;
+/// that falls back to round-robin. Config validation rejects it for a static
+/// endpoint list.
+pub(crate) fn key_share_endpoints(shares: &[f64], total: usize) -> Vec<usize> {
+    let n = shares.len();
+    if n == 0 || total < n {
+        return (0..total).map(|i| i % n.max(1)).collect();
+    }
+    let target: Vec<f64> = shares.iter().map(|s| s * total as f64).collect();
+    let mut count: Vec<usize> = target.iter().map(|t| (t.floor() as usize).max(1)).collect();
+    let mut sum: usize = count.iter().sum();
+    while sum < total {
+        let e = (0..n)
+            .max_by(|&a, &b| {
+                (target[a] - count[a] as f64).total_cmp(&(target[b] - count[b] as f64))
+            })
+            .expect("n > 0");
+        count[e] += 1;
+        sum += 1;
+    }
+    while sum > total {
+        let e = (0..n)
+            .filter(|&e| count[e] > 1)
+            .min_by(|&a, &b| {
+                (target[a] - count[a] as f64).total_cmp(&(target[b] - count[b] as f64))
+            })
+            .expect("total >= n, so some endpoint has more than one");
+        count[e] -= 1;
+        sum -= 1;
+    }
+    let mut slots: Vec<(f64, usize)> = Vec::with_capacity(total);
+    for (e, &c) in count.iter().enumerate() {
+        for k in 0..c {
+            slots.push(((k as f64 + 0.5) / c as f64, e));
+        }
+    }
+    slots.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    slots.into_iter().map(|(_, e)| e).collect()
 }
 
 // ── Connection establishment helper ──────────────────────────────────────
@@ -3946,6 +4015,112 @@ mod tests {
         assert_eq!(inflight.len(), 1);
         let order: Vec<usize> = std::iter::from_fn(|| queues.pop_front(0)).collect();
         assert_eq!(order, [2, 3, 4]);
+    }
+
+    /// 48 endpoints, 100,000 keys, theta 0.99, 1,536 connections: the
+    /// geometry of the runs this option exists for.
+    fn key_share_fixture() -> (Arc<Vec<Vec<u32>>>, KeyDist, usize) {
+        let endpoints: Vec<SocketAddr> = (0..48)
+            .map(|i| format!("172.31.0.10:{}", 6379 + i).parse().unwrap())
+            .collect();
+        let n = 100_000;
+        let keys = Arc::new(build_endpoint_keys(n, 16, &endpoints, &None));
+        let d = KeyDist::zipf(n, 0.99).with_endpoint_keys(&keys);
+        (keys, d, 1_536)
+    }
+
+    #[test]
+    fn key_share_connection_counts_track_zipf_shares() {
+        let (_, d, total) = key_share_fixture();
+        let shares = d.endpoint_sampler().unwrap().shares();
+        let a = key_share_endpoints(shares, total);
+        assert_eq!(a.len(), total);
+        let mut count = vec![0usize; shares.len()];
+        for &e in &a {
+            count[e] += 1;
+        }
+        for (e, &c) in count.iter().enumerate() {
+            assert!(c >= 1, "endpoint {e} has no connection");
+            // Rounding to whole connections: within one connection of target.
+            let err = (c as f64 - shares[e] * total as f64).abs();
+            assert!(
+                err < 1.0,
+                "endpoint {e}: {c} connections, target {:.2}",
+                shares[e] * total as f64
+            );
+        }
+        // Each worker's contiguous slice (48 threads x 32) mixes endpoints.
+        for w in a.chunks(32) {
+            let mut seen = w.to_vec();
+            seen.sort_unstable();
+            seen.dedup();
+            assert!(
+                seen.len() >= 16,
+                "a 32-connection slice covers only {} endpoints",
+                seen.len()
+            );
+        }
+    }
+
+    /// Simulates a rate-limited run in which every connection receives the
+    /// same number of tokens, and checks what the servers see in aggregate.
+    /// Under `key_share` each endpoint's request share is within 0.07
+    /// percentage points (one connection in 1,536) of its zipf share, and the
+    /// ten hottest keys' shares are within 0.3 points of the global zipf pmf.
+    /// Under round-robin the hottest key's share is far off, which is the
+    /// control showing the check can fail.
+    #[test]
+    fn key_share_gives_endpoints_their_zipf_request_share() {
+        let (keys, d, total) = key_share_fixture();
+        let by_ep = d.endpoint_sampler().unwrap();
+        let shares = by_ep.shares().to_vec();
+        let n = 100_000usize;
+        let norm: f64 = (0..n).map(|i| (i as f64 + 1.0).powf(-0.99)).sum();
+        let pmf = |id: usize| (id as f64 + 1.0).powf(-0.99) / norm;
+        let per_conn = 400;
+        let run = |assignment: &[usize]| {
+            let mut rng = Xoshiro256PlusPlus::seed_from_u64(7);
+            let mut by_endpoint = vec![0usize; keys.len()];
+            let mut hot = [0usize; 10];
+            for &e in assignment {
+                for _ in 0..per_conn {
+                    let id = by_ep.sample(e, &mut rng).unwrap();
+                    by_endpoint[e] += 1;
+                    if id < 10 {
+                        hot[id] += 1;
+                    }
+                }
+            }
+            (by_endpoint, hot)
+        };
+        let requests = (total * per_conn) as f64;
+
+        let (by_endpoint, hot) = run(&key_share_endpoints(&shares, total));
+        for (e, &r) in by_endpoint.iter().enumerate() {
+            let got = r as f64 / requests;
+            assert!(
+                (got - shares[e]).abs() < 1.0 / total as f64,
+                "endpoint {e}: request share {got:.4}, zipf share {:.4}",
+                shares[e]
+            );
+        }
+        for (id, &h) in hot.iter().enumerate() {
+            let got = h as f64 / requests;
+            assert!(
+                (got - pmf(id)).abs() < 0.003,
+                "key {id}: share {got:.4}, zipf {:.4}",
+                pmf(id)
+            );
+        }
+
+        let round_robin: Vec<usize> = (0..total).map(|i| i % keys.len()).collect();
+        let (_, hot) = run(&round_robin);
+        let got = hot[0] as f64 / requests;
+        assert!(
+            (got - pmf(0)).abs() > 0.03,
+            "round-robin unexpectedly matched zipf for key 0: {got:.4} vs {:.4}",
+            pmf(0)
+        );
     }
 
     /// A dispatcher with a slot already queued, without needing an executor:

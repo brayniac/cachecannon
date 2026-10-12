@@ -37,6 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   values transmit over libfabric, server-initiated. `[dma] module` picks the
   server module dialect, `largeobj` (`BLOB.*`, the default) or `vdma`
   (`DMA.*`). The fabric, buffers, and connection task are the same for both.
+- `[connection] endpoint_allocation = "key_share"` (zipf, several endpoints):
+  each endpoint gets connections in proportion to the zipf probability its
+  keys carry, at least one each, instead of an equal number. In a
+  rate-limited run each endpoint then receives its zipf share of requests, so
+  the servers together see the global distribution; with the default `even`,
+  every endpoint gets the same share whatever its keys' popularity. Closed
+  loop, an endpoint's share also depends on its latency.
 
 ### Fixed
 - Multi-endpoint `distribution = "zipf"` drew from the global zipf and
