@@ -198,14 +198,18 @@ length = 64
 
 By default the RESP client receives GET replies with ringline-redis
 `recv_meta`, which parses the reply header and drains the value without
-copying it out of the receive buffers. Client CPU per request is then a lower
-bound on what a client that uses the value spends. `read_values = true` adds
-the work such a client does, per GET hit:
+assembling it. Client CPU per request is then a lower bound on what a client
+that uses the value spends. `read_values = true` receives RESP replies with
+`recv` instead, which waits until the whole reply is in ringline's
+per-connection accumulator and returns the value as a slice of it, and then
+computes a CRC-32c over that slice. No copy is made beyond what the table
+lists.
 
-| Protocol | Work per hit with `read_values = true` |
-|----------|----------------------------------------|
-| resp, resp3 | `recv` copies the reply from the receive buffers into ringline's per-connection accumulator (one userspace copy) and returns the value as a slice of it; CRC-32c over that slice. No further copy. |
-| memcache, memcache-binary | `recv` already copies each reply into the accumulator with the option off; the option adds the CRC-32c over the returned slice. No further copy. |
+| Protocol and backend | Option off | Option on |
+|----------------------|------------|-----------|
+| resp, resp3 on io_uring | value drained from the kernel-filled provided buffers; no userspace copy | each reply copied from the provided buffers into the accumulator (one userspace copy), then CRC-32c |
+| resp, resp3 on mio | each 8 KiB read copied into the accumulator and the value drained from it | same copy; the option adds the CRC-32c and holds the whole reply until it is parsed |
+| memcache, memcache-binary (both backends) | `recv` already assembles each reply in the accumulator | adds the CRC-32c over the returned slice |
 
 Each CRC is folded into a per-connection value passed to `black_box`, so the
 compiler cannot remove it. `values_read_bytes` counts the bytes checksummed.
@@ -217,12 +221,17 @@ Differences from the default path:
   `timestamps.mode = "userspace"` its cost appears in the latency of later
   replies on the same worker; under `"software"` it appears only in client CPU
   and achieved throughput.
+- Client memory. `recv` holds each whole reply until it is parsed, so peak
+  accumulator memory is up to connections × `pipeline_depth` × value size.
+  `recv_meta` holds about one read burst per connection.
 - An unexpected reply type to a RESP GET is a per-request error and the
   connection stays open. With the option off it closes the connection, which
   is counted in `disconnects_recv_error`.
 - A RESP reply larger than ringline's `recv_accumulator_max` (default 1 GiB)
-  fails only with the option on; `recv_meta` streams the value and has no such
-  limit.
+  fails only with the option on: the runtime closes the connection when the
+  accumulator would exceed the limit, the worker counts it in
+  `disconnects_eof` and reconnects, and the next such reply does the same.
+  `recv_meta` drains the value as it arrives and is not limited.
 
 ### Saturation Search Settings
 

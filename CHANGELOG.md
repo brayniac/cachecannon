@@ -21,14 +21,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   JSON result, and the clean and verbose outputs print it when it is
   nonzero.
 - `[workload] read_values = true` computes a CRC-32c over every GET hit's
-  value, so client CPU per request includes reading the value. RESP then
-  receives through ringline-redis `recv`, which copies each reply into
-  contiguous memory, instead of `recv_meta`, which drains values without
-  copying them; memcache already received that way. No further copy is made.
-  Bytes read are counted in the new `values_read_bytes` counter. Rejected with
-  `protocol = "ping"`. Off by default; the default recv path is unchanged.
-  `docs/reference.md` "Reading values" lists the timing and error-handling
-  differences.
+  value, so client CPU per request includes reading the value. RESP
+  then receives through ringline-redis `recv`, which holds each whole reply
+  in contiguous memory, instead of `recv_meta`, which drains values as they
+  arrive. On io_uring that adds one copy out of the provided buffers; on mio
+  replies are copied into that buffer either way, so only the CRC is added.
+  Memcache already received whole replies and gains the CRC. Client memory
+  rises to up to connections × `pipeline_depth` × value size. Rejected with
+  `protocol = "ping"`. Off by default; the default recv path is
+  unchanged. The metrics endpoints and the parquet recording gain a
+  `values_read_bytes` counter, which is 0 when the option is off.
+  `docs/reference.md` "Reading values" lists the per-backend work and the
+  timing, memory and error-handling differences.
 
 ### Changed
 - metriken 0.9 → 0.11.3 (metriken-core 0.3), metriken-exposition 0.16 → 0.22,

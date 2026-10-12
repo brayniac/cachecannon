@@ -7,7 +7,7 @@
 // Each test binary uses part of this module.
 #![allow(dead_code)]
 
-use cachecannon::metrics::{CACHE_HITS, GET_COUNT, VALUES_READ_BYTES};
+use cachecannon::metrics::{CACHE_HITS, CACHE_MISSES, GET_COUNT, VALUES_READ_BYTES};
 use cachecannon::{ColorMode, Config, OutputFormat, create_formatter, run_benchmark_full};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -17,7 +17,8 @@ use std::sync::atomic::AtomicBool;
 /// Every third GET on a connection is answered with a miss.
 pub const MISS_EVERY: u64 = 3;
 
-/// Large enough to span several 16 KiB receive buffers.
+/// Large enough to span many receive buffers: io_uring's provided buffers are
+/// 16 KiB by default and mio reads 8 KiB at a time.
 pub const LARGE_VALUE_LEN: usize = 256 * 1024;
 
 /// What the fake servers return: a value of `value_len` bytes for each GET,
@@ -153,6 +154,7 @@ fn serve_memcache(stream: TcpStream, server: Server) {
 pub struct Counts {
     pub gets: u64,
     pub hits: u64,
+    pub misses: u64,
     pub read: u64,
 }
 
@@ -205,6 +207,7 @@ pub fn run(addr: SocketAddr, protocol: &str, read_values: bool) -> Counts {
     Counts {
         gets: GET_COUNT.value(),
         hits: CACHE_HITS.value(),
+        misses: CACHE_MISSES.value(),
         read: VALUES_READ_BYTES.value(),
     }
 }
@@ -219,7 +222,12 @@ pub fn assert_every_hit_read(protocol: &str, server: Server) {
     };
     let c = run(addr, protocol, true);
     assert!(c.hits > 0, "no hits recorded: {c:?}");
-    assert!(c.hits < c.gets, "no misses recorded: {c:?}");
+    assert!(c.misses > 0, "no misses recorded: {c:?}");
+    assert_eq!(
+        c.hits + c.misses,
+        c.gets,
+        "a GET was neither hit nor miss: {c:?}"
+    );
     assert_eq!(
         c.read,
         c.hits * server.value_len as u64,
