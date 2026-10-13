@@ -10,6 +10,7 @@ use crate::client::{RequestResult, RequestType};
 use crate::config::TimestampMode;
 use crate::config::{Config, Protocol as CacheProtocol};
 use crate::keydist::KeyDist;
+use crate::kvreplay::KvReplay;
 use crate::limiters::WorkerLimiter;
 use crate::metrics;
 use crate::read_values::ValueReader;
@@ -255,6 +256,9 @@ pub struct BenchWorkerConfig {
     /// Steady-state key-id distribution, built ONCE by the runner and shared by
     /// every worker. Zipf setup is O(keyspace) so it must not be per-worker.
     pub(crate) key_dist: Arc<KeyDist>,
+    /// The KV-cache trace and its replay state, shared by every worker; `None`
+    /// unless `[workload.kv_replay]` is set.
+    pub kv_replay: Option<Arc<KvReplay>>,
 }
 
 // ── Config channel ────────────────────────────────────────────────────────
@@ -285,7 +289,7 @@ fn recv_config() -> BenchWorkerConfig {
 /// alive until the send completes.
 ///
 /// Size: 8 (Arc ptr) + 4 + 4 = 16 bytes, well within GuardBox's 64-byte limit.
-struct ValuePoolGuard {
+pub(crate) struct ValuePoolGuard {
     pool: Arc<Vec<u8>>,
     offset: u32,
     len: u32,
@@ -304,7 +308,7 @@ impl SendGuard for ValuePoolGuard {
 }
 
 /// Create a ValuePoolGuard referencing a random slice of the value pool.
-fn make_value_guard(
+pub(crate) fn make_value_guard(
     rng: &mut Xoshiro256PlusPlus,
     value_pool: &Arc<Vec<u8>>,
     value_len: usize,
@@ -344,7 +348,7 @@ const IDLE_SLEEP_MIN: Duration = Duration::from_micros(100);
 
 /// Upper bound on a single dispatcher wait, and on how long the dispatcher
 /// itself sleeps when no connection wants a token.
-const IDLE_SLEEP_MAX: Duration = Duration::from_millis(50);
+pub(crate) const IDLE_SLEEP_MAX: Duration = Duration::from_millis(50);
 
 /// One connection's claim on the rate limiter.
 ///
@@ -554,7 +558,7 @@ async fn run_dispatcher(
 /// Borrow a random `value_len`-byte slice of the value pool, for the
 /// copy-based `fire_set` path (the bytes are copied into the send pool
 /// synchronously, so the borrow only needs to outlive the fire call).
-fn value_slice<'a>(
+pub(crate) fn value_slice<'a>(
     rng: &mut Xoshiro256PlusPlus,
     value_pool: &'a Arc<Vec<u8>>,
     value_len: usize,
@@ -646,6 +650,8 @@ struct TaskSharedState {
     tls_server_name: Option<String>,
     /// Steady-state key-id distribution (see `BenchWorkerConfig::key_dist`).
     key_dist: Arc<KeyDist>,
+    /// See `BenchWorkerConfig::kv_replay`.
+    kv_replay: Option<Arc<KvReplay>>,
 }
 
 /// State shared between the BenchHandler (on_tick) and connection tasks.
@@ -737,6 +743,15 @@ impl AsyncEventHandler for BenchHandler {
                     );
                     DISPATCHER.with(|slot| *slot.borrow_mut() = None);
                 }
+            }
+            // Likewise the KV replay dispatcher, which hands trace requests to
+            // the connection tasks spawned next.
+            if let Some(kv) = worker_state.task_state.kv_replay.clone() {
+                crate::kvreplay::start_dispatcher(
+                    kv,
+                    Arc::clone(&worker_state.task_state.shared),
+                    worker_id,
+                );
             }
             match protocol {
                 CacheProtocol::Ping => {
@@ -875,6 +890,7 @@ impl AsyncEventHandler for BenchHandler {
             backfill_on_miss,
             tls_enabled,
             tls_server_name,
+            kv_replay: cfg.kv_replay.clone(),
         });
 
         // Workers with no connections immediately pass precheck
@@ -1238,16 +1254,30 @@ async fn resp_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: usize
             }
         }
 
-        let result = drive_resp_workload(
-            &mut client,
-            conn,
-            &state,
-            endpoint_idx,
-            &mut rng,
-            &mut key_buf,
-            &mut backfill_queue,
-        )
-        .await;
+        let result = match state.task_state.kv_replay {
+            Some(ref kv) => {
+                let ctx = crate::kvreplay::KvConn {
+                    kv,
+                    shared: &state.task_state.shared,
+                    value_pool: &state.task_state.value_pool,
+                    pipeline_depth: config.connection.pipeline_depth,
+                    request_timeout: config.connection.request_timeout,
+                };
+                crate::kvreplay::drive(&mut client, conn, &ctx, &mut rng).await
+            }
+            None => {
+                drive_resp_workload(
+                    &mut client,
+                    conn,
+                    &state,
+                    endpoint_idx,
+                    &mut rng,
+                    &mut key_buf,
+                    &mut backfill_queue,
+                )
+                .await
+            }
+        };
 
         metrics::CONNECTIONS_ACTIVE.decrement();
 
@@ -1836,7 +1866,7 @@ fn map_resp_op(op: ringline_redis::CompletedOp, reader: &mut ValueReader) -> Req
 /// a load generator records: hit/miss, prefill/backfill markers, key_id, a
 /// MOVED/ASK redirect from the error string, and per-op `latency_ns`. rx-bytes
 /// are recorded by the `on_result` callback.
-fn map_respmeta(meta: ringline_redis::RespMeta) -> RequestResult {
+pub(crate) fn map_respmeta(meta: ringline_redis::RespMeta) -> RequestResult {
     use ringline_redis::OpKind;
     let request_type = match meta.kind {
         OpKind::Get => RequestType::Get,
@@ -3374,7 +3404,7 @@ async fn drive_memcache_append(
 /// `inflight` and, when `count_failed`, counted in `REQUESTS_SEND_FAILED`.
 /// Returns how many were discarded, which are the newest entries of any
 /// per-request queue the caller keeps.
-fn note_discarded(
+pub(crate) fn note_discarded(
     before: usize,
     after: usize,
     inflight: &mut InFlight,
@@ -3390,7 +3420,7 @@ fn note_discarded(
 
 /// [`note_discarded`] for a `fire_*` call that returned an error, which also
 /// did not send the request it was given.
-fn note_failed_fire(
+pub(crate) fn note_failed_fire(
     before: usize,
     after: usize,
     inflight: &mut InFlight,
@@ -3424,14 +3454,14 @@ fn requeue_newest(
 /// Also owns the connection's deadline timer. The timer outlives individual
 /// recvs: it is armed for the oldest request's deadline and left running when
 /// that request's reply arrives. See `recv_with_timeout` for why.
-struct InFlight {
+pub(crate) struct InFlight {
     fired: VecDeque<Instant>,
     timeout: Duration,
     timer: Option<ringline::SleepFuture>,
 }
 
 impl InFlight {
-    fn new(timeout: Duration, capacity: usize) -> Self {
+    pub(crate) fn new(timeout: Duration, capacity: usize) -> Self {
         Self {
             fired: VecDeque::with_capacity(capacity),
             timeout,
@@ -3440,18 +3470,18 @@ impl InFlight {
     }
 
     #[inline]
-    fn push(&mut self, fired_at: Instant) {
+    pub(crate) fn push(&mut self, fired_at: Instant) {
         self.fired.push_back(fired_at);
     }
 
     #[inline]
-    fn pop(&mut self) {
+    pub(crate) fn pop(&mut self) {
         self.fired.pop_front();
     }
 
     /// Drop the `n` most recently pushed requests: ones the client discarded
     /// before they were sent.
-    fn forget_newest(&mut self, n: usize) {
+    pub(crate) fn forget_newest(&mut self, n: usize) {
         let keep = self.fired.len().saturating_sub(n);
         self.fired.truncate(keep);
     }
@@ -3507,7 +3537,7 @@ impl InFlight {
 /// against the current oldest request: expired means timeout, otherwise the
 /// timer is re-armed for what remains. A healthy connection re-arms about once
 /// per `timeout` and never cancels.
-async fn recv_with_timeout<F, T>(
+pub(crate) async fn recv_with_timeout<F, T>(
     recv: F,
     inflight: &mut InFlight,
     conn: ConnCtx,
@@ -3657,7 +3687,7 @@ fn record_disconnect_reason(reason: DisconnectReason) {
 }
 
 /// Record counter metrics for a completed request result (always called).
-fn record_counters(result: &RequestResult) {
+pub(crate) fn record_counters(result: &RequestResult) {
     metrics::RESPONSES_RECEIVED.increment();
     if result.redirect.is_some() {
         // Redirects are counted via CLUSTER_REDIRECTS, not as errors
@@ -4062,6 +4092,7 @@ mod tests {
             backfill_on_miss: false,
             tls_enabled: false,
             tls_server_name: None,
+            kv_replay: None,
         });
 
         Arc::new(SharedWorkerState {

@@ -2,6 +2,7 @@
 use crate::config::TimestampMode;
 use crate::config::{Config, Protocol as CacheProtocol};
 use crate::keydist::KeyDist;
+use crate::kvreplay::{KvBaseline, KvReplay};
 use crate::limiters::WorkerLimiters;
 use crate::metrics;
 use crate::output::{PrefillDiagnostics, PrefillSample, PrefillStallCause};
@@ -90,6 +91,13 @@ pub fn run_benchmark_full(
         seed,
         "rng seed (set general.seed = {seed} to repeat this key sequence)"
     );
+
+    // KV-cache replay: read the trace and the model geometry before anything
+    // starts, so a bad trace or an unsupported model fails the run here.
+    let kv_replay = match config.workload.kv_replay {
+        Some(ref kv) => Some(Arc::new(KvReplay::load(kv)?)),
+        None => None,
+    };
 
     // Cluster mode: discover topology and replace endpoints with primaries
     let slot_table = if config.target.cluster {
@@ -277,6 +285,7 @@ pub fn run_benchmark_full(
                 cpu_ids: cpu_ids.clone(),
                 value_pool: Arc::clone(&value_pool),
                 slot_table: slot_table.clone(),
+                kv_replay: kv_replay.clone(),
             })
             .expect("failed to queue worker config");
     }
@@ -298,7 +307,11 @@ pub fn run_benchmark_full(
     let total_conns = config.connection.total_connections();
     let standalone_task_capacity = standalone_task_capacity(total_conns, num_threads);
     let timer_slots = timer_slots(total_conns, num_threads);
-    let send_loads: Vec<SendLoad> = std::iter::once(SendLoad::main(&config))
+    let main_load = match kv_replay {
+        Some(ref kv) => SendLoad::kv_replay(&config, kv),
+        None => SendLoad::main(&config),
+    };
+    let send_loads: Vec<SendLoad> = std::iter::once(main_load)
         .chain(SendLoad::append(&config))
         .collect();
     let send_slab_slots = send_slab_slots(&send_loads, num_threads);
@@ -412,6 +425,7 @@ pub fn run_benchmark_full(
     let mut baseline_perceived: Option<Histogram> = None;
     let mut baseline_requests_dropped = 0u64;
     let mut baseline_requests_send_failed = 0u64;
+    let mut kv_baseline: Option<KvBaseline> = None;
     let mut current_phase = Phase::Precheck;
 
     let mut actual_duration = duration;
@@ -494,6 +508,11 @@ pub fn run_benchmark_full(
                     formatter.print_prefill(key_count);
                     formatter.print_prefill_header();
                 } else {
+                    if let Some(ref kv) = kv_replay
+                        && !warmup.is_zero()
+                    {
+                        kv.start_at(Instant::now());
+                    }
                     shared.set_phase(Phase::Warmup);
                     current_phase = Phase::Warmup;
                     warmup_start = Some(Instant::now());
@@ -555,6 +574,11 @@ pub fn run_benchmark_full(
             // when N per-worker markers fire, since a worker may serve only a
             // subset of cluster nodes and would never reach a per-worker total.
             if total > 0 && confirmed >= total {
+                if let Some(ref kv) = kv_replay
+                    && !warmup.is_zero()
+                {
+                    kv.start_at(Instant::now());
+                }
                 shared.set_phase(Phase::Warmup);
                 current_phase = Phase::Warmup;
                 warmup_start = Some(Instant::now());
@@ -663,7 +687,16 @@ pub fn run_benchmark_full(
         let saturation_done = saturation_state.as_ref().is_some_and(|s| s.is_completed());
         let has_saturation = config.workload.saturation_search.is_some();
         let time_done = elapsed >= warmup + duration;
-        if saturation_done || (time_done && !has_saturation) {
+        // A KV replay also ends when every trace request has finished.
+        let kv_done = kv_replay.as_ref().is_some_and(|kv| kv.is_finished());
+        if kv_done && running_start.is_none() {
+            tracing::warn!(
+                "the kv replay trace finished during warmup; nothing was recorded \
+                 (lower general.warmup)"
+            );
+            actual_duration = Duration::ZERO;
+        }
+        if saturation_done || kv_done || (time_done && !has_saturation) {
             if let Some(rs) = running_start {
                 actual_duration = rs.elapsed();
             }
@@ -706,6 +739,15 @@ pub fn run_benchmark_full(
             baseline_perceived = metrics::PERCEIVED_LATENCY.load();
             baseline_requests_dropped = ratelimiter.as_ref().map(|rl| rl.dropped()).unwrap_or(0);
             baseline_requests_send_failed = metrics::REQUESTS_SEND_FAILED.value();
+            // A KV replay starts with warmup when there is one, so its first
+            // requests warm the cache unrecorded. Without one it starts here,
+            // after the baselines: started at the warmup phase, a short trace
+            // could finish before this transition, which the loop only checks
+            // every 100 ms.
+            if let Some(ref kv) = kv_replay {
+                kv_baseline = Some(KvBaseline::take());
+                kv.start_at(Instant::now());
+            }
 
             last_responses = baseline_responses;
             last_errors = baseline_errors;
@@ -1010,7 +1052,14 @@ pub fn run_benchmark_full(
         requests_send_failed,
         schedule_slip,
         perceived_latency,
+        // A run stopped before recording has no baseline; its deltas are 0.
+        kv_replay: kv_replay
+            .as_ref()
+            .map(|kv| kv.results(&kv_baseline.unwrap_or_else(KvBaseline::take))),
     };
+    if let Some(ref kv) = kv_replay {
+        kv.flush_log();
+    }
 
     formatter.print_results(&results);
 
@@ -1028,7 +1077,10 @@ pub fn run_benchmark_full(
 /// Subtracts the baseline snapshot (captured at warmup→running transition) from
 /// the current cumulative histogram so that precheck/prefill/warmup samples are
 /// excluded from the final results.
-fn delta_latency_stats(hist: &AtomicHistogram, baseline: &Option<Histogram>) -> LatencyStats {
+pub(crate) fn delta_latency_stats(
+    hist: &AtomicHistogram,
+    baseline: &Option<Histogram>,
+) -> LatencyStats {
     let current = hist.load();
     let delta = match (&current, baseline) {
         (Some(cur), Some(base)) => cur.wrapping_sub(base).ok(),
@@ -1339,6 +1391,10 @@ struct SendLoad {
     key_len: usize,
     value_len: usize,
     tls: bool,
+    /// Copied bytes of the largest burst a connection sends outside its
+    /// pipeline: a KV replay lookup, every EXISTS of one request in one send.
+    /// 0 for other loads.
+    lookup_bytes: usize,
 }
 
 impl SendLoad {
@@ -1351,6 +1407,20 @@ impl SendLoad {
             key_len: config.workload.keyspace.length,
             value_len: config.workload.values.length,
             tls: config.target.tls,
+            lookup_bytes: 0,
+        }
+    }
+
+    /// KV replay connections: SETs carry objects of up to the largest
+    /// object size, and a lookup sends the EXISTS of the request with the
+    /// most objects at once.
+    fn kv_replay(config: &Config, kv: &KvReplay) -> Self {
+        let key_len = kv.max_key_len();
+        Self {
+            key_len,
+            value_len: kv.max_object_size(),
+            lookup_bytes: kv.max_objects().saturating_mul(key_len + REQUEST_FRAMING),
+            ..Self::main(config)
         }
     }
 
@@ -1460,7 +1530,12 @@ fn send_slab_slots(loads: &[SendLoad], num_threads: usize) -> u16 {
 fn send_pool_slots(loads: &[SendLoad], num_threads: usize) -> u16 {
     per_worker(loads, num_threads, RINGLINE_SEND_POOL_DEFAULT, |l| {
         let batches = l.pipeline_depth.max(1).div_ceil(l.batch());
-        2 * batches * l.slots_per_batch()
+        let per_slot = if l.tls {
+            TLS_RECORD_PLAINTEXT
+        } else {
+            RINGLINE_SEND_SLOT_SIZE as usize
+        };
+        (2 * batches * l.slots_per_batch()).saturating_add(l.lookup_bytes.div_ceil(per_slot))
     })
 }
 
@@ -1489,7 +1564,20 @@ mod tests {
             key_len: 16,
             value_len,
             tls: false,
+            lookup_bytes: 0,
         }
+    }
+
+    #[test]
+    fn a_kv_lookup_burst_adds_its_slots_per_connection() {
+        let base = send_pool_slots(&[load(4096, 4, 4, 64)], 1);
+        // 2,000 EXISTS of a 19-byte key with framing: 166,000 bytes, 11 slots
+        // of 16,448 bytes for each of 4,096 connections.
+        let kv = SendLoad {
+            lookup_bytes: 2000 * (19 + 64),
+            ..load(4096, 4, 4, 64)
+        };
+        assert_eq!(send_pool_slots(&[kv], 1), base + 11 * 4096);
     }
 
     #[test]

@@ -4,6 +4,7 @@ pub mod client;
 pub mod cluster;
 pub mod config;
 pub mod keydist;
+pub mod kvreplay;
 pub mod limiters;
 pub mod metrics;
 pub mod output;
@@ -19,8 +20,8 @@ pub mod worker;
 pub use admin::{AdminHandle, AdminServer};
 pub use config::{Config, parse_cpu_list};
 pub use output::{
-    ColorMode, LatencyStats, OutputFormat, OutputFormatter, PrefillDiagnostics, PrefillStallCause,
-    Results, Sample, SaturationResults, SaturationStep, create_formatter,
+    ColorMode, KvReplayResults, LatencyStats, OutputFormat, OutputFormatter, PrefillDiagnostics,
+    PrefillStallCause, Results, Sample, SaturationResults, SaturationStep, create_formatter,
 };
 pub use ratelimit::Ratelimiter;
 pub use runner::{VALUE_POOL_SIZE, run_benchmark, run_benchmark_full};

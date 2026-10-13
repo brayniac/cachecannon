@@ -453,6 +453,71 @@ impl OutputFormatter for CleanFormatter {
             }
         }
 
+        if let Some(ref kv) = results.kv_replay {
+            println!();
+            let timing = if kv.closed_loop {
+                "closed loop".to_string()
+            } else {
+                format!("open loop at {}x trace speed", kv.speedup)
+            };
+            println!(
+                "{}",
+                self.cyan(&format!("KV Replay ({timing}, {})", kv.write_rule))
+            );
+            let failed = if kv.requests_failed > 0 {
+                self.red(&format!(", {} failed", format_count(kv.requests_failed)))
+            } else {
+                String::new()
+            };
+            println!(
+                "{}     {} of {} trace requests{}",
+                self.cyan("requests"),
+                format_count(kv.requests),
+                format_count(kv.trace_requests),
+                failed
+            );
+            println!(
+                "{}       {} cached ({}%), {} new, {} input",
+                self.cyan("tokens"),
+                format_count(kv.cached_tokens),
+                format_pct(kv.cached_fraction() * 100.0),
+                format_count(kv.new_tokens),
+                format_count(kv.input_tokens)
+            );
+            println!(
+                "{}     {} full hits, {} missed at chunk 0, {} GETs nil",
+                self.cyan("prefixes"),
+                format_count(kv.full_hits),
+                format_count(kv.chunk0_misses),
+                format_count(kv.get_nil)
+            );
+            println!(
+                "{}",
+                format_latency_row(&self.cyan(&pad_name("lookup")), &kv.lookup_time)
+            );
+            println!(
+                "{}",
+                format_latency_row(&self.cyan(&pad_name("load")), &kv.load_time)
+            );
+            println!(
+                "{}",
+                format_latency_row(
+                    &self.cyan(&pad_name("load/1k")),
+                    &kv.load_time_per_1k_tokens
+                )
+            );
+            println!(
+                "{}",
+                format_latency_row(&self.cyan(&pad_name("store")), &kv.store_time)
+            );
+            if !kv.closed_loop {
+                println!(
+                    "{}",
+                    format_latency_row(&self.cyan(&pad_name("sched lag")), &kv.schedule_lag)
+                );
+            }
+        }
+
         if results.requests_send_failed > 0 {
             println!(
                 "{}",

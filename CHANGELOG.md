@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `[workload.kv_replay]` replays a request-level KV-cache trace (the kvtrace
+  request format from pelikan-io/cachesim) against a RESP server used as an
+  LLM serving engine's KV-cache prefix store, and reports prompt tokens
+  served from the cache and computed. Object ids and sizes come from
+  kvtrace's `ObjectMapper` for a model geometry given as a Hugging Face
+  `config.json` or as KV bytes per token, with tensor parallelism (one
+  object per rank for dense models, rank 0 only for MLA). Per trace request:
+  one pipelined EXISTS per object, a GET of each object in the hit prefix,
+  then SETs from the end of the prefix (`write_rule = "set-from-miss"`,
+  the default) or of every object EXISTS did not find
+  (`"insert-if-absent"`). A full-prompt hit counts `input_tokens - 1` as
+  cached. Requests start at the trace's timestamps divided by `speedup`, or
+  closed-loop with `speedup = 0`; open loop records how late each started.
+  The run ends when the trace is exhausted or at `duration`. Hybrid models
+  are rejected. The JSON result gains a `kv_replay` object (totals, and
+  per-request lookup, load, store, load per 1,000 cached tokens and schedule
+  lag distributions); the clean and verbose outputs print the same, and
+  `requests_out` writes one CSV row per trace request. New `kv_*` counters
+  and histograms reach `/metrics` and the parquet recording. EXISTS, GET and
+  SET are also counted in `requests`, `responses`, the GET and SET latency
+  histograms and the byte counters. Existing fields are unchanged.
 - `[admin] listen` serves `GET /metrics/stream[?interval=..&layout=wide|long]`,
   metriken-exposition's stream route: dendro replication frames
   (`application/vnd.metriken.replication.v1+dendro`), a handshake with

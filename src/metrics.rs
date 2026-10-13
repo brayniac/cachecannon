@@ -220,6 +220,135 @@ pub static APPEND_BATCHES: Gauge = Gauge::new();
 )]
 pub static APPEND_CONNECTIONS_ACTIVE: ShardedGauge = ShardedGauge::new();
 
+// ── KV-cache replay metrics ──────────────────────────────────────────────
+//
+// `[workload.kv_replay]`. Tokens are prompt tokens of the replayed trace
+// requests; the EXISTS, GET and SET operations they issue are also counted
+// in the request, response and per-op metrics above.
+static KV: CounterGroup = CounterGroup::new();
+
+/// Counter slot indices for KV replay metrics.
+pub mod kv {
+    pub const REQUESTS: usize = 0;
+    pub const FAILED: usize = 1;
+    pub const INPUT_TOKENS: usize = 2;
+    pub const CACHED_TOKENS: usize = 3;
+    pub const NEW_TOKENS: usize = 4;
+    pub const FULL_HITS: usize = 5;
+    pub const CHUNK0_MISSES: usize = 6;
+    pub const NO_FULL_CHUNK: usize = 7;
+    pub const GET_NIL: usize = 8;
+    pub const EXISTS: usize = 9;
+    pub const LOOKUPS: usize = 10;
+    pub const LOADS: usize = 11;
+    pub const STORES: usize = 12;
+}
+
+#[metric(
+    name = "kv_requests",
+    description = "KV replay: trace requests replayed to completion"
+)]
+pub static KV_REQUESTS: Counter = Counter::new(&KV, kv::REQUESTS);
+
+#[metric(
+    name = "kv_requests_failed",
+    description = "KV replay: trace requests abandoned on a connection error, send failure or server error"
+)]
+pub static KV_REQUESTS_FAILED: Counter = Counter::new(&KV, kv::FAILED);
+
+#[metric(
+    name = "kv_input_tokens",
+    description = "KV replay: prompt tokens of the replayed requests"
+)]
+pub static KV_INPUT_TOKENS: Counter = Counter::new(&KV, kv::INPUT_TOKENS);
+
+#[metric(
+    name = "kv_cached_tokens",
+    description = "KV replay: prompt tokens served from the cache"
+)]
+pub static KV_CACHED_TOKENS: Counter = Counter::new(&KV, kv::CACHED_TOKENS);
+
+#[metric(
+    name = "kv_new_tokens",
+    description = "KV replay: prompt tokens not served from the cache (input - cached)"
+)]
+pub static KV_NEW_TOKENS: Counter = Counter::new(&KV, kv::NEW_TOKENS);
+
+#[metric(
+    name = "kv_full_hits",
+    description = "KV replay: requests whose cached prefix covered the whole prompt"
+)]
+pub static KV_FULL_HITS: Counter = Counter::new(&KV, kv::FULL_HITS);
+
+#[metric(
+    name = "kv_chunk0_misses",
+    description = "KV replay: requests whose lookup found the first chunk missing"
+)]
+pub static KV_CHUNK0_MISSES: Counter = Counter::new(&KV, kv::CHUNK0_MISSES);
+
+#[metric(
+    name = "kv_no_full_chunk",
+    description = "KV replay: requests shorter than one chunk, which issue no operations"
+)]
+pub static KV_NO_FULL_CHUNK: Counter = Counter::new(&KV, kv::NO_FULL_CHUNK);
+
+#[metric(
+    name = "kv_get_nil",
+    description = "KV replay: GETs of an object whose EXISTS returned 1 that returned nil"
+)]
+pub static KV_GET_NIL: Counter = Counter::new(&KV, kv::GET_NIL);
+
+#[metric(name = "kv_exists_count", description = "KV replay: EXISTS operations")]
+pub static KV_EXISTS_COUNT: Counter = Counter::new(&KV, kv::EXISTS);
+
+#[metric(
+    name = "kv_lookups",
+    description = "KV replay: requests that issued a lookup (samples in kv_lookup_time)"
+)]
+pub static KV_LOOKUPS: Counter = Counter::new(&KV, kv::LOOKUPS);
+
+#[metric(
+    name = "kv_loads",
+    description = "KV replay: requests that issued GETs (samples in kv_load_time)"
+)]
+pub static KV_LOADS: Counter = Counter::new(&KV, kv::LOADS);
+
+#[metric(
+    name = "kv_stores",
+    description = "KV replay: requests that issued SETs (samples in kv_store_time)"
+)]
+pub static KV_STORES: Counter = Counter::new(&KV, kv::STORES);
+
+#[metric(
+    name = "kv_lookup_time",
+    description = "KV replay: per request, first EXISTS sent to last EXISTS reply (nanoseconds)"
+)]
+pub static KV_LOOKUP_TIME: AtomicHistogram = AtomicHistogram::new(7, 64);
+
+#[metric(
+    name = "kv_load_time",
+    description = "KV replay: per request, first GET sent to last GET reply (nanoseconds)"
+)]
+pub static KV_LOAD_TIME: AtomicHistogram = AtomicHistogram::new(7, 64);
+
+#[metric(
+    name = "kv_store_time",
+    description = "KV replay: per request, first SET sent to last SET reply (nanoseconds)"
+)]
+pub static KV_STORE_TIME: AtomicHistogram = AtomicHistogram::new(7, 64);
+
+#[metric(
+    name = "kv_load_time_per_1k_tokens",
+    description = "KV replay: per request with cached tokens, load time per 1,000 cached tokens (nanoseconds)"
+)]
+pub static KV_LOAD_TIME_PER_1K_TOKENS: AtomicHistogram = AtomicHistogram::new(7, 64);
+
+#[metric(
+    name = "kv_schedule_lag",
+    description = "KV replay, open loop: per request, start minus the time the trace scheduled it (nanoseconds)"
+)]
+pub static KV_SCHEDULE_LAG: AtomicHistogram = AtomicHistogram::new(7, 64);
+
 // Cluster metrics
 static CLUSTER: CounterGroup = CounterGroup::new();
 

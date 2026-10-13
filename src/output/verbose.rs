@@ -171,6 +171,49 @@ impl OutputFormatter for VerboseFormatter {
                 );
             }
         }
+        if let Some(ref kv) = results.kv_replay {
+            tracing::info!(
+                "kv_replay: {} speedup={} write_rule={} requests={}/{} failed={}",
+                kv.timing(),
+                kv.speedup,
+                kv.write_rule,
+                kv.requests,
+                kv.trace_requests,
+                kv.requests_failed
+            );
+            tracing::info!(
+                "kv_replay tokens: cached={} ({}%) new={} input={} full_hits={} \
+                 misses_at_chunk_0={} get_nil={}",
+                kv.cached_tokens,
+                format_pct(kv.cached_fraction() * 100.0),
+                kv.new_tokens,
+                kv.input_tokens,
+                kv.full_hits,
+                kv.chunk0_misses,
+                kv.get_nil
+            );
+            let mut rows = vec![
+                ("lookup", &kv.lookup_time),
+                ("load", &kv.load_time),
+                ("load_per_1k_cached_tokens", &kv.load_time_per_1k_tokens),
+                ("store", &kv.store_time),
+            ];
+            if !kv.closed_loop {
+                rows.push(("schedule_lag", &kv.schedule_lag));
+            }
+            for (name, s) in rows {
+                tracing::info!(
+                    "kv_replay {name}: p50={:.0}us p90={:.0}us p99={:.0}us p99.9={:.0}us \
+                     p99.99={:.0}us max={:.0}us",
+                    s.p50_us,
+                    s.p90_us,
+                    s.p99_us,
+                    s.p999_us,
+                    s.p9999_us,
+                    s.max_us,
+                );
+            }
+        }
         if results.requests_send_failed > 0 {
             tracing::warn!(
                 "{} requests not sent because a send failed (usually a full send pool \
