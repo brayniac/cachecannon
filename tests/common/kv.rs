@@ -1,12 +1,6 @@
-//! Shared by the `kv_replay_*` tests: an in-process RESP server that stores
-//! what it is sent, a trace writer, and one closed-loop replay against the
-//! server.
-//!
-//! The runner can be started once per process and its metrics are
-//! process-global, so each test is its own test binary.
-
-// Each test binary uses part of this module.
-#![allow(dead_code)]
+//! For `tests/kv_replay.rs`: an in-process RESP server that stores what it is
+//! sent, a trace writer, one closed-loop replay against the server, and
+//! [`isolated`], which runs a test in its own process.
 
 use cachecannon::{ColorMode, Config, OutputFormat, create_formatter, run_benchmark_full};
 use kvtrace::{ObjectKind, Request, RequestWriter};
@@ -14,6 +8,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -346,4 +341,39 @@ pub fn load_config(toml: &str) -> Config {
     let config = Config::load(&path);
     std::fs::remove_file(&path).unwrap();
     config.unwrap()
+}
+
+/// Run `body` in a child process of this test binary, one child at a time.
+///
+/// `run_benchmark_full` can run once per process (the worker config channel
+/// is a `OnceLock`), and the metrics the tests read are process-global, so
+/// every replay needs a fresh process. The child is this binary run with
+/// `name` as an exact filter and `CACHECANNON_KV_TEST=name`, which makes the
+/// same test run `body` instead of spawning. Children run one at a time
+/// because each allocates the 1 GiB value pool and the open-loop test
+/// measures timing.
+pub fn isolated(name: &str, body: impl FnOnce()) {
+    const VAR: &str = "CACHECANNON_KV_TEST";
+    if std::env::var(VAR).as_deref() == Ok(name) {
+        body();
+        return;
+    }
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--nocapture", "--test-threads=1"])
+        .env(VAR, name)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "{name} failed in its child process\n--- stdout\n{stdout}\n--- stderr\n{stderr}"
+    );
+    // A filter that matched nothing would also succeed.
+    assert!(
+        stdout.contains("test result: ok. 1 passed"),
+        "{name}: the child process did not run exactly one test\n{stdout}"
+    );
 }

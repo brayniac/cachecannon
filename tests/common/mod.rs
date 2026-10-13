@@ -1,11 +1,15 @@
 //! Shared by the `read_values_*` tests: fake servers and a one-second
-//! benchmark run against them.
+//! benchmark run against them. `kv` is shared by `kv_replay.rs`.
 //!
 //! The runner can be started once per process (`init_config_channel`), and the
-//! metrics it records are process-global, so each run is its own test binary.
+//! metrics it records are process-global, so each `read_values_*` run is its
+//! own test binary. `kv_replay.rs` runs each test in a child process instead
+//! (`kv::isolated`).
 
 // Each test binary uses part of this module.
 #![allow(dead_code)]
+
+pub mod kv;
 
 use cachecannon::metrics::{CACHE_HITS, CACHE_MISSES, GET_COUNT, VALUES_READ_BYTES};
 use cachecannon::{ColorMode, Config, OutputFormat, create_formatter, run_benchmark_full};
