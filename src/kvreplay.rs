@@ -286,7 +286,7 @@ impl KvReplay {
 pub fn geometry(cfg: &crate::config::KvReplay) -> Result<Geometry, String> {
     let sizes = match (&cfg.model_config, cfg.kv_bytes_per_token) {
         (Some(path), _) => ModelSizes::from_config_file(path, cfg.kv_dtype.as_deref())
-            .map_err(|e| format!("kv_replay model_config: {e}"))?,
+            .map_err(|e| format!("kv_replay model_config {}: {e}", path.display()))?,
         (None, Some(bytes)) => {
             let mut sizes = ModelSizes::explicit(bytes, 0);
             sizes.mla = cfg.mla;
