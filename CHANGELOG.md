@@ -25,7 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are rejected. The JSON result gains a `kv_replay` object (totals, and
   per-request lookup, load, store, load per 1,000 cached tokens and schedule
   lag distributions); the clean and verbose outputs print the same, and
-  `requests_out` writes one CSV row per trace request. EXISTS, GET and SET
+  `requests_out` writes one CSV row per completed trace request (failed
+  requests have none). EXISTS, GET and SET
   are also counted in `requests`, `responses`, the GET and SET latency
   histograms and the byte counters. Existing JSON fields are unchanged. New
   `kv_*` counters and histograms are registered statically, like every

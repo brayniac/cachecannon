@@ -354,6 +354,17 @@ pub fn replay_on(
     kv_toml: &str,
     connections: usize,
 ) -> Vec<Row> {
+    replay_with(server, requests, kv_toml, connections, "resp")
+}
+
+/// [`replay_on`] with `protocol` (`resp` or `resp3`).
+pub fn replay_with(
+    server: &Server,
+    requests: &[Request],
+    kv_toml: &str,
+    connections: usize,
+    protocol: &str,
+) -> Vec<Row> {
     let addr = server.spawn();
     let trace = write_trace(requests);
     let out = temp_path("requests.csv");
@@ -376,7 +387,7 @@ pub fn replay_on(
 
         [target]
         endpoints = ["{addr}"]
-        protocol = "resp"
+        protocol = "{protocol}"
 
         [connection]
         connections = {connections}

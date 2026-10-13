@@ -1220,6 +1220,9 @@ async fn resp_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: usize
             );
             metrics::CONNECTIONS_ACTIVE.decrement();
             metrics::CONNECTIONS_FAILED.increment();
+            if state.task_state.kv_replay.is_some() {
+                crate::kvreplay::note_connect_failed();
+            }
             ringline::sleep(Duration::from_millis(100)).await;
             continue;
         }
@@ -1244,6 +1247,9 @@ async fn resp_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: usize
                     );
                     metrics::CONNECTIONS_ACTIVE.decrement();
                     metrics::CONNECTIONS_FAILED.increment();
+                    if state.task_state.kv_replay.is_some() {
+                        crate::kvreplay::note_connect_failed();
+                    }
                     ringline::sleep(Duration::from_millis(100)).await;
                     continue;
                 }

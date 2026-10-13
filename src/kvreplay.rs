@@ -602,8 +602,9 @@ fn dispatcher() -> Option<Rc<KvDispatcher>> {
     DISPATCHER.with(|d| d.borrow().clone())
 }
 
-/// Note a failed connect attempt on this worker, or a connection closed before
-/// it ran a request. A request handed back while none of the worker's
+/// Note a failed connect attempt on this worker (including a failed `HELLO 3`
+/// or precheck PING on a new connection), or a connection closed before it
+/// ran a request. A request handed back while none of the worker's
 /// connections is connected is failed once a reconnect attempt has failed,
 /// rather than waiting for one that may never succeed.
 pub(crate) fn note_connect_failed() {
@@ -638,6 +639,8 @@ impl Drop for Live {
 /// request claimed after it was due starts at once, and `kv_schedule_lag`
 /// records how late. A handed-back request is due already and goes to the
 /// next idle connection before the held one; a hand-back ends the sleep.
+/// A held request that comes due while none of the worker's connections is
+/// connected is treated as handed back.
 async fn run_dispatcher(dispatch: Rc<KvDispatcher>, kv: Arc<KvReplay>, shared: Arc<SharedState>) {
     let mut exhausted = false;
     // Claimed and not yet handed to a connection.
@@ -662,6 +665,18 @@ async fn run_dispatcher(dispatch: Rc<KvDispatcher>, kv: Arc<KvReplay>, shared: A
             let slot = dispatch.waiting.borrow_mut().pop_front().unwrap();
             slot.complete(Some(job));
             continue;
+        }
+        // A held request that is due while no connection on this worker is
+        // connected joins the handed-back ones: it runs on the first
+        // connection back, or fails under the rule below.
+        if dispatch.live.get() == 0
+            && pending.is_some_and(|j| j.scheduled.is_none_or(|d| d <= Instant::now()))
+        {
+            let job = pending.take().unwrap();
+            dispatch
+                .returned
+                .borrow_mut()
+                .push_back((job, dispatch.connect_failures.get()));
         }
         // No connection on this worker is connected and a reconnect attempt
         // failed since the request came back: fail it rather than wait for a

@@ -421,7 +421,9 @@ several connections or threads.
 
   A handed-back request is counted as failed when it has used those up, or
   when none of its worker's connections is connected and a reconnect attempt
-  has failed (refused, or a new connection closed before it ran anything).
+  has failed (refused, a failed `HELLO 3` or precheck, or a new connection
+  closed before it ran anything). An open-loop request already claimed and
+  waiting for its start time is treated the same way once it is due.
   Without that it could keep the run going until `duration`.
 - Multiple endpoints and cluster mode: every key of a request must be on the
   server its connection reaches.
