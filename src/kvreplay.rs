@@ -337,11 +337,14 @@ pub fn lookup_prefix(exists: &[bool], ranks: usize) -> usize {
 /// LMCache reports one token fewer on a full-prompt hit
 /// (`lmcache/integration/vllm/vllm_v1_adapter.py:1443-1445`, "In full-prompt-hit
 /// case, we need to recompute the last token"). A trace whose `input_tokens`
-/// is below its full chunks' tokens is capped the same way.
+/// is below its full chunks' tokens is capped the same way, and a prompt of 0
+/// tokens has 0 cached: kvtrace keeps `input_tokens` as the source gives it,
+/// so it can disagree with the chunks. The result never exceeds
+/// `input_tokens`.
 pub fn cached_tokens(hit_chunks: u64, chunk_tokens: u64, input_tokens: u64) -> u64 {
     let hit = hit_chunks.saturating_mul(chunk_tokens);
-    if input_tokens > 0 && hit >= input_tokens {
-        input_tokens - 1
+    if hit >= input_tokens {
+        input_tokens.saturating_sub(1)
     } else {
         hit
     }
@@ -886,7 +889,15 @@ async fn run_request(
     }
 
     o.cached_tokens = cached_tokens(o.hit as u64, kv.chunk_tokens, input);
-    o.new_tokens = input - o.cached_tokens;
+    // `cached_tokens` never exceeds its input; the subtraction is checked so
+    // a regression there fails loudly in tests instead of panicking a
+    // connection task in a debug build or wrapping the counter in release.
+    debug_assert!(
+        o.cached_tokens <= input,
+        "cached {} > input {input}",
+        o.cached_tokens
+    );
+    o.new_tokens = input.saturating_sub(o.cached_tokens);
     o.full_hit = input > 0 && (o.hit as u64).saturating_mul(kv.chunk_tokens) >= input;
     Ok(o)
 }
@@ -1052,6 +1063,15 @@ mod tests {
         // The trace's chunks cover more than its input_tokens.
         assert_eq!(cached_tokens(4, 16, 50), 49);
         assert_eq!(cached_tokens(0, 16, 0), 0);
+        // A 0-token prompt with chunks: nothing cached, whatever was found.
+        assert_eq!(cached_tokens(2, 16, 0), 0);
+        assert_eq!(cached_tokens(1, 16, 1), 0);
+        for (h, input) in [(4, 64), (4, 50), (2, 0), (3, 1), (0, 0), (u64::MAX, 7)] {
+            assert!(
+                cached_tokens(h, 16, input) <= input,
+                "{h} chunks, {input} tokens"
+            );
+        }
     }
 
     fn cfg(kv_bytes_per_token: Option<u64>) -> crate::config::KvReplay {

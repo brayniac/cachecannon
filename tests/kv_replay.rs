@@ -380,3 +380,25 @@ fn kv_replay_open_loop_follows_the_trace_clock() {
         assert_eq!(cachecannon::metrics::KV_REQUESTS.value(), 3);
     });
 }
+
+/// KV replay of a trace row whose `input_tokens` is 0 although it has full
+/// chunks (kvtrace keeps the source's prompt length, which can disagree with
+/// the chunks): the repeat finds both chunks, counts 0 cached and 0 new
+/// tokens, and the run finishes.
+#[test]
+fn kv_replay_zero_input_tokens_with_chunks() {
+    common::kv::isolated("kv_replay_zero_input_tokens_with_chunks", || {
+        let server = Server::default();
+        let rows = replay(
+            &server,
+            &[request(1, 0, &[1, 2], 0), request(2, 1, &[1, 2], 0)],
+            "",
+        );
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let r = &rows[1];
+        assert_eq!((r.hit_chunks, r.gets), (2, 2), "{r:?}");
+        assert_eq!((r.cached_tokens, r.new_tokens), (0, 0), "{r:?}");
+        assert_eq!(metrics::KV_NEW_TOKENS.value(), 0);
+        assert_eq!(metrics::KV_FULL_HITS.value(), 0);
+    });
+}
