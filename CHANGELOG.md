@@ -25,10 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are rejected. The JSON result gains a `kv_replay` object (totals, and
   per-request lookup, load, store, load per 1,000 cached tokens and schedule
   lag distributions); the clean and verbose outputs print the same, and
-  `requests_out` writes one CSV row per trace request. New `kv_*` counters
-  and histograms reach `/metrics` and the parquet recording. EXISTS, GET and
-  SET are also counted in `requests`, `responses`, the GET and SET latency
-  histograms and the byte counters. Existing fields are unchanged.
+  `requests_out` writes one CSV row per trace request. EXISTS, GET and SET
+  are also counted in `requests`, `responses`, the GET and SET latency
+  histograms and the byte counters. Existing JSON fields are unchanged. New
+  `kv_*` counters and histograms are registered statically, like every
+  metric here, so `/metrics`, `/metrics/binary`, `/metrics/stream` and the
+  parquet recording of every run now carry them, as zeros when
+  `kv_replay` is not set (the `append_*` metrics already behave this way).
 - `[admin] listen` serves `GET /metrics/stream[?interval=..&layout=wide|long]`,
   metriken-exposition's stream route: dendro replication frames
   (`application/vnd.metriken.replication.v1+dendro`), a handshake with

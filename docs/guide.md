@@ -330,6 +330,9 @@ For a request with `input_tokens` prompt tokens whose first `h` chunks of
   that is a whole number of chunks, since the partial tail is never stored.
   It is counted in `full_hits`.
 - `new_tokens = input_tokens - cached_tokens`.
+- `input_tokens = 0` gives 0 cached and 0 new tokens, whatever was found.
+  kvtrace keeps the prompt length as the source gives it, so a row can have
+  full chunks and `input_tokens = 0`; its operations are still sent.
 
 A request shorter than one chunk has no objects, sends nothing, and counts all
 its tokens as new (`no_full_chunk`).
