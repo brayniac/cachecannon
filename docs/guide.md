@@ -294,7 +294,10 @@ Each trace request runs on one connection, in three dependent steps:
      lookup's prefix to the last full chunk, present or not. LMCache's
      in-process remote backends put every object they are given without
      checking the store (`lmcache/v1/storage_backend/remote_backend.py:263-270`,
-     `323-331`).
+     `323-331`). That holds for the default, non-layerwise store; with
+     `use_layerwise` the cache engine skips a chunk whose first layer's key is
+     already present (`lmcache/v1/cache_engine.py:676`, `store_layer`), which
+     is closer to insert-if-absent.
    - `write_rule = "insert-if-absent"`: every object whose `EXISTS` returned 0.
      LMCache's multiprocess store reserves only keys that are not present
      (`reserve_write(..., "new")`,
@@ -357,8 +360,48 @@ the replay starts at the beginning of recording and every request is recorded.
 The run ends when every trace request has finished, or after warmup +
 `duration`, whichever is first.
 
+### Which LMCache connector this matches
+
+LMCache picks its remote connector from the URL scheme of `remote_url`. The
+replay's shape is one key per object and one `EXISTS`, one `GET` and one `SET`
+per object, sent pipelined on one connection. Checked against LMCache v0.5.5
+(05a013b):
+
+- **`resp://`** (`RESPConnector`, `lmcache/v1/storage_backend/connector/redis_adapter.py:18-70`,
+  `redis_connector.py:38-235`): matches the key and operation counts. Each
+  object is one key, and `EXISTS`, `GET` and `SET` use that key
+  (`redis_connector.py:65-66`, `88`, `101`). The lookup checks every key and
+  counts the prefix up to the first missing one (`redis_connector.py:164-188`).
+  It differs in concurrency: the native client splits a batch into up to
+  `resp_num_threads` tiles (default 8, `redis_adapter.py:44`), each on its own
+  connection doing one request at a time
+  (`csrc/storage_backends/connector_base.h:313-315`, `335-340`;
+  `csrc/storage_backends/redis/connector.cpp:315-337`).
+- **`valkey://`** (`ValkeyConnector`, `valkey_connector.py`): matches the key and
+  operation counts; one key per object (module docs, `valkey_connector.py:19-20`).
+  It sends each `EXISTS`, `GET` and `SET` as its own request through a thread
+  pool of clients (`valkey_connector.py:222-234`, `253-319`, `335-347`, `357-370`), not as
+  one pipeline, and supports cluster mode, which the replay does not.
+- **`redis://`** (`RedisConnector`, `redis_connector.py:238-420`): does not
+  match. Each object is two keys, `<key>kv_bytes` and `<key>metadata`. The
+  lookup checks `EXISTS <key>metadata` one key at a time and stops at the
+  first miss (`redis_connector.py:265-267`, `399-411`), so a lookup sends hit
+  chunks + 1 `EXISTS` rather than one per object. A load is two `GET`s per
+  object, metadata then `kv_bytes` (`278-300`), and a store two `SET`s
+  (`378-379`). The server therefore holds twice the keys, and each cached
+  object costs twice the `GET`s and `SET`s the replay sends.
+
+The lookup, load and store times here are those of one pipelined connection
+per trace request; for `resp://` and `valkey://` they would be spread over
+several connections or threads.
+
 ### What is not modelled
 
+- LMCache's local CPU tier. `local_cpu` defaults to true with
+  `max_local_cpu_size` 5 GB (`lmcache/v1/config.py:91-96`), and a lookup that
+  finds a chunk there never reaches the remote store. The replay sends every
+  lookup and load to the server, so for prefixes hot enough to stay in that
+  tier it overstates the remote operations.
 - The engine's own GPU prefix cache. Every request does the lookup, so a
   prefix that vLLM would find in its own cache is looked up and loaded from the
   server here.

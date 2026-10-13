@@ -376,7 +376,7 @@ pub struct KvReplay {
 pub enum KvWriteRule {
     /// Every object from the end of the lookup's prefix hit to the last full
     /// chunk, whether or not the store holds it (LMCache's in-process remote
-    /// backends).
+    /// backends, on the default non-layerwise store path).
     #[default]
     SetFromMiss,
     /// Every object whose EXISTS returned 0 (LMCache's multiprocess store).
