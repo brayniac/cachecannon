@@ -148,8 +148,10 @@ latency. Check the shares a run achieved from per-instance server counters, for
 example `cmdstat_get` and `cmdstat_set` calls from `INFO commandstats` on each
 instance, divided by their total, against the `zipf_share` column that
 `cargo run --release --example zipfbench -- <keys> <endpoints> <theta> 1
-<first endpoint addr> <connections>` prints per endpoint (with the same
-endpoint addresses, since the key partition depends on them).
+<first endpoint addr> <connections>` prints per endpoint. zipfbench builds
+its endpoints as consecutive ports on the first address and renders 16-byte hex
+keys over the ketama ring, so its shares match a run only with that layout: the
+same endpoint addresses, `keyspace.length = 16`, hex keys and no cluster mode.
 
 With `even`, an endpoint that owns no keys (fewer keys than endpoints, or a
 large value size) still gets connections; under a rate limit they claim tokens

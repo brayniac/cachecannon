@@ -38,7 +38,8 @@ impl KeyDist {
     }
 
     /// `theta` is the YCSB skew parameter: larger is more skewed, 0.99 is the
-    /// YCSB default. Must be > 0 and != 1 (the generator divides by `1 - theta`).
+    /// YCSB default. Must be > 0; config validation also bounds it to
+    /// `config::MAX_ZIPF_THETA`.
     pub fn zipf(n: usize, theta: f64) -> Self {
         KeyDist::Zipf(Zipfian::new(n, theta))
     }
@@ -299,7 +300,7 @@ impl Zipfian {
 /// A connection serves one endpoint, so it may only send keys that route
 /// there. Drawing from the global `Zipfian` and discarding keys that route
 /// elsewhere costs about `1 / P(endpoint)` draws, each with a key render and a
-/// route hash; with 48 endpoints that is roughly 50 to 60 of each per request.
+/// route hash; with 48 endpoints and 100,000 keys that is about 61 of each per request.
 /// The keys that survive that rejection have pmf
 /// `(id + 1)^-theta / sum over the endpoint's ids of (id + 1)^-theta`, and this
 /// samples exactly that pmf in O(1) with an alias table over the endpoint's

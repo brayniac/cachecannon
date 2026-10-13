@@ -988,28 +988,21 @@ fn spawn_protocol_tasks(
     let protocol = worker_state.task_state.config.target.protocol;
     let seed = run_seed(&worker_state.task_state.config);
 
-    // `key_share`: every worker computes the same assignment from the shared
-    // sampler and takes its own slice of it. `None` means round-robin.
-    let assignment = match worker_state
-        .task_state
-        .config
-        .connection
-        .endpoint_allocation
-    {
-        EndpointAllocation::KeyShare => worker_state
+    // Every worker computes the same assignment and takes its own slice of it.
+    let assignment = connection_endpoints(
+        worker_state
             .task_state
-            .key_dist
-            .endpoint_sampler()
-            .map(|z| key_share_endpoints(z.shares(), total_connections)),
-        EndpointAllocation::Even => None,
-    };
+            .config
+            .connection
+            .endpoint_allocation,
+        &worker_state.task_state.key_dist,
+        total_connections,
+        num_endpoints,
+    );
 
     for i in 0..my_connections {
         let global_conn_idx = my_start + i;
-        let endpoint_idx = match assignment {
-            Some(ref a) => a[global_conn_idx],
-            None => global_conn_idx % num_endpoints,
-        };
+        let endpoint_idx = assignment[global_conn_idx];
         let state = Arc::clone(worker_state);
         let session_seed = connection_seed(seed, SeedRole::Reader, worker_id, i);
 
@@ -1047,6 +1040,24 @@ fn spawn_protocol_tasks(
     }
 }
 
+/// The endpoint each of the run's `total` connections serves, indexed by
+/// global connection index. `key_share` with a per-endpoint zipf sampler gives
+/// `key_share_endpoints`; otherwise connection `i` serves endpoint
+/// `i % num_endpoints`.
+fn connection_endpoints(
+    allocation: EndpointAllocation,
+    key_dist: &KeyDist,
+    total: usize,
+    num_endpoints: usize,
+) -> Vec<usize> {
+    if allocation == EndpointAllocation::KeyShare
+        && let Some(z) = key_dist.endpoint_sampler()
+    {
+        return key_share_endpoints(z.shares(), total);
+    }
+    (0..total).map(|i| i % num_endpoints).collect()
+}
+
 /// Endpoint index for each of `total` global connection indices, with endpoint
 /// `e` getting about `shares[e] * total` connections: at least one if it owns
 /// any keys, none if it owns none. A connection to an endpoint with no keys
@@ -1062,6 +1073,7 @@ fn spawn_protocol_tasks(
 /// With fewer connections than endpoints that own keys, the minimum of one each
 /// cannot be met; that falls back to round-robin over those endpoints. Config
 /// validation rejects fewer connections than endpoints for a static list.
+#[doc(hidden)]
 pub fn key_share_endpoints(shares: &[f64], total: usize) -> Vec<usize> {
     let n = shares.len();
     let live: Vec<usize> = (0..n).filter(|&e| shares[e] > 0.0).collect();
@@ -3924,6 +3936,7 @@ pub(crate) fn build_prefill_queues(
 /// plain random key-id over the whole keyspace (no routing needed). Routing
 /// uses the same slot table / ketama ring as `build_prefill_queues`, so the
 /// partition matches the prefill partition.
+#[doc(hidden)]
 pub fn build_endpoint_keys(
     key_count: usize,
     key_len: usize,
@@ -3953,6 +3966,7 @@ pub fn build_endpoint_keys(
 /// `run_benchmark_full` before any key is generated. See `config::KeyFormat`.
 pub(crate) static KEY_FORMAT: AtomicU8 = AtomicU8::new(0);
 
+#[doc(hidden)]
 pub fn write_key(buf: &mut [u8], id: usize) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     // Canonical UUID form: 8-4-4-4-12 hex with dashes at indices 8/13/18/23.
@@ -4045,6 +4059,31 @@ mod tests {
         let keys = Arc::new(build_endpoint_keys(n, 16, &endpoints, &None));
         let d = KeyDist::zipf(n, 0.99).with_endpoint_keys(&keys);
         (keys, d, 1_536)
+    }
+
+    #[test]
+    fn connections_follow_the_configured_allocation() {
+        let (_, d, total) = key_share_fixture();
+        let shares = d.endpoint_sampler().unwrap().shares();
+        assert_eq!(
+            connection_endpoints(EndpointAllocation::KeyShare, &d, total, 48),
+            key_share_endpoints(shares, total)
+        );
+        let even: Vec<usize> = (0..total).map(|i| i % 48).collect();
+        assert_eq!(
+            connection_endpoints(EndpointAllocation::Even, &d, total, 48),
+            even
+        );
+        // Without a per-endpoint sampler (uniform keys), key_share is round-robin.
+        assert_eq!(
+            connection_endpoints(
+                EndpointAllocation::KeyShare,
+                &KeyDist::uniform(1000),
+                total,
+                48
+            ),
+            even
+        );
     }
 
     #[test]

@@ -53,29 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [threads] [base_addr] [connections]`; prints each endpoint's keys, zipf
   share and `key_share` connection count.
 
-### Fixed
-- `keyspace.zipf_theta` is now bounded to (0, 10]. A large theta could
-  underflow every key weight on an endpoint, which the per-endpoint alias
-  tables below cannot sample.
-- Multi-endpoint `distribution = "zipf"` drew from the global zipf and
-  discarded keys that routed to another endpoint, about `1 / P(endpoint)`
-  draws, key renders and ketama hashes per request (60.9 at 48 endpoints and
-  100,000 keys; 19–39 µs per request across runs on one core of a shared
-  Apple M-series laptop, not yet measured on a server). That cost alone
-  limits 48 threads to 1.2M–2.5M keys/s, consistent with the ~2.0M req/s
-  ceiling seen with zipf. Each endpoint now samples zipf
-  restricted to its own keys from an alias table built once at startup: the
-  same pmf the rejection produced, in O(1). RESP and DMA only; memcache and
-  `recency` still reject-route.
-
-### Known issues
-- Known, not fixed: with `endpoint_allocation = "even"` (the default), an
-  endpoint that owns no keys (fewer keys than endpoints, e.g. a 16 GiB
-  keyspace of 128 MiB values over 48 endpoints) still gets connections. In
-  RESP each claims a rate-limit token batch, finds no key and drops it, which
-  lowers the achieved rate. `key_share` gives such endpoints no connections.
-
 ### Changed
+- `keyspace.zipf_theta` must now be in (0, 10]; larger values were accepted
+  before. A large theta could underflow every key weight on an endpoint,
+  which the per-endpoint alias tables cannot sample.
 - metriken 0.9 → 0.11.3 (metriken-core 0.3), metriken-exposition 0.16 → 0.22,
   metriken-query 0.9 → 0.36, and metriken-storage 0.2 for `--parquet`'s
   msgpack-to-parquet conversion, which left metriken-exposition. No SQLite is
@@ -139,6 +120,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than rate: 1536 connections at 14,950 req/s of 1 MiB values used 17.6
   CPUs, and 0.26 with the dispatcher; GET p99 was 378 and 387 us.
   Closed-loop runs are unchanged.
+- Multi-endpoint `distribution = "zipf"` drew from the global zipf and
+  discarded keys that routed to another endpoint: about `1 / P(endpoint)`
+  draws, key renders and ketama hashes per request (61 at 48 endpoints and
+  100,000 keys; `examples/zipfbench` measures the per-key cost on the client
+  host). Each endpoint now samples zipf restricted to its own keys from an
+  alias table built once at startup: the same pmf the rejection produced, in
+  O(1). Closed loop against 48 server processes with 1536 connections and
+  4 KiB values, zipf went from 2.04M to 6.10M req/s on RESP (uniform keys:
+  6.1M) and from 1.9M to 3.80M on DMA (uniform: 3.73M). RESP and DMA only;
+  memcache and `recency` still reject-route. The tables use the startup key
+  partition, so in cluster mode a slot that moves during the run is not
+  followed: the old owner's connections keep sending its keys and get MOVED,
+  as the uniform path already does.
 - A connection the server closed while it had no requests in flight now
   reconnects. Its sends failed without reaching `recv`, where a close is
   noticed, so it retried for the rest of the run: a rate-limited run (64
@@ -181,6 +175,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Connection seeds mix the run seed with the connection's role (reader or
   append writer) and position through SplitMix64, so connections within a run,
   and the same connection across runs, never share a stream.
+
+### Known issues
+- With `endpoint_allocation = "even"` (the default), an
+  endpoint that owns no keys (fewer keys than endpoints, e.g. a 16 GiB
+  keyspace of 128 MiB values over 48 endpoints) still gets connections. In
+  RESP each claims a rate-limit token batch, finds no key and drops it, which
+  lowers the achieved rate. `key_share` gives such endpoints no connections.
 
 ## [0.0.28] - 2026-09-28
 
