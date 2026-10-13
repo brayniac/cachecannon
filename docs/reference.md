@@ -295,7 +295,7 @@ run ends when every trace request has finished. Trace requests that finish
 during `general.warmup` are not recorded.
 
 Rejected at config load: protocols other than `resp` and `resp3`, more than one
-endpoint, `cluster = true`, `rate_limit`, `[workload.saturation_search]`,
+endpoint, `cluster = true`, `connection.pipeline_depth = 0`, `rate_limit`, `[workload.saturation_search]`,
 `prefill`, `backfill_on_miss`, `read_values` and `[workload.append]`. Rejected
 when the run starts: an empty trace, a model with recurrent state (a hybrid
 linear-attention model), and a `tp` the model's head counts or per-token size

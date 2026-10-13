@@ -1132,6 +1132,12 @@ impl Config {
         if kv.tp == 0 || kv.tp > kvtrace::MAX_TP {
             return bad(&format!("tp must be in 1..={}", kvtrace::MAX_TP));
         }
+        // A request's GETs and SETs are sent at most pipeline_depth at a time;
+        // with 0 none would be sent and the replay would wait for a reply to
+        // nothing, with no request in flight to time out.
+        if self.connection.pipeline_depth == 0 {
+            return bad("needs connection.pipeline_depth >= 1");
+        }
         // The lookup is one pipeline of EXISTS per connection, so every key a
         // request touches must live on the server that connection reaches.
         if !matches!(self.target.protocol, Protocol::Resp | Protocol::Resp3) {
@@ -1335,6 +1341,7 @@ mod validation_tests {
             ("speedup = -1.0", "", "speedup"),
             ("tp = 0", "", "tp must be"),
             ("tp = 4097", "", "tp must be"),
+            ("", "[connection]\npipeline_depth = 0", "pipeline_depth"),
             ("", "[workload]\nrate_limit = 1000", "rate_limit"),
             ("", "[workload]\nprefill = true", "prefill"),
             ("", "[workload]\nread_values = true", "read_values"),
