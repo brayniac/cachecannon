@@ -19,9 +19,9 @@ use crate::config::{DmaModule, DmaProvider};
 use crate::keydist::KeyDist;
 use crate::metrics;
 use crate::worker::{
-    DisconnectReason, InFlight, Phase, SharedWorkerState, confirm_prefill_key,
+    DisconnectReason, InFlight, Phase, SharedWorkerState, confirm_prefill_key, dispatcher,
     establish_connection, max_routing_attempts, record_counters, recv_with_timeout,
-    resolve_tls_server_name, route_key, value_offset, write_key,
+    resolve_tls_server_name, route_key, take_token, value_offset, wait_for_token, write_key,
 };
 
 thread_local! {
@@ -258,6 +258,12 @@ async fn run_transfers(
     let value_len = config.workload.values.length;
     let pool_len = state.task_state.value_pool.len();
     let backfill_on_miss = state.task_state.backfill_on_miss;
+    // A connection the limiter turns away parks on the worker's dispatcher, as the RESP path does,
+    // instead of re-polling the limiter on a timer. `None` only if the dispatcher failed to spawn;
+    // closed-loop runs have no limiter and never reach it.
+    let token_dispatch = dispatcher();
+    // A token the dispatcher already charged to this connection; see `take_token`.
+    let mut carried_tokens: u64 = 0;
 
     loop {
         let phase = state.task_state.shared.phase();
@@ -320,11 +326,14 @@ async fn run_transfers(
                 }
             };
             if let Some(limiter) = state.task_state.ratelimiter.as_ref() {
-                if limiter.try_wait().is_err() {
+                if !take_token(&mut carried_tokens, limiter) {
                     // Refreshed even when nothing is sent, so perceived latency reflects a
                     // still-growing backlog.
                     metrics::CURRENT_SLIP_NS.set(limiter.slip_ns() as i64);
-                    ringline::sleep(Duration::from_micros(100)).await;
+                    match token_dispatch {
+                        Some(ref dispatch) => wait_for_token(dispatch, &mut carried_tokens).await,
+                        None => ringline::sleep(Duration::from_micros(100)).await,
+                    }
                     continue;
                 }
                 // Read after the claim, as does RESP.

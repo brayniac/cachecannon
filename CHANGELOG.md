@@ -96,6 +96,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     a `query worker:` error.
 
 ### Fixed
+- `protocol = "dma"` rate-limited runs take tokens from the worker's
+  dispatcher, as RESP and memcache do. A connection the limiter turned away
+  re-polled it every 100 us, so client CPU scaled with connections rather
+  than rate: 1536 connections at 14,950 req/s of 1 MiB values used 17.6
+  CPUs, and 0.26 with the dispatcher; GET p99 was 378 and 387 us.
+  Closed-loop runs are unchanged.
 - A connection the server closed while it had no requests in flight now
   reconnects. Its sends failed without reaching `recv`, where a close is
   noticed, so it retried for the rest of the run: a rate-limited run (64

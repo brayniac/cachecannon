@@ -391,7 +391,7 @@ impl TokenSlot {
 /// token rate rather than the connection count, and the cadence that governs
 /// smoothness is set by the dispatcher alone. The two quantities come apart.
 #[derive(Default)]
-struct TokenDispatcher {
+pub(crate) struct TokenDispatcher {
     queue: RefCell<VecDeque<Rc<TokenSlot>>>,
     /// Set once the dispatcher has stopped servicing. Sticky, because `drain`
     /// can only release the waiters queued at that instant -- a connection
@@ -513,8 +513,31 @@ thread_local! {
     static DISPATCHER: RefCell<Option<Rc<TokenDispatcher>>> = const { RefCell::new(None) };
 }
 
-fn dispatcher() -> Option<Rc<TokenDispatcher>> {
+pub(crate) fn dispatcher() -> Option<Rc<TokenDispatcher>> {
     DISPATCHER.with(|d| d.borrow().clone())
+}
+
+/// One request's rate-limit token, for a connection that sends one request at
+/// a time: a token the dispatcher already granted it, else one from the
+/// limiter. The carried token is spent first because `acquire` has already
+/// debited the limiter for it; polling the limiter instead would charge the
+/// request twice and lower the achieved rate.
+#[cfg(any(feature = "dma", test))]
+pub(crate) fn take_token(carried: &mut u64, rl: &WorkerLimiter) -> bool {
+    if *carried > 0 {
+        *carried -= 1;
+        true
+    } else {
+        rl.try_wait().is_ok()
+    }
+}
+
+/// Park on the dispatcher until it grants one token, and carry the grant to
+/// the next `take_token`. Returns with nothing carried when the dispatcher
+/// drains at shutdown.
+#[cfg(any(feature = "dma", test))]
+pub(crate) async fn wait_for_token(dispatch: &Rc<TokenDispatcher>, carried: &mut u64) {
+    *carried += dispatch.acquire(1).await;
 }
 
 /// Run this worker's dispatcher until the run stops.
@@ -738,9 +761,10 @@ impl AsyncEventHandler for BenchHandler {
                 DISPATCHER.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&dispatch)));
                 let shared = Arc::clone(&worker_state.task_state.shared);
                 if let Err(e) = ringline::spawn(run_dispatcher(dispatch, rl, shared)) {
-                    // Without it every connection falls back to the bounded
-                    // wait in `acquire`, which still makes progress -- but it
-                    // is the old per-connection poll, so say so.
+                    // Without it `dispatcher()` returns `None` and every
+                    // connection falls back to polling the limiter on a short
+                    // sleep, which still makes progress -- but it is the old
+                    // per-connection poll, so say so.
                     tracing::error!(
                         worker = worker_id,
                         "failed to spawn rate-limit dispatcher: {e}; \
@@ -3993,6 +4017,46 @@ mod tests {
         };
         let mut cx = Context::from_waker(Waker::noop());
         Pin::new(&mut wait).poll(&mut cx).is_ready()
+    }
+
+    #[test]
+    fn a_carried_token_is_spent_before_the_limiter() {
+        let rl = WorkerLimiter::per_second(1, 1);
+        let mut carried = 1;
+        assert!(take_token(&mut carried, &rl));
+        assert_eq!(carried, 0);
+        assert!(
+            rl.try_wait().is_ok(),
+            "a carried token must not debit the limiter"
+        );
+        assert!(
+            !take_token(&mut carried, &rl),
+            "nothing carried, limiter empty"
+        );
+    }
+
+    #[test]
+    fn a_granted_token_is_carried_to_the_next_request() {
+        let d = Rc::new(TokenDispatcher::default());
+        // Holds two, so a claim for more than one token would be granted it.
+        let rl = limiter(2);
+        let mut carried = 0;
+        {
+            let mut wait = std::pin::pin!(wait_for_token(&d, &mut carried));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(wait.as_mut().poll(&mut cx).is_pending());
+            d.dispatch(&rl);
+            assert!(wait.as_mut().poll(&mut cx).is_ready());
+        }
+        assert_eq!(carried, 1, "one token granted and kept, not dropped");
+        assert!(
+            take_token(&mut carried, &rl),
+            "and pays for the next request"
+        );
+        assert_eq!(carried, 0);
+        // The grant debited one of the two; spending it must not debit another.
+        assert!(rl.try_wait().is_ok(), "one token left in the limiter");
+        assert!(rl.try_wait().is_err());
     }
 
     #[test]
