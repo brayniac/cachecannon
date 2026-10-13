@@ -360,11 +360,22 @@ pub fn load_config(toml: &str) -> Config {
 /// is a `OnceLock`), and the metrics the tests read are process-global, so
 /// every replay needs a fresh process. The child is this binary run with
 /// `name` as an exact filter and `CACHECANNON_KV_TEST=name`, which makes the
-/// same test run `body` instead of spawning. Children run one at a time
+/// same test run `body` instead of spawning. `name` must be the running
+/// test's own name, which is checked in the parent and in the child. Children
+/// run one at a time
 /// because each allocates the 1 GiB value pool and the open-loop test
 /// measures timing.
 pub fn isolated(name: &str, body: impl FnOnce()) {
     const VAR: &str = "CACHECANNON_KV_TEST";
+    // libtest runs each test on a thread named after it. A `name` that is
+    // another test's exact name would otherwise run that test's body in the
+    // child, and pass.
+    let running = std::thread::current().name().map(str::to_owned);
+    assert_eq!(
+        running.as_deref(),
+        Some(name),
+        "isolated() was given a name that is not the running test's"
+    );
     if std::env::var(VAR).as_deref() == Ok(name) {
         body();
         return;
