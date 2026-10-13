@@ -56,6 +56,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timing, memory and error-handling differences.
 
 ### Changed
+- A run whose computed send copy pool exceeds ringline's per-worker maximum
+  of 65,535 slots logs a warning naming the inputs (connections per worker,
+  pipeline depth, batch, value length, TLS, and for `kv_replay` the largest
+  lookup). The pool was, and still is, capped there; sends past it fail and
+  are counted in `requests_send_failed`. Before, the cap was applied without
+  a message.
 - metriken 0.9 → 0.11.3 (metriken-core 0.3), metriken-exposition 0.16 → 0.22,
   metriken-query 0.9 → 0.36, and metriken-storage 0.2 for `--parquet`'s
   msgpack-to-parquet conversion, which left metriken-exposition. No SQLite is
