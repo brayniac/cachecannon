@@ -233,6 +233,128 @@ Differences from the default path:
   `disconnects_eof` and reconnects, and the next such reply does the same.
   `recv_meta` drains the value as it arrives and is not limited.
 
+### KV-Cache Replay Settings
+
+`[workload.kv_replay]` replaces the synthetic keyspace with a kvtrace request
+trace. `docs/guide.md` "KV-Cache Prefix Replay" describes what a trace request
+does and how tokens are counted.
+
+```toml
+[workload.kv_replay]
+# kvtrace request trace (Parquet). Read into memory at startup and sorted by
+# timestamp.
+trace = "requests.parquet"
+
+# Trace time is divided by this: 10 replays ten times faster than recorded.
+# 0 replays closed loop: each connection starts its next trace request as
+# soon as the previous one finished. Default 1.
+speedup = 1.0
+
+# Model geometry: exactly one of model_config and kv_bytes_per_token.
+# A Hugging Face config.json; KV bytes per token, MLA and head counts come
+# from it.
+model_config = "config.json"
+# KV cache dtype, overriding the config's (model_config only).
+# kv_dtype = "fp8"
+# KV bytes per token over all layers and ranks, instead of model_config.
+# kv_bytes_per_token = 131072
+# With kv_bytes_per_token: multi-head latent attention, stored by rank 0
+# only at full size. Default false.
+# mla = false
+
+# Tensor-parallel degree. A dense model stores one object per rank per chunk,
+# each 1/min(tp, kv_heads) of the chunk. Default 1.
+tp = 1
+
+# Which objects a trace request SETs after its lookup:
+# "set-from-miss"    - every object from the end of the lookup's prefix hit
+#                      to the last full chunk (default)
+# "insert-if-absent" - every object whose EXISTS returned 0
+write_rule = "set-from-miss"
+
+# Object key: key_prefix followed by the object id.
+# "hex"     - 16 lowercase hex digits, zero-padded (default)
+# "decimal" - decimal, no padding
+key_prefix = "kv:"
+key_format = "hex"
+
+# One CSV row per completed trace request (optional).
+# requests_out = "kv-requests.csv"
+```
+
+The object id is kvtrace's `chunk << 16 | slot << 12 | rank`, with slot 0.
+The SET value of an object is that many bytes of the shared value pool; an
+object larger than the pool (1 GiB) is rejected at startup.
+
+Related settings keep their meaning: `connection.connections` bounds the trace
+requests in flight (one per connection), `connection.pipeline_depth` bounds the
+GETs or SETs one trace request has in flight, and `connection.request_timeout`
+applies to every EXISTS, GET and SET. `general.duration` is an upper bound: the
+run ends when every trace request has finished. Trace requests that finish
+during `general.warmup` are not recorded.
+
+Rejected at config load: protocols other than `resp` and `resp3`, more than one
+endpoint, `cluster = true`, `rate_limit`, `[workload.saturation_search]`,
+`prefill`, `backfill_on_miss`, `read_values` and `[workload.append]`. Rejected
+when the run starts: a model with recurrent state (a hybrid linear-attention
+model), and a `tp` the model's head counts or per-token size do not divide.
+
+#### KV replay results
+
+The JSON `result` line gains a `kv_replay` object:
+
+| Field | Meaning |
+|-------|---------|
+| `timing` | `"open-loop"` or `"closed-loop"` |
+| `speedup` | Trace time divisor; 0 in closed loop |
+| `write_rule` | `"set-from-miss"` or `"insert-if-absent"` |
+| `trace_requests` | Requests in the trace |
+| `requests` | Trace requests replayed to completion during recording |
+| `requests_failed` | Trace requests abandoned on a connection error, send failure or server error to the lookup; in no token count |
+| `input_tokens` | Prompt tokens of the replayed requests |
+| `cached_tokens` | Prompt tokens served from the cache |
+| `new_tokens` | `input_tokens - cached_tokens` |
+| `cached_fraction` | `cached_tokens / input_tokens` |
+| `full_hits` | Requests whose loaded prefix covered the whole prompt |
+| `misses_at_chunk_0` | Requests whose lookup found the first chunk missing |
+| `no_full_chunk` | Requests shorter than one chunk; they issue no operations |
+| `get_nil` | GETs that returned nil after their EXISTS returned 1 |
+| `exists` | EXISTS operations |
+| `lookup` | Per request: first EXISTS sent to last EXISTS reply |
+| `load` | Per request with GETs: first GET sent to last GET reply |
+| `store` | Per request with SETs: first SET sent to last SET reply |
+| `load_per_1k_cached_tokens` | Per request with GETs and cached tokens: `load × 1000 / cached_tokens` |
+| `schedule_lag` | Open loop only, per request: start minus the time the trace scheduled it |
+
+The five distributions are objects with `count` (requests sampled) and
+`p50_us` through `max_us`, like `get` and `set`. A request is attributed to the
+phase it finished in.
+
+The EXISTS, GETs and SETs are also counted in `requests`, `responses`,
+`bytes_tx` and `bytes_rx`, and the GETs and SETs in `get`, `set`, `hits` and
+`misses`. EXISTS have no per-operation latency: the lookup is sent as one
+pipeline whose replies arrive together.
+
+The clean and verbose formats print the same totals and distributions under
+"KV Replay".
+
+`requests_out` columns, one row per trace request that completed, in completion
+order:
+
+| Column | Meaning |
+|--------|---------|
+| `req_id` | From the trace |
+| `timestamp_ns` | Trace timestamp |
+| `lag_ns` | Open loop: start minus scheduled time. Empty in closed loop |
+| `input_tokens` | From the trace |
+| `chunks` | Full chunks in the trace request |
+| `lookup_hit_chunks` | Chunks of the lookup's prefix hit |
+| `hit_chunks` | Chunks loaded: the lookup's prefix, cut at the first GET that returned nil or an error |
+| `cached_tokens`, `new_tokens` | As in the result |
+| `gets`, `get_nil`, `sets` | Operations the request sent |
+| `lookup_ns`, `load_ns`, `store_ns` | As in the result; 0 when there was no such step |
+| `recorded` | 1 if the request finished during recording, 0 during warmup |
+
 ### Saturation Search Settings
 
 See the [Saturation Search](guide.md#saturation-search) section in the guide for how this works.
@@ -565,6 +687,15 @@ Each snapshot contains the full set of metrics. The file uses the metriken expos
 | `disconnects_error_event` | Disconnects from error events |
 | `disconnects_connect_failed` | Disconnects from failed connect attempts |
 | `cluster_redirects` | Total MOVED/ASK redirects (cluster mode) |
+| `kv_requests` | KV replay: trace requests replayed to completion |
+| `kv_requests_failed` | KV replay: trace requests abandoned |
+| `kv_input_tokens`, `kv_cached_tokens`, `kv_new_tokens` | KV replay: prompt tokens in, served from the cache, and computed |
+| `kv_full_hits` | KV replay: requests whose cached prefix covered the whole prompt |
+| `kv_chunk0_misses` | KV replay: requests whose lookup found the first chunk missing |
+| `kv_no_full_chunk` | KV replay: requests shorter than one chunk |
+| `kv_get_nil` | KV replay: GETs that returned nil after their EXISTS returned 1 |
+| `kv_exists_count` | KV replay: EXISTS operations |
+| `kv_lookups`, `kv_loads`, `kv_stores` | KV replay: requests with a lookup, GETs, SETs (sample counts of the time histograms) |
 
 **Gauges** (point-in-time values):
 
@@ -585,6 +716,9 @@ Each snapshot contains the full set of metrics. The file uses the metriken expos
 | `backfill_set_latency` | Backfill SET latency |
 | `schedule_slip` | Queueing the latency clock omits: rate-limiter tokens beyond one claim (one batch), divided by rate, per worker. Zero without a rate limit |
 | `perceived_latency` | `response_latency + schedule_slip`. What a client issuing at the target rate experienced |
+| `kv_lookup_time`, `kv_load_time`, `kv_store_time` | KV replay, per trace request: first EXISTS, GET or SET sent to the last reply |
+| `kv_load_time_per_1k_tokens` | KV replay, per trace request with cached tokens: load time × 1000 / cached tokens |
+| `kv_schedule_lag` | KV replay, open loop, per trace request: start minus scheduled time |
 
 ### Programmatic Analysis
 

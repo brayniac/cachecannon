@@ -219,6 +219,154 @@ the cache's fill time against the append cadence. Shrinking `every` to compress
 a run changes what is being measured: fill time does not scale with it. Prefer
 real cadence with Parquet output and the viewer.
 
+## KV-Cache Prefix Replay
+
+```toml
+[general]
+duration = "3600s"   # an upper bound; the run ends with the trace
+warmup = "0s"
+
+[connection]
+connections = 64     # trace requests in flight
+pipeline_depth = 32  # GETs or SETs in flight within one trace request
+
+[workload.kv_replay]
+trace = "requests.parquet"
+speedup = 1.0
+model_config = "config.json"
+tp = 2
+requests_out = "kv-requests.csv"
+```
+
+Replays a request-level KV-cache trace against the server as an LLM serving
+engine uses a remote KV-cache store for prefix caching, and reports how many
+prompt tokens were served from the cache (cached tokens) and how many had to be
+computed (new tokens), with how long the lookups, loads and stores took.
+Results are in tokens; converting them to GPU time or cost is left to the
+reader. `config/kv-replay.toml` is a complete example and `docs/reference.md`
+"KV-Cache Replay Settings" lists every key and output field.
+
+### The trace and the objects
+
+The trace is the kvtrace request format (`crates/kvtrace` in
+[pelikan-io/cachesim](https://github.com/pelikan-io/cachesim)): one Parquet row
+per inference request with its timestamp, `req_id`, `input_tokens`,
+`output_tokens`, the ids of its full prefix chunks, and a session id, plus the
+tokens per chunk in the file metadata. Equal chunk ids mean equal prefix
+content. Tokens after the last full chunk are not represented, because LMCache
+does not store a partial chunk.
+
+kvtrace's `ObjectMapper` turns a request's chunks into the objects the engine
+stores, for a model geometry: one object per chunk per storing rank, keyed
+`key_prefix` + the object id (`chunk << 16 | slot << 12 | rank`), sized
+chunk tokens × KV bytes per token held by that rank. Following LMCache v0.5.5
+(05a013b) and vLLM v0.31.0 (db9527a), as kvtrace documents:
+
+- With tensor parallelism each rank stores its own shard as a separate object
+  (LMCache's key includes the worker id, `lmcache/utils.py:389-441`), holding
+  `1/min(tp, kv_heads)` of the KV, since vLLM replicates KV heads once `tp`
+  reaches their count (`vllm/model_executor/layers/linear.py:1053-1058`,
+  `vllm/config/model.py:1625-1628`).
+- An MLA model is stored by rank 0 only, at full size (`save_only_first_rank`,
+  `lmcache/v1/cache_engine.py:116-119`).
+- Hybrid models (linear-attention layers with a recurrent state) are rejected.
+  kvtrace's geometry for them is an approximation: object sizes, the chunk
+  length vLLM and LMCache allow, and the number of state snapshots differ from
+  what LMCache stores.
+
+### One trace request
+
+Each trace request runs on one connection, in three dependent steps:
+
+1. **Lookup.** One `EXISTS` per object, for every full chunk on every storing
+   rank, all sent in one pipeline. No multi-key `EXISTS` is used. The hit
+   prefix is the chunks before the first chunk missing an object on any rank,
+   which is the minimum of the ranks' own prefixes: a chunk is usable only if
+   every rank can load its shard.
+2. **Load.** `GET` of every object in the hit prefix, at most
+   `connection.pipeline_depth` in flight. A `GET` that returns nil (the object
+   was evicted between its `EXISTS` and its `GET`) is counted in `get_nil`, and
+   the cached prefix ends at that chunk. A `GET` answered with an error ends it
+   the same way.
+3. **Store.** `SET` of the objects the write rule selects, at most
+   `pipeline_depth` in flight, each value the object's size:
+   - `write_rule = "set-from-miss"` (default): every object from the end of the
+     lookup's prefix to the last full chunk, present or not. LMCache's
+     in-process remote backends put every object they are given without
+     checking the store (`lmcache/v1/storage_backend/remote_backend.py:263-270`,
+     `323-331`).
+   - `write_rule = "insert-if-absent"`: every object whose `EXISTS` returned 0.
+     LMCache's multiprocess store reserves only keys that are not present
+     (`reserve_write(..., "new")`,
+     `lmcache/v1/distributed/storage_manager.py:182-200`).
+
+   The store starts where the lookup's prefix ended, not where the load did:
+   LMCache records the lookup result as already saved
+   (`num_saved_tokens = lmcache_cached_tokens`,
+   `lmcache/integration/vllm/vllm_v1_adapter.py:193`, `:247`) and skips that
+   many leading tokens, rounded down to a chunk, when it stores (`:326`,
+   `:1059-1065`). An object that came back nil is therefore not written again
+   by the request that found it missing.
+
+Under `tp > 1` all ranks' operations go on the one connection, in rank order
+within each chunk. The engine's ranks are separate processes with their own
+connections, so the lookup, load and store times here are those of one client
+doing every rank's work; they are not the per-rank times.
+
+### Token accounting
+
+For a request with `input_tokens` prompt tokens whose first `h` chunks of
+`chunk_tokens` were loaded:
+
+- `cached_tokens = h × chunk_tokens`, except when that is at least
+  `input_tokens`: then `cached_tokens = input_tokens - 1`. vLLM must compute
+  at least the last prompt token to produce output, so LMCache reports one
+  token fewer on a full-prompt hit
+  (`lmcache/integration/vllm/vllm_v1_adapter.py:1443-1445`, "In full-prompt-hit
+  case, we need to recompute the last token"). A full-prompt hit needs a prompt
+  that is a whole number of chunks, since the partial tail is never stored.
+  It is counted in `full_hits`.
+- `new_tokens = input_tokens - cached_tokens`.
+
+A request shorter than one chunk has no objects, sends nothing, and counts all
+its tokens as new (`no_full_chunk`).
+
+### Timing
+
+- **Open loop** (`speedup > 0`, default 1): each trace request is due at its
+  trace time, measured from the first request's, divided by `speedup`, and
+  starts then whether or not earlier ones have finished, as long as a
+  connection is free. Each connection replays one trace request at a time, so
+  `connections` is the most that can be in flight. A request that starts late
+  because none was free, or because the generator fell behind, starts at once
+  and `schedule_lag` records by how much: read it before the other numbers.
+- **Closed loop** (`speedup = 0`): every connection starts its next trace
+  request as soon as its previous one finished, so `connections` is the
+  concurrency. Trace timestamps are ignored. Results say `"timing":
+  "closed-loop"` and have no `schedule_lag`. Closed loop finds how fast the
+  server can serve the trace; it does not show how the server behaves at the
+  trace's own arrival rate.
+
+Each worker has one dispatcher task that hands the next trace request to one of
+its idle connections and sleeps until the request is due, so the schedule costs
+one timer per worker rather than one per connection or request.
+
+With `general.warmup > 0` the replay starts with warmup, and trace requests that
+finish during it warm the cache without being recorded. With `warmup = "0s"`
+the replay starts at the beginning of recording and every request is recorded.
+The run ends when every trace request has finished, or after warmup +
+`duration`, whichever is first.
+
+### What is not modelled
+
+- The engine's own GPU prefix cache. Every request does the lookup, so a
+  prefix that vLLM would find in its own cache is looked up and loaded from the
+  server here.
+- Retries, timeouts and failure handling of the engine. A trace request whose
+  connection fails is abandoned and counted in `requests_failed`.
+- Multiple endpoints and cluster mode: every key of a request must be on the
+  server its connection reaches.
+
 ## Prefill
 
 Prefill populates the cache with every key in the keyspace before the benchmark begins. This is useful for read-only workloads, hit-rate measurements, or any test where you need the cache to be warm from the start.

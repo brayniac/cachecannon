@@ -1,0 +1,49 @@
+# KV-cache prefix replay: replay a kvtrace request trace against a RESP server
+# used as a KV-cache prefix store, and report prompt tokens served from the
+# cache. See docs/guide.md "KV-Cache Prefix Replay" and docs/reference.md
+# "KV-Cache Replay Settings".
+
+[general]
+# An upper bound: the run ends when every trace request has finished.
+duration = "3600s"
+# Trace requests that finish during warmup warm the cache and are not
+# recorded. 0 records the whole trace.
+warmup = "0s"
+threads = 4
+
+[target]
+endpoints = ["127.0.0.1:6379"]
+protocol = "resp"
+
+[connection]
+# Each connection replays one trace request at a time, so this bounds the
+# trace requests in flight. Open loop records how late requests start when
+# none is free (kv_replay.schedule_lag).
+connections = 64
+# GETs or SETs in flight per connection within one trace request.
+pipeline_depth = 32
+# Applies to the oldest operation in flight on a connection; raise it for
+# large objects.
+request_timeout = "5s"
+
+[workload.kv_replay]
+# kvtrace request trace (Parquet).
+trace = "requests.parquet"
+# Trace time divided by this; 0 = closed loop.
+speedup = 1.0
+# Object sizes from a Hugging Face config.json ...
+model_config = "config.json"
+# kv_dtype = "fp8"
+# ... or from KV bytes per token over all layers:
+# kv_bytes_per_token = 131072
+# mla = false
+tp = 1
+# "set-from-miss" or "insert-if-absent".
+write_rule = "set-from-miss"
+key_prefix = "kv:"
+key_format = "hex"
+# One CSV row per trace request.
+requests_out = "kv-requests.csv"
+
+[admin]
+format = "clean"
