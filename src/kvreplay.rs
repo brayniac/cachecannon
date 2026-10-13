@@ -391,8 +391,33 @@ struct KvJob {
     index: usize,
     /// When the trace says it starts; `None` in closed loop.
     scheduled: Option<Instant>,
-    /// Handed back once already because its connection was found closed.
+    /// Handed back once already because its connection closed after its
+    /// lookup was sent.
     retried: bool,
+    /// Times it was handed to a connection that was already closed, before
+    /// anything was sent. Bounded by the worker's connection count.
+    dead_handovers: u32,
+}
+
+impl KvJob {
+    fn new(index: usize, scheduled: Option<Instant>) -> Self {
+        Self {
+            index,
+            scheduled,
+            retried: false,
+            dead_handovers: 0,
+        }
+    }
+}
+
+/// Why a connection hands a request back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandBack {
+    /// The connection was closed when the request reached it; nothing was
+    /// sent.
+    Unsent,
+    /// The connection closed after the lookup was sent and before any reply.
+    LookupSent,
 }
 
 /// One idle connection waiting for a trace request.
@@ -427,8 +452,18 @@ struct KvDispatcher {
     /// The dispatcher's waker while no connection is waiting.
     idle: RefCell<Option<Waker>>,
     /// Requests handed back by a connection found closed before the server
-    /// answered any of their operations. Served before new ones.
-    returned: RefCell<VecDeque<KvJob>>,
+    /// answered any of their operations, each with `connect_failures` as it
+    /// was when handed back. Served before new ones.
+    returned: RefCell<VecDeque<(KvJob, u64)>>,
+    /// Set while the dispatcher needs a connection to ask; `next_job` wakes
+    /// it only then.
+    wants_slot: Cell<bool>,
+    /// Connection tasks on this worker.
+    connections: Cell<usize>,
+    /// Connections on this worker in the replay loop, connected.
+    live: Cell<usize>,
+    /// Failed connect attempts on this worker so far.
+    connect_failures: Cell<u64>,
 }
 
 impl KvDispatcher {
@@ -445,7 +480,9 @@ impl KvDispatcher {
             waker: RefCell::new(None),
         });
         self.waiting.borrow_mut().push_back(Rc::clone(&slot));
-        if let Some(w) = self.idle.borrow_mut().take() {
+        if self.wants_slot.get()
+            && let Some(w) = self.idle.borrow_mut().take()
+        {
             w.wake();
         }
         SlotWait {
@@ -455,16 +492,42 @@ impl KvDispatcher {
         slot.job.get()
     }
 
-    /// Give a request back to be run on another connection, once. Returns
-    /// false, and keeps nothing, if it was handed back before.
-    fn give_back(&self, job: KvJob) -> bool {
-        if job.retried {
-            return false;
-        }
-        self.returned.borrow_mut().push_back(KvJob {
-            retried: true,
-            ..job
-        });
+    /// Give a request back to run on the next idle connection. Returns false,
+    /// and keeps nothing, when the request has used up its hand-backs: the
+    /// caller counts it as failed.
+    ///
+    /// `Unsent` does not use the one retry: nothing reached the server, and
+    /// each such hand-back is one closed connection that then reconnects, so
+    /// a server closing every idle connection at once costs at most one
+    /// hand-back per connection. It is bounded by the worker's connection
+    /// count so a server that closes each new connection at once cannot
+    /// bounce a request forever. `LookupSent` uses the one retry.
+    fn give_back(&self, job: KvJob, why: HandBack) -> bool {
+        let job = match why {
+            HandBack::Unsent => {
+                if job.dead_handovers as usize >= self.connections.get().max(1) {
+                    return false;
+                }
+                KvJob {
+                    dead_handovers: job.dead_handovers + 1,
+                    ..job
+                }
+            }
+            HandBack::LookupSent => {
+                if job.retried {
+                    return false;
+                }
+                KvJob {
+                    retried: true,
+                    ..job
+                }
+            }
+        };
+        self.returned
+            .borrow_mut()
+            .push_back((job, self.connect_failures.get()));
+        // Always wake: the dispatcher may be sleeping until a later request
+        // is due, and this one is due already.
         if let Some(w) = self.idle.borrow_mut().take() {
             w.wake();
         }
@@ -502,8 +565,14 @@ thread_local! {
 
 /// Install this worker's dispatcher and spawn its task. Called from the
 /// worker's `on_start`, before any connection task runs.
-pub(crate) fn start_dispatcher(kv: Arc<KvReplay>, shared: Arc<SharedState>, worker_id: usize) {
+pub(crate) fn start_dispatcher(
+    kv: Arc<KvReplay>,
+    shared: Arc<SharedState>,
+    worker_id: usize,
+    connections: usize,
+) {
     let dispatch = Rc::new(KvDispatcher::default());
+    dispatch.connections.set(connections);
     DISPATCHER.with(|d| *d.borrow_mut() = Some(Rc::clone(&dispatch)));
     if let Err(e) = ringline::spawn(run_dispatcher(dispatch, kv, shared)) {
         // Without it no connection on this worker gets a trace request, and
@@ -533,16 +602,46 @@ fn dispatcher() -> Option<Rc<KvDispatcher>> {
     DISPATCHER.with(|d| d.borrow().clone())
 }
 
+/// Note a failed connect attempt on this worker, or a connection closed before
+/// it ran a request. A request handed back while none of the worker's
+/// connections is connected is failed once a reconnect attempt has failed,
+/// rather than waiting for one that may never succeed.
+pub(crate) fn note_connect_failed() {
+    if let Some(d) = dispatcher() {
+        d.connect_failures.set(d.connect_failures.get() + 1);
+    }
+}
+
+/// Marks a connection as in the replay loop for as long as it lives.
+struct Live(Rc<KvDispatcher>);
+
+impl Live {
+    fn new(d: &Rc<KvDispatcher>) -> Self {
+        d.live.set(d.live.get() + 1);
+        Self(Rc::clone(d))
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.0.live.set(self.0.live.get() - 1);
+    }
+}
+
 /// Hand trace requests to this worker's idle connections until the run
 /// stops.
 ///
 /// A request is claimed only once a connection is waiting, so a worker whose
 /// connections are all busy leaves the next request to another worker. In
-/// open loop the dispatcher then sleeps until the request is due, in steps of
-/// at most `IDLE_SLEEP_MAX` so a stop is noticed; a request claimed after it
-/// was due starts at once, and `kv_schedule_lag` records how late.
+/// open loop a claimed request is held until it is due while the dispatcher
+/// sleeps, in steps of at most `IDLE_SLEEP_MAX` so a stop is noticed; a
+/// request claimed after it was due starts at once, and `kv_schedule_lag`
+/// records how late. A handed-back request is due already and goes to the
+/// next idle connection before the held one; a hand-back ends the sleep.
 async fn run_dispatcher(dispatch: Rc<KvDispatcher>, kv: Arc<KvReplay>, shared: Arc<SharedState>) {
     let mut exhausted = false;
+    // Claimed and not yet handed to a connection.
+    let mut pending: Option<KvJob> = None;
     loop {
         if shared.phase().should_stop() {
             dispatch.close();
@@ -555,61 +654,71 @@ async fn run_dispatcher(dispatch: Rc<KvDispatcher>, kv: Arc<KvReplay>, shared: A
             ringline::sleep(START_POLL).await;
             continue;
         };
-        // A handed-back request was already due; it goes first.
-        if !dispatch.waiting.borrow().is_empty()
-            && let Some(job) = dispatch.returned.borrow_mut().pop_front()
-        {
+        let has_slot = !dispatch.waiting.borrow().is_empty();
+
+        // Handed-back requests first: they were due before anything claimed
+        // since.
+        if has_slot && let Some((job, _)) = dispatch.returned.borrow_mut().pop_front() {
             let slot = dispatch.waiting.borrow_mut().pop_front().unwrap();
             slot.complete(Some(job));
             continue;
         }
-        if exhausted {
-            // Idle connections stay parked, untimed, until the run stops:
-            // woken now, each would poll on its own timer while others finish
-            // the last requests. This loop still serves handed-back requests.
-            ringline::sleep(IDLE_SLEEP_MAX).await;
-            continue;
-        }
-        let Some(slot) = dispatch.waiting.borrow_mut().pop_front() else {
-            // No idle connection. Wait for one to ask, with `IDLE_SLEEP_MAX`
-            // as a backstop so a stop is noticed while all are busy.
-            let mut backstop = std::pin::pin!(ringline::sleep(IDLE_SLEEP_MAX));
-            std::future::poll_fn(|cx| {
-                if !dispatch.waiting.borrow().is_empty() {
-                    return Poll::Ready(());
-                }
-                *dispatch.idle.borrow_mut() = Some(cx.waker().clone());
-                backstop.as_mut().poll(cx)
-            })
-            .await;
-            dispatch.idle.borrow_mut().take();
-            continue;
-        };
-        let Some(index) = kv.claim() else {
-            dispatch.waiting.borrow_mut().push_front(slot);
-            exhausted = true;
-            continue;
-        };
-        let scheduled = kv.scheduled_at(start, index);
-        if let Some(due) = scheduled {
-            loop {
-                if shared.phase().should_stop() {
-                    slot.complete(None);
-                    dispatch.close();
-                    return;
-                }
-                let now = Instant::now();
-                if now >= due {
-                    break;
-                }
-                ringline::sleep((due - now).min(IDLE_SLEEP_MAX)).await;
+        // No connection on this worker is connected and a reconnect attempt
+        // failed since the request came back: fail it rather than wait for a
+        // connection that may never come.
+        if dispatch.live.get() == 0 {
+            let failures = dispatch.connect_failures.get();
+            let mut returned = dispatch.returned.borrow_mut();
+            while returned.front().is_some_and(|&(_, at)| failures > at) {
+                returned.pop_front();
+                kv.mark_finished();
+                metrics::KV_REQUESTS_FAILED.increment();
             }
         }
-        slot.complete(Some(KvJob {
-            index,
-            scheduled,
-            retried: false,
-        }));
+        if has_slot && pending.is_none() && !exhausted {
+            match kv.claim() {
+                Some(index) => pending = Some(KvJob::new(index, kv.scheduled_at(start, index))),
+                None => exhausted = true,
+            }
+            continue;
+        }
+        let now = Instant::now();
+        let due_in = pending.map(|j| {
+            j.scheduled
+                .map_or(Duration::ZERO, |d| d.saturating_duration_since(now))
+        });
+        if has_slot && due_in == Some(Duration::ZERO) {
+            let slot = dispatch.waiting.borrow_mut().pop_front().unwrap();
+            slot.complete(pending.take());
+            continue;
+        }
+
+        // Wait. A connection asking wakes us only when one is needed now; a
+        // hand-back always does. Once the trace is exhausted, idle connections
+        // stay parked, untimed, until the run stops.
+        let needs_slot = !has_slot
+            && (due_in == Some(Duration::ZERO)
+                || !dispatch.returned.borrow().is_empty()
+                || (pending.is_none() && !exhausted));
+        dispatch.wants_slot.set(needs_slot);
+        let nap = match due_in {
+            Some(d) if !d.is_zero() => d.min(IDLE_SLEEP_MAX),
+            _ => IDLE_SLEEP_MAX,
+        };
+        let mut timer = std::pin::pin!(ringline::sleep(nap));
+        std::future::poll_fn(|cx| {
+            if !dispatch.returned.borrow().is_empty() && !dispatch.waiting.borrow().is_empty() {
+                return Poll::Ready(());
+            }
+            if needs_slot && !dispatch.waiting.borrow().is_empty() {
+                return Poll::Ready(());
+            }
+            *dispatch.idle.borrow_mut() = Some(cx.waker().clone());
+            timer.as_mut().poll(cx)
+        })
+        .await;
+        dispatch.wants_slot.set(false);
+        dispatch.idle.borrow_mut().take();
     }
 }
 
@@ -654,6 +763,7 @@ pub(crate) async fn drive(
         // `on_start` installs it before spawning connections.
         unreachable!("kv replay connection without a dispatcher");
     };
+    let _live = Live::new(&dispatch);
     let mut inflight = InFlight::new(ctx.request_timeout, ctx.pipeline_depth);
     let mut scratch = Scratch {
         objects: Vec::new(),
@@ -662,11 +772,18 @@ pub(crate) async fn drive(
         exists: Vec::new(),
         sets: Vec::new(),
     };
+    let mut ran_any = false;
     loop {
         if ctx.shared.phase().should_stop() {
             return Ok(());
         }
         if !client.is_alive() {
+            // Closed before it ran anything: a reconnect that did not take
+            // (a server closing each new connection at once) counts like a
+            // failed connect for failing handed-back requests.
+            if !ran_any {
+                note_connect_failed();
+            }
             return Err(DisconnectReason::Eof);
         }
         let Some(job) = dispatch.next_job().await else {
@@ -680,15 +797,16 @@ pub(crate) async fn drive(
             continue;
         };
         // The connection can close while it waits for a request (a server
-        // closes idle connections). The request has not started: hand it
-        // back and reconnect.
+        // closes idle connections). Nothing was sent: hand the request back
+        // and reconnect, so this connection is not offered it again.
         if !client.is_alive() {
-            if !dispatch.give_back(job) {
+            if !dispatch.give_back(job, HandBack::Unsent) {
                 ctx.kv.mark_finished();
                 metrics::KV_REQUESTS_FAILED.increment();
             }
             return Err(DisconnectReason::Eof);
         }
+        ran_any = true;
         let req = &ctx.kv.requests[job.index];
         let started = Instant::now();
         let lag_ns = job
@@ -696,7 +814,7 @@ pub(crate) async fn drive(
             .map(|due| started.saturating_duration_since(due).as_nanos() as u64);
         let result = run_request(client, conn, ctx, rng, &mut inflight, &mut scratch, req).await;
         if let Err(Failure::Closed) = result
-            && dispatch.give_back(job)
+            && dispatch.give_back(job, HandBack::LookupSent)
         {
             return Err(DisconnectReason::Eof);
         }

@@ -46,6 +46,16 @@ pub struct Hooks {
     /// After replying to this many SETs in total, wait this long and close
     /// the connection, as a server closes an idle connection.
     pub close_after_sets: Option<(usize, Duration)>,
+    /// After replying to this many SETs in total, wait this long and shut
+    /// down every connection open then, as an idle timeout closing all idle
+    /// connections at once.
+    pub close_all_after_sets: Option<(usize, Duration)>,
+    /// With `close_all_after_sets`: stop accepting connections when they are
+    /// shut, so every reconnect is refused.
+    pub refuse_after_close_all: bool,
+    /// With `close_all_after_sets`: from then on accept connections and shut
+    /// each down at once.
+    pub drop_new_after_close_all: bool,
 }
 
 #[derive(Default)]
@@ -54,6 +64,12 @@ struct State {
     log: Vec<Op>,
     sets: usize,
     hooks: Hooks,
+    /// Every connection accepted, for `close_all_after_sets`.
+    streams: Vec<TcpStream>,
+    /// Set by `refuse_after_close_all`: the listener closes.
+    refusing: bool,
+    /// Set by `drop_new_after_close_all`.
+    dropping_new: bool,
 }
 
 /// A RESP2 server holding every SET in memory. Answers PING, EXISTS (one
@@ -98,10 +114,31 @@ impl Server {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let state = Arc::clone(&self.state);
+        // Non-blocking, so the listener can be closed to refuse reconnects.
+        listener.set_nonblocking(true).unwrap();
         std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let state = Arc::clone(&state);
-                std::thread::spawn(move || serve(stream, state));
+            loop {
+                if state.lock().unwrap().refusing {
+                    return;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        if state.lock().unwrap().dropping_new {
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                            continue;
+                        }
+                        {
+                            let mut st = state.lock().unwrap();
+                            if st.hooks.close_all_after_sets.is_some() {
+                                st.streams.push(stream.try_clone().unwrap());
+                            }
+                        }
+                        let state = Arc::clone(&state);
+                        std::thread::spawn(move || serve(stream, state));
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(1)),
+                }
             }
         });
         addr
@@ -174,6 +211,30 @@ fn serve(stream: TcpStream, state: Arc<Mutex<State>>) {
                     if st.hooks.close_after_sets.is_some_and(|(n, _)| n == st.sets) {
                         close = st.hooks.close_after_sets.take().map(|(_, d)| d);
                     }
+                    if st
+                        .hooks
+                        .close_all_after_sets
+                        .is_some_and(|(n, _)| n == st.sets)
+                    {
+                        let (_, after) = st.hooks.close_all_after_sets.take().unwrap();
+                        let refuse = st.hooks.refuse_after_close_all;
+                        let drop_new = st.hooks.drop_new_after_close_all;
+                        let all: Vec<TcpStream> =
+                            st.streams.iter().map(|s| s.try_clone().unwrap()).collect();
+                        let state = Arc::clone(&state);
+                        std::thread::spawn(move || {
+                            std::thread::sleep(after);
+                            if refuse {
+                                state.lock().unwrap().refusing = true;
+                            }
+                            if drop_new {
+                                state.lock().unwrap().dropping_new = true;
+                            }
+                            for s in all {
+                                let _ = s.shutdown(std::net::Shutdown::Both);
+                            }
+                        });
+                    }
                     if let Some((after, _)) = st.hooks.delete_after_sets
                         && st.sets == after
                     {
@@ -196,6 +257,9 @@ fn serve(stream: TcpStream, state: Arc<Mutex<State>>) {
         }
         if let Some(after) = close {
             std::thread::sleep(after);
+            // Shut down rather than only drop: another handle to the socket
+            // (kept for `close_all_after_sets`) would keep it open.
+            let _ = writer.shutdown(std::net::Shutdown::Both);
             return;
         }
     }

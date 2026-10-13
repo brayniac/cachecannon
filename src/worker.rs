@@ -751,6 +751,7 @@ impl AsyncEventHandler for BenchHandler {
                     kv,
                     Arc::clone(&worker_state.task_state.shared),
                     worker_id,
+                    my_connections,
                 );
             }
             match protocol {
@@ -1167,6 +1168,9 @@ async fn resp_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: usize
         {
             Ok(conn) => conn,
             Err(_) => {
+                if state.task_state.kv_replay.is_some() {
+                    crate::kvreplay::note_connect_failed();
+                }
                 ringline::sleep(Duration::from_millis(100)).await;
                 continue;
             }

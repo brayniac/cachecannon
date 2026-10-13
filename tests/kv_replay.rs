@@ -472,3 +472,147 @@ fn kv_replay_closed_idle_connection_reconnects_without_losing_a_request() {
         },
     );
 }
+
+/// KV replay when the server closes every idle connection at once, as an idle
+/// timeout does: the request handed to the first closed connection goes back
+/// without using up its retry, may land on the next closed one, and runs once
+/// a connection has reconnected. No request is lost.
+#[test]
+fn kv_replay_closing_every_idle_connection_loses_no_request() {
+    common::kv::isolated(
+        "kv_replay_closing_every_idle_connection_loses_no_request",
+        || {
+            let ct = CHUNK_TOKENS;
+            // All three connections are shut 100 ms after request 1's SET;
+            // request 2 is due at 300 ms.
+            let server = Server::with_hooks(Hooks {
+                close_all_after_sets: Some((1, Duration::from_millis(100))),
+                ..Default::default()
+            });
+            let rows = replay_on(
+                &server,
+                &[request(1, 0, &[1], ct + 3), request(2, 300, &[2], ct + 3)],
+                "speedup = 1",
+                3,
+            );
+            assert_eq!(
+                rows.iter().map(|r| r.req_id).collect::<Vec<_>>(),
+                [1, 2],
+                "{rows:?}"
+            );
+            assert_eq!(metrics::KV_REQUESTS_FAILED.value(), 0);
+        },
+    );
+}
+
+/// KV replay: a request handed back while the dispatcher waits for a later
+/// request's due time runs at once, before that later request.
+#[test]
+fn kv_replay_handed_back_request_runs_before_later_ones() {
+    common::kv::isolated(
+        "kv_replay_handed_back_request_runs_before_later_ones",
+        || {
+            let ct = CHUNK_TOKENS;
+            // The connection that ran request 1 is closed 100 ms after its
+            // second SET. Requests 2 and 3 are due at 300 and 600 ms, request 4
+            // at 3,000 ms; request 3 reaches the closed connection.
+            let server = Server::with_hooks(Hooks {
+                close_after_sets: Some((2, Duration::from_millis(100))),
+                ..Default::default()
+            });
+            let rows = replay_on(
+                &server,
+                &[
+                    request(1, 0, &[1, 2], 2 * ct + 3),
+                    request(2, 300, &[3], ct + 3),
+                    request(3, 600, &[4], ct + 3),
+                    request(4, 3000, &[5], ct + 3),
+                ],
+                "speedup = 1",
+                2,
+            );
+            assert_eq!(
+                rows.iter().map(|r| r.req_id).collect::<Vec<_>>(),
+                [1, 2, 3, 4],
+                "{rows:?}"
+            );
+            for r in &rows {
+                let lag = r.lag_ns.unwrap();
+                assert!(
+                    lag < 100_000_000,
+                    "request {} started {lag} ns late",
+                    r.req_id
+                );
+            }
+            assert_eq!(metrics::KV_REQUESTS_FAILED.value(), 0);
+        },
+    );
+}
+
+/// KV replay when no connection can reconnect: a request handed back while
+/// none of the worker's connections is connected is counted as failed once a
+/// reconnect attempt fails, and the run ends instead of waiting for
+/// `duration`.
+#[test]
+fn kv_replay_handed_back_request_fails_when_nothing_reconnects() {
+    common::kv::isolated(
+        "kv_replay_handed_back_request_fails_when_nothing_reconnects",
+        || {
+            let ct = CHUNK_TOKENS;
+            let server = Server::with_hooks(Hooks {
+                close_all_after_sets: Some((1, Duration::from_millis(100))),
+                refuse_after_close_all: true,
+                ..Default::default()
+            });
+            let started = std::time::Instant::now();
+            let rows = replay_on(
+                &server,
+                &[request(1, 0, &[1], ct + 3), request(2, 300, &[2], ct + 3)],
+                "speedup = 1",
+                1,
+            );
+            let took = started.elapsed();
+            assert_eq!(
+                rows.iter().map(|r| r.req_id).collect::<Vec<_>>(),
+                [1],
+                "{rows:?}"
+            );
+            assert_eq!(metrics::KV_REQUESTS_FAILED.value(), 1);
+            // `duration` is 20 s; the value pool and setup take about 3 s.
+            assert!(took < Duration::from_secs(10), "the run took {took:?}");
+        },
+    );
+}
+
+/// KV replay when every reconnect is accepted and closed at once: each
+/// reconnect counts as a failed one, so a handed-back request is counted as
+/// failed and the run ends instead of waiting for `duration`.
+#[test]
+fn kv_replay_handed_back_request_fails_when_reconnects_close_at_once() {
+    common::kv::isolated(
+        "kv_replay_handed_back_request_fails_when_reconnects_close_at_once",
+        || {
+            let ct = CHUNK_TOKENS;
+            let server = Server::with_hooks(Hooks {
+                close_all_after_sets: Some((1, Duration::from_millis(100))),
+                drop_new_after_close_all: true,
+                ..Default::default()
+            });
+            let started = std::time::Instant::now();
+            let rows = replay_on(
+                &server,
+                &[request(1, 0, &[1], ct + 3), request(2, 300, &[2], ct + 3)],
+                "speedup = 1",
+                1,
+            );
+            let took = started.elapsed();
+            assert_eq!(
+                rows.iter().map(|r| r.req_id).collect::<Vec<_>>(),
+                [1],
+                "{rows:?}"
+            );
+            assert_eq!(metrics::KV_REQUESTS_FAILED.value(), 1);
+            assert!(took < Duration::from_secs(10), "the run took {took:?}");
+        },
+    );
+}

@@ -406,10 +406,20 @@ several connections or threads.
   prefix that vLLM would find in its own cache is looked up and loaded from the
   server here.
 - Retries, timeouts and failure handling of the engine. A trace request whose
-  connection fails is abandoned and counted in `requests_failed`, with one
-  exception: a request whose connection is found closed before the server
-  answered any of its operations (a server closing idle connections) runs
-  again, once, on the next idle connection while this one reconnects.
+  connection fails is abandoned and counted in `requests_failed`, except when
+  the connection closed before the server answered any of the request's
+  operations, as when a server closes idle connections. Then the request goes
+  back to its worker's dispatcher and runs on the next idle connection, ahead
+  of any request claimed after it, while the closed connection reconnects:
+  - found closed when the request reached it, with nothing sent: at most once
+    per connection on the worker, so an idle timeout that closes every
+    connection at once costs no request;
+  - closed after the lookup was sent and before any reply: once per request.
+
+  A handed-back request is counted as failed when it has used those up, or
+  when none of its worker's connections is connected and a reconnect attempt
+  has failed (refused, or a new connection closed before it ran anything).
+  Without that it could keep the run going until `duration`.
 - Multiple endpoints and cluster mode: every key of a request must be on the
   server its connection reaches.
 
