@@ -212,6 +212,10 @@ pub struct KvReplayResults {
     pub lookups: u64,
     pub loads: u64,
     pub stores: u64,
+    /// Requests with GETs that ended with cached tokens: the sample count of
+    /// `load_time_per_1k_tokens`, which is below `loads` when a GET at the
+    /// first chunk returned nil.
+    pub loads_with_cached_tokens: u64,
     pub lookup_time: LatencyStats,
     pub load_time: LatencyStats,
     pub store_time: LatencyStats,

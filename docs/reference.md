@@ -325,7 +325,7 @@ The JSON `result` line gains a `kv_replay` object:
 | `lookup` | Per request: first EXISTS sent to last EXISTS reply |
 | `load` | Per request with GETs: first GET sent to last GET reply |
 | `store` | Per request with SETs: first SET sent to last SET reply |
-| `load_per_1k_cached_tokens` | Per request with GETs and cached tokens: `load × 1000 / cached_tokens` |
+| `load_per_1k_cached_tokens` | Per request with GETs and cached tokens: `load × 1000 / cached_tokens`. Its `count` can be below `load`'s: a request whose first GET returned nil has a load time and no cached tokens |
 | `schedule_lag` | Open loop only, per request: start minus the time the trace scheduled it |
 
 The five distributions are objects with `count` (requests sampled) and
@@ -698,6 +698,7 @@ Each snapshot contains the full set of metrics. The file uses the metriken expos
 | `kv_get_nil` | KV replay: GETs that returned nil after their EXISTS returned 1 |
 | `kv_exists_count` | KV replay: EXISTS operations |
 | `kv_lookups`, `kv_loads`, `kv_stores` | KV replay: requests with a lookup, GETs, SETs (sample counts of the time histograms) |
+| `kv_loads_with_cached_tokens` | KV replay: requests with GETs that ended with cached tokens (sample count of `kv_load_time_per_1k_tokens`) |
 
 **Gauges** (point-in-time values):
 

@@ -686,7 +686,10 @@ fn record_outcome(req: &Request, o: &Outcome) {
     if o.gets > 0 {
         metrics::KV_LOADS.increment();
         let _ = metrics::KV_LOAD_TIME.increment(o.load_ns);
+        // Only a load that left cached tokens has a time per token. A nil GET
+        // at the first chunk loads nothing.
         if let Some(per_1k) = o.load_ns.saturating_mul(1000).checked_div(o.cached_tokens) {
+            metrics::KV_LOADS_WITH_CACHED.increment();
             let _ = metrics::KV_LOAD_TIME_PER_1K_TOKENS.increment(per_1k);
         }
     }
@@ -961,7 +964,7 @@ fn recv_failed(e: ringline_redis::Error) -> Failure {
 /// subtracted from the final values as the runner does for every other
 /// metric.
 pub struct KvBaseline {
-    counters: [u64; 13],
+    counters: [u64; 14],
     lookup: Option<Histogram>,
     load: Option<Histogram>,
     store: Option<Histogram>,
@@ -969,7 +972,7 @@ pub struct KvBaseline {
     lag: Option<Histogram>,
 }
 
-fn kv_counters() -> [u64; 13] {
+fn kv_counters() -> [u64; 14] {
     [
         metrics::KV_REQUESTS.value(),
         metrics::KV_REQUESTS_FAILED.value(),
@@ -984,6 +987,7 @@ fn kv_counters() -> [u64; 13] {
         metrics::KV_LOOKUPS.value(),
         metrics::KV_LOADS.value(),
         metrics::KV_STORES.value(),
+        metrics::KV_LOADS_WITH_CACHED.value(),
     ]
 }
 
@@ -1026,6 +1030,7 @@ impl KvReplay {
             lookups: d(10),
             loads: d(11),
             stores: d(12),
+            loads_with_cached_tokens: d(13),
             lookup_time: stats(&metrics::KV_LOOKUP_TIME, &base.lookup),
             load_time: stats(&metrics::KV_LOAD_TIME, &base.load),
             store_time: stats(&metrics::KV_STORE_TIME, &base.store),

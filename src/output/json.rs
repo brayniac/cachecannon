@@ -179,7 +179,7 @@ impl KvReplayOutput {
             load: LatencyOutput::from_stats(kv.loads, &kv.load_time),
             store: LatencyOutput::from_stats(kv.stores, &kv.store_time),
             load_per_1k_cached_tokens: LatencyOutput::from_stats(
-                kv.loads,
+                kv.loads_with_cached_tokens,
                 &kv.load_time_per_1k_tokens,
             ),
             schedule_lag: (!kv.closed_loop)
@@ -455,5 +455,53 @@ impl OutputFormatter for JsonFormatter {
             Ok(json) => println!("{}", json),
             Err(e) => tracing::warn!("failed to serialize JSON output: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each distribution's `count` is the number of samples it holds. A load
+    /// whose first GET returned nil has a load time but no time per cached
+    /// token.
+    #[test]
+    fn kv_distribution_counts_are_their_sample_counts() {
+        let kv = KvReplayResults {
+            closed_loop: true,
+            speedup: 0.0,
+            write_rule: "set-from-miss",
+            trace_requests: 3,
+            requests: 3,
+            requests_failed: 0,
+            input_tokens: 0,
+            cached_tokens: 0,
+            new_tokens: 0,
+            full_hits: 0,
+            chunk0_misses: 0,
+            no_full_chunk: 0,
+            get_nil: 1,
+            exists: 0,
+            lookups: 3,
+            loads: 2,
+            stores: 1,
+            loads_with_cached_tokens: 1,
+            lookup_time: LatencyStats::default(),
+            load_time: LatencyStats::default(),
+            store_time: LatencyStats::default(),
+            load_time_per_1k_tokens: LatencyStats::default(),
+            schedule_lag: LatencyStats::default(),
+        };
+        let out = KvReplayOutput::new(&kv);
+        assert_eq!(
+            (
+                out.lookup.count,
+                out.load.count,
+                out.store.count,
+                out.load_per_1k_cached_tokens.count
+            ),
+            (3, 2, 1, 1)
+        );
+        assert!(out.schedule_lag.is_none(), "closed loop has no lag");
     }
 }

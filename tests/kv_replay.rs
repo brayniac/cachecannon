@@ -402,3 +402,34 @@ fn kv_replay_zero_input_tokens_with_chunks() {
         assert_eq!(metrics::KV_FULL_HITS.value(), 0);
     });
 }
+
+/// KV replay when the first chunk's object is evicted between its EXISTS and
+/// its GET: the request has a load but no cached tokens, so it adds no sample
+/// to the load time per 1,000 cached tokens.
+#[test]
+fn kv_replay_get_nil_at_the_first_chunk_has_no_per_token_load_time() {
+    common::kv::isolated(
+        "kv_replay_get_nil_at_the_first_chunk_has_no_per_token_load_time",
+        || {
+            let ct = CHUNK_TOKENS;
+            let server = Server::with_hooks(Hooks {
+                evict_after_exists: Some(key(1, 0)),
+                ..Default::default()
+            });
+            let a = request(1, 0, &[1, 2], 2 * ct + 3);
+            let again = request(2, 1, &[1, 2], 2 * ct + 3);
+            let rows = replay(&server, &[a, again], "");
+            let r = &rows[1];
+            assert_eq!((r.lookup_hit_chunks, r.hit_chunks), (2, 0), "{r:?}");
+            assert_eq!((r.gets, r.get_nil, r.cached_tokens), (2, 1, 0), "{r:?}");
+            assert_eq!(metrics::KV_LOADS.value(), 1);
+            assert_eq!(metrics::KV_LOADS_WITH_CACHED.value(), 0);
+            assert!(
+                metrics::KV_LOAD_TIME_PER_1K_TOKENS
+                    .load()
+                    .is_none_or(|h| h.into_iter().all(|b| b.count() == 0)),
+                "a per-token load time was recorded"
+            );
+        },
+    );
+}

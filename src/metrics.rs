@@ -242,6 +242,7 @@ pub mod kv {
     pub const LOOKUPS: usize = 10;
     pub const LOADS: usize = 11;
     pub const STORES: usize = 12;
+    pub const LOADS_WITH_CACHED: usize = 13;
 }
 
 #[metric(
@@ -318,6 +319,12 @@ pub static KV_LOADS: Counter = Counter::new(&KV, kv::LOADS);
     description = "KV replay: requests that issued SETs (samples in kv_store_time)"
 )]
 pub static KV_STORES: Counter = Counter::new(&KV, kv::STORES);
+
+#[metric(
+    name = "kv_loads_with_cached_tokens",
+    description = "KV replay: requests that issued GETs and ended with cached tokens (samples in kv_load_time_per_1k_tokens)"
+)]
+pub static KV_LOADS_WITH_CACHED: Counter = Counter::new(&KV, kv::LOADS_WITH_CACHED);
 
 #[metric(
     name = "kv_lookup_time",
