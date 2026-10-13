@@ -97,6 +97,14 @@ impl KvReplay {
         let mut requests = reader
             .collect::<Result<Vec<Request>, _>>()
             .map_err(|e| format!("kv_replay trace {}: {e}", cfg.trace.display()))?;
+        // With nothing to replay the run would end at once and report
+        // nothing recorded, which reads as a timing problem.
+        if requests.is_empty() {
+            return Err(format!(
+                "kv_replay trace {}: no requests",
+                cfg.trace.display()
+            ));
+        }
         // Requests arrive in timestamp order; a stable sort keeps the file
         // order among equal timestamps.
         requests.sort_by_key(|r| r.timestamp);
@@ -1060,6 +1068,23 @@ mod tests {
             key_format: KvKeyFormat::Hex,
             requests_out: None,
         }
+    }
+
+    #[test]
+    fn an_empty_trace_is_rejected() {
+        let path = std::env::temp_dir().join(format!(
+            "cachecannon-kv-empty-{}.parquet",
+            std::process::id()
+        ));
+        kvtrace::RequestWriter::create(&path, 16, 1)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let mut c = cfg(Some(4));
+        c.trace = path.clone();
+        let err = KvReplay::load(&c).err().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(err.ends_with("no requests"), "{err}");
     }
 
     #[test]

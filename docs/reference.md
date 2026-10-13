@@ -263,7 +263,8 @@ model_config = "config.json"
 # mla = false
 
 # Tensor-parallel degree. A dense model stores one object per rank per chunk,
-# each 1/min(tp, kv_heads) of the chunk. Default 1.
+# each 1/min(tp, kv_heads) of the chunk when model_config gives the KV head
+# count, 1/tp otherwise. Default 1.
 tp = 1
 
 # Which objects a trace request SETs after its lookup:
@@ -283,8 +284,8 @@ key_format = "hex"
 ```
 
 The object id is kvtrace's `chunk << 16 | slot << 12 | rank`, with slot 0.
-The SET value of an object is that many bytes of the shared value pool; an
-object larger than the pool (1 GiB) is rejected at startup.
+A SET's value is the object's size in bytes, taken from the shared value pool;
+an object larger than the pool (1 GiB) is rejected at startup.
 
 Related settings keep their meaning: `connection.connections` bounds the trace
 requests in flight (one per connection), `connection.pipeline_depth` bounds the
@@ -296,8 +297,9 @@ during `general.warmup` are not recorded.
 Rejected at config load: protocols other than `resp` and `resp3`, more than one
 endpoint, `cluster = true`, `rate_limit`, `[workload.saturation_search]`,
 `prefill`, `backfill_on_miss`, `read_values` and `[workload.append]`. Rejected
-when the run starts: a model with recurrent state (a hybrid linear-attention
-model), and a `tp` the model's head counts or per-token size do not divide.
+when the run starts: an empty trace, a model with recurrent state (a hybrid
+linear-attention model), and a `tp` the model's head counts or per-token size
+do not divide.
 
 #### KV replay results
 
