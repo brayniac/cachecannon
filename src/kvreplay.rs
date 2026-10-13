@@ -633,13 +633,15 @@ pub(crate) async fn drive(
         let lag_ns = job
             .scheduled
             .map(|due| started.saturating_duration_since(due).as_nanos() as u64);
-        if let Some(lag) = lag_ns {
-            let _ = metrics::KV_SCHEDULE_LAG.increment(lag);
-        }
         let result = run_request(client, conn, ctx, rng, &mut inflight, &mut scratch, req).await;
         ctx.kv.mark_finished();
         match result {
             Ok(outcome) => {
+                // Recorded with the rest of the request's samples, when it
+                // finishes, so all of them fall in the same phase.
+                if let Some(lag) = lag_ns {
+                    let _ = metrics::KV_SCHEDULE_LAG.increment(lag);
+                }
                 record_outcome(req, &outcome);
                 let recorded = ctx.shared.phase() == Phase::Running;
                 ctx.kv.write_row(req, lag_ns, &outcome, recorded);
