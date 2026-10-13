@@ -43,6 +43,9 @@ pub struct Hooks {
     /// Hold the reply to the first SET of this key this long. Other
     /// connections are served meanwhile.
     pub delay_set: Option<(Vec<u8>, Duration)>,
+    /// After replying to this many SETs in total, wait this long and close
+    /// the connection, as a server closes an idle connection.
+    pub close_after_sets: Option<(usize, Duration)>,
 }
 
 #[derive(Default)]
@@ -135,6 +138,7 @@ fn serve(stream: TcpStream, state: Arc<Mutex<State>>) {
         let cmd = String::from_utf8_lossy(&args[0]).to_ascii_uppercase();
         let key = args.get(1).cloned().unwrap_or_default();
         let mut delay = None;
+        let mut close = None;
         let reply: Vec<u8> = {
             let mut st = state.lock().unwrap();
             st.log.push(Op {
@@ -167,6 +171,9 @@ fn serve(stream: TcpStream, state: Arc<Mutex<State>>) {
                     }
                     st.store.insert(key, args[2].clone());
                     st.sets += 1;
+                    if st.hooks.close_after_sets.is_some_and(|(n, _)| n == st.sets) {
+                        close = st.hooks.close_after_sets.take().map(|(_, d)| d);
+                    }
                     if let Some((after, _)) = st.hooks.delete_after_sets
                         && st.sets == after
                     {
@@ -185,6 +192,10 @@ fn serve(stream: TcpStream, state: Arc<Mutex<State>>) {
             std::thread::sleep(d);
         }
         if writer.write_all(&reply).is_err() {
+            return;
+        }
+        if let Some(after) = close {
+            std::thread::sleep(after);
             return;
         }
     }

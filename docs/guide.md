@@ -363,7 +363,10 @@ The run ends when every trace request has finished, or after warmup +
   prefix that vLLM would find in its own cache is looked up and loaded from the
   server here.
 - Retries, timeouts and failure handling of the engine. A trace request whose
-  connection fails is abandoned and counted in `requests_failed`.
+  connection fails is abandoned and counted in `requests_failed`, with one
+  exception: a request whose connection is found closed before the server
+  answered any of its operations (a server closing idle connections) runs
+  again, once, on the next idle connection while this one reconnects.
 - Multiple endpoints and cluster mode: every key of a request must be on the
   server its connection reaches.
 

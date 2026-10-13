@@ -312,7 +312,7 @@ The JSON `result` line gains a `kv_replay` object:
 | `write_rule` | `"set-from-miss"` or `"insert-if-absent"` |
 | `trace_requests` | Requests in the trace |
 | `requests` | Trace requests replayed to completion during recording |
-| `requests_failed` | Trace requests abandoned on a connection error, send failure or server error to the lookup; in no token count |
+| `requests_failed` | Trace requests abandoned on a connection error, send failure or server error to the lookup; in no token count. A request whose connection is found closed before the server answered any of its operations (a server closing idle connections) is run again on another connection instead, once |
 | `input_tokens` | Prompt tokens of the replayed requests |
 | `cached_tokens` | Prompt tokens served from the cache |
 | `new_tokens` | `input_tokens - cached_tokens` |

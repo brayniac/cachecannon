@@ -433,3 +433,42 @@ fn kv_replay_get_nil_at_the_first_chunk_has_no_per_token_load_time() {
         },
     );
 }
+
+/// KV replay when the server closes a connection while it waits for its next
+/// request (as a server with an idle timeout does): the request handed to it
+/// finds it closed before anything was sent, goes back to the dispatcher, and
+/// runs after the reconnect. It is not counted as failed, and nothing is
+/// counted as a send-pool failure.
+#[test]
+fn kv_replay_closed_idle_connection_reconnects_without_losing_a_request() {
+    common::kv::isolated(
+        "kv_replay_closed_idle_connection_reconnects_without_losing_a_request",
+        || {
+            let ct = CHUNK_TOKENS;
+            let server = Server::with_hooks(Hooks {
+                close_after_sets: Some((2, Duration::from_millis(100))),
+                ..Default::default()
+            });
+            let rows = replay(
+                &server,
+                // The server closes 100 ms after request 1's last SET
+                // reply; request 2 is due at 300 ms, so the connection is
+                // idle, waiting for it, when it closes.
+                &[
+                    request(1, 0, &[1, 2], 2 * ct + 3),
+                    request(2, 300, &[3, 4], 2 * ct + 3),
+                ],
+                "speedup = 1",
+            );
+            assert_eq!(
+                rows.iter().map(|r| r.req_id).collect::<Vec<_>>(),
+                [1, 2],
+                "{rows:?}"
+            );
+            assert_eq!(rows[1].sets, 2, "{rows:?}");
+            assert_eq!(metrics::KV_REQUESTS_FAILED.value(), 0);
+            assert_eq!(metrics::REQUESTS_SEND_FAILED.value(), 0);
+            assert_eq!(server.sets(), [key(1, 0), key(2, 0), key(3, 0), key(4, 0)]);
+        },
+    );
+}

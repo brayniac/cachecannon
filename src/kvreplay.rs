@@ -377,6 +377,10 @@ enum Failure {
     /// The server answered the lookup with an error, or the lookup could not
     /// be sent; the connection is still usable.
     Request,
+    /// The connection was closed before the server answered any operation of
+    /// the request, as when the server closes an idle connection. Nothing was
+    /// written, so the request can run again on another connection.
+    Closed,
 }
 
 // ── Dispatcher ─────────────────────────────────────────────────────────────
@@ -387,6 +391,8 @@ struct KvJob {
     index: usize,
     /// When the trace says it starts; `None` in closed loop.
     scheduled: Option<Instant>,
+    /// Handed back once already because its connection was found closed.
+    retried: bool,
 }
 
 /// One idle connection waiting for a trace request.
@@ -420,11 +426,15 @@ struct KvDispatcher {
     closed: Cell<bool>,
     /// The dispatcher's waker while no connection is waiting.
     idle: RefCell<Option<Waker>>,
+    /// Requests handed back by a connection found closed before the server
+    /// answered any of their operations. Served before new ones.
+    returned: RefCell<VecDeque<KvJob>>,
 }
 
 impl KvDispatcher {
     /// Wait for the next trace request. Once the trace is exhausted this
-    /// waits until the run stops, then returns `None`.
+    /// waits until the run stops (or a request is handed back), and returns
+    /// `None` when the run stops.
     async fn next_job(&self) -> Option<KvJob> {
         if self.closed.get() {
             return None;
@@ -443,6 +453,22 @@ impl KvDispatcher {
         }
         .await;
         slot.job.get()
+    }
+
+    /// Give a request back to be run on another connection, once. Returns
+    /// false, and keeps nothing, if it was handed back before.
+    fn give_back(&self, job: KvJob) -> bool {
+        if job.retried {
+            return false;
+        }
+        self.returned.borrow_mut().push_back(KvJob {
+            retried: true,
+            ..job
+        });
+        if let Some(w) = self.idle.borrow_mut().take() {
+            w.wake();
+        }
+        true
     }
 
     /// Release every waiting connection without a job, for good.
@@ -516,6 +542,7 @@ fn dispatcher() -> Option<Rc<KvDispatcher>> {
 /// at most `IDLE_SLEEP_MAX` so a stop is noticed; a request claimed after it
 /// was due starts at once, and `kv_schedule_lag` records how late.
 async fn run_dispatcher(dispatch: Rc<KvDispatcher>, kv: Arc<KvReplay>, shared: Arc<SharedState>) {
+    let mut exhausted = false;
     loop {
         if shared.phase().should_stop() {
             dispatch.close();
@@ -528,6 +555,21 @@ async fn run_dispatcher(dispatch: Rc<KvDispatcher>, kv: Arc<KvReplay>, shared: A
             ringline::sleep(START_POLL).await;
             continue;
         };
+        // A handed-back request was already due; it goes first.
+        if !dispatch.waiting.borrow().is_empty()
+            && let Some(job) = dispatch.returned.borrow_mut().pop_front()
+        {
+            let slot = dispatch.waiting.borrow_mut().pop_front().unwrap();
+            slot.complete(Some(job));
+            continue;
+        }
+        if exhausted {
+            // Idle connections stay parked, untimed, until the run stops:
+            // woken now, each would poll on its own timer while others finish
+            // the last requests. This loop still serves handed-back requests.
+            ringline::sleep(IDLE_SLEEP_MAX).await;
+            continue;
+        }
         let Some(slot) = dispatch.waiting.borrow_mut().pop_front() else {
             // No idle connection. Wait for one to ask, with `IDLE_SLEEP_MAX`
             // as a backstop so a stop is noticed while all are busy.
@@ -544,15 +586,9 @@ async fn run_dispatcher(dispatch: Rc<KvDispatcher>, kv: Arc<KvReplay>, shared: A
             continue;
         };
         let Some(index) = kv.claim() else {
-            // The trace is exhausted. Idle connections stay parked, untimed,
-            // until the run stops: woken now, each would poll on its own timer
-            // while other connections finish the last requests.
             dispatch.waiting.borrow_mut().push_front(slot);
-            while !shared.phase().should_stop() {
-                ringline::sleep(IDLE_SLEEP_MAX).await;
-            }
-            dispatch.close();
-            return;
+            exhausted = true;
+            continue;
         };
         let scheduled = kv.scheduled_at(start, index);
         if let Some(due) = scheduled {
@@ -569,7 +605,11 @@ async fn run_dispatcher(dispatch: Rc<KvDispatcher>, kv: Arc<KvReplay>, shared: A
                 ringline::sleep((due - now).min(IDLE_SLEEP_MAX)).await;
             }
         }
-        slot.complete(Some(KvJob { index, scheduled }));
+        slot.complete(Some(KvJob {
+            index,
+            scheduled,
+            retried: false,
+        }));
     }
 }
 
@@ -639,12 +679,27 @@ pub(crate) async fn drive(
             ringline::sleep(IDLE_SLEEP_MAX).await;
             continue;
         };
+        // The connection can close while it waits for a request (a server
+        // closes idle connections). The request has not started: hand it
+        // back and reconnect.
+        if !client.is_alive() {
+            if !dispatch.give_back(job) {
+                ctx.kv.mark_finished();
+                metrics::KV_REQUESTS_FAILED.increment();
+            }
+            return Err(DisconnectReason::Eof);
+        }
         let req = &ctx.kv.requests[job.index];
         let started = Instant::now();
         let lag_ns = job
             .scheduled
             .map(|due| started.saturating_duration_since(due).as_nanos() as u64);
         let result = run_request(client, conn, ctx, rng, &mut inflight, &mut scratch, req).await;
+        if let Err(Failure::Closed) = result
+            && dispatch.give_back(job)
+        {
+            return Err(DisconnectReason::Eof);
+        }
         ctx.kv.mark_finished();
         match result {
             Ok(outcome) => {
@@ -658,6 +713,12 @@ pub(crate) async fn drive(
                 ctx.kv.write_row(req, lag_ns, &outcome, recorded);
             }
             Err(Failure::Request) => metrics::KV_REQUESTS_FAILED.increment(),
+            // Closed a second time: counted as failed rather than retried
+            // again.
+            Err(Failure::Closed) => {
+                metrics::KV_REQUESTS_FAILED.increment();
+                return Err(DisconnectReason::Eof);
+            }
             Err(Failure::Disconnect(reason)) => {
                 metrics::KV_REQUESTS_FAILED.increment();
                 return Err(reason);
@@ -755,9 +816,14 @@ async fn run_request(
     o.lookup_ns = fired_at.elapsed().as_nanos() as u64;
     let values = match replies {
         Ok(values) => values,
+        // ringline refuses a send on a closed or closing connection with
+        // NotConnected. Nothing was sent.
+        Err(ringline_redis::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotConnected => {
+            return Err(Failure::Closed);
+        }
         Err(ringline_redis::Error::Io(_)) => {
             // `execute` sends nothing when the send pool cannot take the whole
-            // pipeline.
+            // pipeline (`Other`, or `InvalidInput` when wider than the pool).
             metrics::REQUESTS_SEND_FAILED.add(n as u64);
             return Err(Failure::Request);
         }
@@ -768,9 +834,9 @@ async fn run_request(
             metrics::REQUEST_ERRORS.increment();
             return Err(Failure::Request);
         }
-        Err(ringline_redis::Error::ConnectionClosed) => {
-            return Err(Failure::Disconnect(DisconnectReason::Eof));
-        }
+        // Closed with the EXISTS sent but unanswered: the server changed
+        // nothing for this request.
+        Err(ringline_redis::Error::ConnectionClosed) => return Err(Failure::Closed),
         Err(e) => {
             // `execute` closed the connection: replies are positional, and a
             // failed parse leaves the stream at an unknown position.
