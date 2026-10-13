@@ -1,0 +1,349 @@
+//! Shared by the `kv_replay_*` tests: an in-process RESP server that stores
+//! what it is sent, a trace writer, and one closed-loop replay against the
+//! server.
+//!
+//! The runner can be started once per process and its metrics are
+//! process-global, so each test is its own test binary.
+
+// Each test binary uses part of this module.
+#![allow(dead_code)]
+
+use cachecannon::{ColorMode, Config, OutputFormat, create_formatter, run_benchmark_full};
+use kvtrace::{ObjectKind, Request, RequestWriter};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Tokens per chunk in every test trace.
+pub const CHUNK_TOKENS: u32 = 16;
+
+/// Key of chunk `chunk`'s object on `rank`, as the replay writes it with the
+/// default prefix and hex format.
+pub fn key(chunk: u64, rank: u64) -> Vec<u8> {
+    let id = kvtrace::obj_id(chunk, ObjectKind::Kv, rank).unwrap();
+    format!("kv:{id:016x}").into_bytes()
+}
+
+/// One command the server received: its name (upper case), key, and when it
+/// was read.
+#[derive(Debug, Clone)]
+pub struct Op {
+    pub cmd: String,
+    pub key: Vec<u8>,
+    pub at: Instant,
+}
+
+/// Server-side changes made at a set point, standing in for an eviction.
+#[derive(Default)]
+pub struct Hooks {
+    /// Once this many SETs have been stored, delete these keys.
+    pub delete_after_sets: Option<(usize, Vec<Vec<u8>>)>,
+    /// The first time an EXISTS for this key answers 1, delete the key, so
+    /// the GET that follows misses.
+    pub evict_after_exists: Option<Vec<u8>>,
+    /// Hold the reply to the first SET of this key this long. Other
+    /// connections are served meanwhile.
+    pub delay_set: Option<(Vec<u8>, Duration)>,
+}
+
+#[derive(Default)]
+struct State {
+    store: HashMap<Vec<u8>, Vec<u8>>,
+    log: Vec<Op>,
+    sets: usize,
+    hooks: Hooks,
+}
+
+/// A RESP2 server holding every SET in memory. Answers PING, EXISTS (one
+/// key), GET, SET and DEL.
+#[derive(Clone, Default)]
+pub struct Server {
+    state: Arc<Mutex<State>>,
+}
+
+impl Server {
+    pub fn with_hooks(hooks: Hooks) -> Self {
+        let s = Self::default();
+        s.state.lock().unwrap().hooks = hooks;
+        s
+    }
+
+    /// Every command received so far, in order.
+    pub fn log(&self) -> Vec<Op> {
+        self.state.lock().unwrap().log.clone()
+    }
+
+    /// Keys of the SETs received, in order.
+    pub fn sets(&self) -> Vec<Vec<u8>> {
+        self.ops("SET")
+    }
+
+    /// Keys of the `cmd` commands received, in order.
+    pub fn ops(&self, cmd: &str) -> Vec<Vec<u8>> {
+        self.log()
+            .into_iter()
+            .filter(|o| o.cmd == cmd)
+            .map(|o| o.key)
+            .collect()
+    }
+
+    /// Length of the value stored at `key`.
+    pub fn value_len(&self, key: &[u8]) -> Option<usize> {
+        self.state.lock().unwrap().store.get(key).map(Vec::len)
+    }
+
+    pub fn spawn(&self) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::clone(&self.state);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let state = Arc::clone(&state);
+                std::thread::spawn(move || serve(stream, state));
+            }
+        });
+        addr
+    }
+}
+
+/// Read one CRLF-terminated line, without the CRLF. `None` at EOF.
+fn read_line(reader: &mut impl BufRead) -> Option<Vec<u8>> {
+    let mut line = Vec::new();
+    if reader.read_until(b'\n', &mut line).ok()? == 0 {
+        return None;
+    }
+    line.truncate(line.len().saturating_sub(2));
+    Some(line)
+}
+
+fn serve(stream: TcpStream, state: Arc<Mutex<State>>) {
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    while let Some(header) = read_line(&mut reader) {
+        let n: usize = std::str::from_utf8(&header[1..]).unwrap().parse().unwrap();
+        let mut args = Vec::with_capacity(n);
+        for _ in 0..n {
+            let len_line = read_line(&mut reader).unwrap();
+            let len: usize = std::str::from_utf8(&len_line[1..])
+                .unwrap()
+                .parse()
+                .unwrap();
+            let mut arg = vec![0u8; len + 2];
+            reader.read_exact(&mut arg).unwrap();
+            arg.truncate(len);
+            args.push(arg);
+        }
+        let cmd = String::from_utf8_lossy(&args[0]).to_ascii_uppercase();
+        let key = args.get(1).cloned().unwrap_or_default();
+        let mut delay = None;
+        let reply: Vec<u8> = {
+            let mut st = state.lock().unwrap();
+            st.log.push(Op {
+                cmd: cmd.clone(),
+                key: key.clone(),
+                at: Instant::now(),
+            });
+            match cmd.as_str() {
+                "PING" => b"+PONG\r\n".to_vec(),
+                "EXISTS" => {
+                    let found = st.store.contains_key(&key);
+                    if found && st.hooks.evict_after_exists.as_ref() == Some(&key) {
+                        st.hooks.evict_after_exists = None;
+                        st.store.remove(&key);
+                    }
+                    format!(":{}\r\n", u8::from(found)).into_bytes()
+                }
+                "GET" => match st.store.get(&key) {
+                    Some(v) => {
+                        let mut r = format!("${}\r\n", v.len()).into_bytes();
+                        r.extend_from_slice(v);
+                        r.extend_from_slice(b"\r\n");
+                        r
+                    }
+                    None => b"$-1\r\n".to_vec(),
+                },
+                "SET" => {
+                    if st.hooks.delay_set.as_ref().is_some_and(|(k, _)| *k == key) {
+                        delay = st.hooks.delay_set.take().map(|(_, d)| d);
+                    }
+                    st.store.insert(key, args[2].clone());
+                    st.sets += 1;
+                    if let Some((after, _)) = st.hooks.delete_after_sets
+                        && st.sets == after
+                    {
+                        let (_, keys) = st.hooks.delete_after_sets.take().unwrap();
+                        for k in keys {
+                            st.store.remove(&k);
+                        }
+                    }
+                    b"+OK\r\n".to_vec()
+                }
+                "DEL" => format!(":{}\r\n", u8::from(st.store.remove(&key).is_some())).into_bytes(),
+                _ => b"+OK\r\n".to_vec(),
+            }
+        };
+        if let Some(d) = delay {
+            std::thread::sleep(d);
+        }
+        if writer.write_all(&reply).is_err() {
+            return;
+        }
+    }
+}
+
+/// A trace request: `chunks` full chunks of [`CHUNK_TOKENS`], arriving at
+/// `timestamp_ms`, with `input_tokens` prompt tokens.
+pub fn request(req_id: u64, timestamp_ms: i64, chunks: &[u64], input_tokens: u32) -> Request {
+    Request {
+        timestamp: timestamp_ms * 1_000_000,
+        req_id,
+        input_tokens,
+        output_tokens: 1,
+        chunks: chunks.to_vec(),
+        session_id: None,
+    }
+}
+
+/// A file under the temp directory unique to this process.
+pub fn temp_path(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("cachecannon-kv-{}-{name}", std::process::id()))
+}
+
+/// Write `requests` as a kvtrace request trace with [`CHUNK_TOKENS`].
+pub fn write_trace(requests: &[Request]) -> PathBuf {
+    let path = temp_path("trace.parquet");
+    let mut w = RequestWriter::create(&path, CHUNK_TOKENS, 1024).unwrap();
+    for r in requests {
+        w.write(r).unwrap();
+    }
+    w.finish().unwrap();
+    path
+}
+
+/// One row of the `requests_out` CSV.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Row {
+    pub req_id: u64,
+    pub lag_ns: Option<u64>,
+    pub input_tokens: u64,
+    pub chunks: u64,
+    pub lookup_hit_chunks: u64,
+    pub hit_chunks: u64,
+    pub cached_tokens: u64,
+    pub new_tokens: u64,
+    pub gets: u64,
+    pub get_nil: u64,
+    pub sets: u64,
+}
+
+fn read_rows(path: &PathBuf) -> Vec<Row> {
+    let text = std::fs::read_to_string(path).unwrap();
+    let mut lines = text.lines();
+    assert_eq!(
+        lines.next(),
+        Some(cachecannon::kvreplay::REQUESTS_OUT_HEADER)
+    );
+    lines
+        .map(|line| {
+            let f: Vec<&str> = line.split(',').collect();
+            assert_eq!(f.len(), 16, "{line}");
+            let n = |i: usize| f[i].parse::<u64>().unwrap();
+            Row {
+                req_id: n(0),
+                lag_ns: (!f[2].is_empty()).then(|| n(2)),
+                input_tokens: n(3),
+                chunks: n(4),
+                lookup_hit_chunks: n(5),
+                hit_chunks: n(6),
+                cached_tokens: n(7),
+                new_tokens: n(8),
+                gets: n(9),
+                get_nil: n(10),
+                sets: n(11),
+            }
+        })
+        .collect()
+}
+
+/// Replay `requests` against `server` with one connection, closed loop
+/// unless `kv_toml` sets `speedup`, 4 bytes of KV per token unless it sets
+/// the geometry. `kv_toml` is appended to `[workload.kv_replay]`. Returns
+/// the per-request rows in completion order.
+pub fn replay(server: &Server, requests: &[Request], kv_toml: &str) -> Vec<Row> {
+    replay_on(server, requests, kv_toml, 1)
+}
+
+/// [`replay`] on `connections` connections.
+pub fn replay_on(
+    server: &Server,
+    requests: &[Request],
+    kv_toml: &str,
+    connections: usize,
+) -> Vec<Row> {
+    let addr = server.spawn();
+    let trace = write_trace(requests);
+    let out = temp_path("requests.csv");
+    let geometry = if kv_toml.contains("model_config") || kv_toml.contains("kv_bytes_per_token") {
+        ""
+    } else {
+        "kv_bytes_per_token = 4"
+    };
+    let speedup = if kv_toml.contains("speedup") {
+        ""
+    } else {
+        "speedup = 0"
+    };
+    let toml = format!(
+        r#"
+        [general]
+        duration = "20s"
+        warmup = "0s"
+        threads = 1
+
+        [target]
+        endpoints = ["{addr}"]
+        protocol = "resp"
+
+        [connection]
+        connections = {connections}
+        pipeline_depth = 4
+
+        [workload.kv_replay]
+        trace = "{trace}"
+        requests_out = "{out}"
+        {geometry}
+        {speedup}
+        {kv_toml}
+
+        [admin]
+        format = "quiet"
+        "#,
+        trace = trace.display(),
+        out = out.display(),
+    );
+    let config = load_config(&toml);
+    run_benchmark_full(
+        config,
+        None,
+        create_formatter(OutputFormat::Quiet, ColorMode::Never),
+        Arc::new(AtomicBool::new(true)),
+    )
+    .unwrap();
+    let rows = read_rows(&out);
+    let _ = std::fs::remove_file(&trace);
+    let _ = std::fs::remove_file(&out);
+    rows
+}
+
+/// Parse `toml` as a config file.
+pub fn load_config(toml: &str) -> Config {
+    let path = temp_path("config.toml");
+    std::fs::write(&path, toml).unwrap();
+    let config = Config::load(&path);
+    std::fs::remove_file(&path).unwrap();
+    config.unwrap()
+}
