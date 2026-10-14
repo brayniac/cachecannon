@@ -54,7 +54,7 @@ impl DmaClient {
         })
     }
 
-    /// Verify a CRC-32c on every read, asking the server for one where it needs asking. Whether a
+    /// Verify the CRC-32c the server returns with a read, asking for one where it needs asking. Whether a
     /// write carries one is the caller's choice; see [`Self::set_registered`].
     pub(crate) fn with_checksum(mut self, enabled: bool) -> Self {
         self.checksum = enabled;

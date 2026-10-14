@@ -763,15 +763,15 @@ pub struct Dma {
     /// memory multiplies with connection count, against `RLIMIT_MEMLOCK`.
     #[serde(default)]
     pub buffer_capacity: Option<usize>,
-    /// Verify a CRC-32c per transfer. Off by default. Under the default module only reads are
-    /// checked: it returns a CRC-32c with every read and takes none on a write.
+    /// Verify the CRC-32c the server returns with a read, and, under vdma, send one with each write.
+    /// Off by default. The default module returns one with every read and takes none on a write.
     #[serde(default)]
     pub checksum: bool,
 }
 
 impl Dma {
     /// Whether a write carries a CRC-32c for the server to verify. Only vdma takes one: the default
-    /// module verifies writes itself and refuses a client checksum.
+    /// module's write command takes no checksum argument.
     pub fn checksums_writes(&self) -> bool {
         self.checksum && self.module == DmaModule::Vdma
     }
@@ -1094,7 +1094,7 @@ impl Config {
         if self.workload.read_values && self.target.protocol == Protocol::Dma {
             return Err(ConfigError::Validation(
                 "workload.read_values does not apply to protocol = \"dma\"; use \
-                 dma.checksum = true to checksum each value the server transfers"
+                 dma.checksum = true to checksum each value a GET returns"
                     .to_string(),
             ));
         }

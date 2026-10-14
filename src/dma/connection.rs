@@ -258,7 +258,6 @@ async fn run_transfers(
     let value_len = config.workload.values.length;
     let pool_len = state.task_state.value_pool.len();
     let backfill_on_miss = state.task_state.backfill_on_miss;
-    let write_checksum = config.dma.checksums_writes();
     // A connection the limiter turns away parks on the worker's dispatcher, as the RESP path does,
     // instead of re-polling the limiter on a timer. `None` only if the dispatcher failed to spawn;
     // closed-loop runs have no limiter and never reach it.
@@ -373,9 +372,10 @@ async fn run_transfers(
                 // No staging copy: the value is already in the registered pool, so the transfer
                 // advertises the window where it lives and the server reads it from there.
                 let at = value_offset(rng, value_len, pool_len);
-                let checksum = write_checksum.then(|| {
-                    crate::dma::checksum(&state.task_state.value_pool[at..at + value_len])
-                });
+                let checksum = write_checksum(
+                    &config.dma,
+                    &state.task_state.value_pool[at..at + value_len],
+                );
                 match source_window(at, value_len) {
                     Some(window) => recv_with_timeout(
                         dma.set_registered(key_buf, &window, checksum),
@@ -484,5 +484,35 @@ async fn run_transfers(
         if failed && !is_error_response {
             return Err(DisconnectReason::RecvError);
         }
+    }
+}
+
+/// The CRC-32c a write of `value` carries: `None` unless the module takes one
+/// ([`crate::config::Dma::checksums_writes`]).
+fn write_checksum(dma: &crate::config::Dma, value: &[u8]) -> Option<u32> {
+    dma.checksums_writes().then(|| crate::dma::checksum(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_checksum;
+    use crate::config::{Dma, DmaModule};
+
+    #[test]
+    fn only_vdma_writes_carry_a_checksum() {
+        let value = b"value";
+        let dma = |module, checksum| Dma {
+            module,
+            checksum,
+            ..Dma::default()
+        };
+        assert_eq!(
+            write_checksum(&dma(DmaModule::Vdma, true), value),
+            Some(crate::dma::checksum(value))
+        );
+        // The default module's write command takes no checksum argument, so `command::set` would
+        // refuse every write that carried one.
+        assert_eq!(write_checksum(&dma(DmaModule::LargeObj, true), value), None);
+        assert_eq!(write_checksum(&dma(DmaModule::Vdma, false), value), None);
     }
 }

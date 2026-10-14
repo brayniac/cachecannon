@@ -38,8 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   values transmit over libfabric, server-initiated. `[dma] module` picks the
   server module dialect, `largeobj` (`BLOB.*`, the default) or `vdma`
   (`DMA.*`). The fabric, buffers, and connection task are the same for both.
-  `[dma] checksum = true` verifies a CRC-32c on every read under both
-  modules. Under vdma, writes also carry one; the default module takes no
+  `[dma] checksum = true` checks the CRC-32c the server returns with a read
+  under both modules. Under vdma, writes also carry one; the default module takes no
   write checksum, so writes are sent without one.
 - `[connection] endpoint_allocation = "key_share"` (zipf, several endpoints):
   each endpoint gets connections in proportion to the zipf probability its
