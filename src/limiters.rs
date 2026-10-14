@@ -84,11 +84,11 @@ impl WorkerLimiter {
     /// before prefill, and refill to their cap meanwhile; without this the run
     /// would open by releasing that cap at once.
     ///
-    /// Nothing may take tokens while this runs: the cap is briefly narrowed, so
-    /// a concurrent take would see `max_tokens()` of 0, and a concurrent refill
-    /// could re-add the time since the last take under the restored cap. The
-    /// runner calls it before setting the Warmup phase, and every taker waits
-    /// for Warmup or Running.
+    /// Nothing may take tokens while this runs: the cap is briefly narrowed to
+    /// less than one claim, so a concurrent take could not fund a claim, and a
+    /// concurrent refill could re-add the time since the last take under the
+    /// restored cap. The runner calls it before setting the Warmup phase, and
+    /// every taker waits for Warmup or Running.
     ///
     /// `ratelimit` refills lazily, so lowering the cap alone is not enough:
     /// the next take would refill the time since the last one under the
@@ -323,7 +323,8 @@ mod tests {
         // 0 holds nothing and none holds a claim: the first claims are
         // fundable at different times, and nothing is released as a burst.
         // 100/s over 8 workers is 12.5/s each, so the half request worker 7
-        // lacks takes 40 ms to accrue: no scheduling delay can fund a claim.
+        // lacks takes 40 ms to accrue: only a delay that long could fund a
+        // claim.
         let l = WorkerLimiters::new(100, &[8; 8], 4);
         for i in 0..8u64 {
             let rl = l.worker(i as usize).unwrap();
@@ -374,9 +375,9 @@ mod tests {
             );
             // `available` does not refill; a take does. A restart that only
             // narrowed and restored the cap would refill the 200 ms (about
-            // 2,500 requests) here; 100 is 8 ms of this worker's rate.
+            // 2,500 requests) here; 1,250 is 100 ms of this worker's rate.
             assert!(
-                rl.try_wait_n(100).is_err(),
+                rl.try_wait_n(1250).is_err(),
                 "worker {i} still held what accrued before restart"
             );
         }
