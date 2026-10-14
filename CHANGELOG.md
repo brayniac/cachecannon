@@ -28,7 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replies are copied into that buffer either way, so only the CRC is added.
   Memcache already received whole replies and gains the CRC. Client memory
   rises to up to connections × `pipeline_depth` × value size. Rejected with
-  `protocol = "ping"`. Off by default; the default recv path is
+  `protocol = "ping"` and `protocol = "dma"`; for DMA, `[dma] checksum = true`
+  is the counterpart. Off by default; the default recv path is
   unchanged. The metrics endpoints and the parquet recording gain a
   `values_read_bytes` counter, which is 0 when the option is off.
   `docs/reference.md` "Reading values" lists the per-backend work and the
@@ -37,6 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   values transmit over libfabric, server-initiated. `[dma] module` picks the
   server module dialect, `largeobj` (`BLOB.*`, the default) or `vdma`
   (`DMA.*`). The fabric, buffers, and connection task are the same for both.
+  `[dma] checksum = true` checks the CRC-32c the server returns with a read
+  under both modules. Under vdma, writes also carry one; the default module takes no
+  write checksum, so writes are sent without one.
 - `[connection] endpoint_allocation = "key_share"` (zipf, several endpoints):
   each endpoint gets connections in proportion to the zipf probability its
   keys carry (at least one if it owns keys, none if it owns none) instead of
