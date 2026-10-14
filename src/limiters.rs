@@ -19,18 +19,19 @@
 //! pipeline 32 and 100K req/s, that was 8 x 32 requests every 2.6 ms and GET
 //! p99 rose from 647 us to 860 us. The workers are therefore staggered: each
 //! limiter counts in 1/`SUB` of a request, and worker `i` of `n` gets a cap
-//! `i/n` of a claim above the others. A worker spends whole claims, so the
-//! fraction it holds when it fills to its cap persists, and the workers stay
-//! spread across the claim interval.
+//! `i/n` of a claim above the others, and starts holding that fraction. A
+//! worker spends whole claims, so the fraction it holds persists (from the
+//! start, and again whenever it fills to its cap), and the workers stay spread
+//! across the claim interval.
 //!
-//! Each limiter starts holding only its stagger, `i/n` of a claim, not its
-//! cap. A limiter that started full released a second's share of requests at
-//! once when the run began: at 26,820 req/s of 1 MiB values that was about
-//! 28 GB queued in the first instant, and the sending host's NIC queued or
-//! dropped up to 1.2M packets a second for the next ten seconds. Starting at
-//! the stagger keeps the phases spread from the first request, so no two
-//! workers fund their first claim together, and no worker holds more than one
-//! claim at the start.
+//! Starting at the stagger rather than the cap also means the run does not
+//! open with a burst. The limiters are built before connections open and
+//! prefill runs; a limiter that started full, or refilled to its cap
+//! meanwhile, released a second's share of the rate at once when warmup
+//! began. At 26,820 req/s of 1 MiB values, the sending host's NIC then queued
+//! or dropped up to 1.2M packets a second for the first ten seconds of
+//! warmup. `WorkerLimiters::restart` resets each limiter to its stagger as
+//! warmup begins.
 
 use ratelimit::{Ratelimiter, TryWaitError};
 use std::sync::Arc;
@@ -82,6 +83,12 @@ impl WorkerLimiter {
     /// accrued since. The limiters are built before the connections open and
     /// before prefill, and refill to their cap meanwhile; without this the run
     /// would open by releasing that cap at once.
+    ///
+    /// Nothing may take tokens while this runs: the cap is briefly narrowed, so
+    /// a concurrent take would see `max_tokens()` of 0, and a concurrent refill
+    /// could re-add the time since the last take under the restored cap. The
+    /// runner calls it before setting the Warmup phase, and every taker waits
+    /// for Warmup or Running.
     ///
     /// `ratelimit` refills lazily, so lowering the cap alone is not enough:
     /// the next take would refill the time since the last one under the
@@ -169,9 +176,10 @@ pub struct WorkerLimiters {
 
 impl WorkerLimiters {
     /// Split `rate` across workers in proportion to `connections` (one entry
-    /// per worker). Each limiter holds its share of one second of tokens, at
-    /// least `claim` (a full batch, so a batch is always fundable), plus its
-    /// stagger. `claim` is also the unit the workers are staggered across.
+    /// per worker). Each limiter's cap is its share of one second of tokens,
+    /// at least `claim` (a full batch, so a batch is always fundable), plus
+    /// its stagger; it starts holding only the stagger. `claim` is also the
+    /// unit the workers are staggered across.
     pub fn new(rate: u64, connections: &[usize], claim: u64) -> Self {
         let weights: Vec<u64> = connections.iter().map(|&c| c as u64).collect();
         let total_weight = weights.iter().sum::<u64>().max(1);
@@ -314,7 +322,9 @@ mod tests {
         // Each worker starts with only its stagger, i/n of a claim, so worker
         // 0 holds nothing and none holds a claim: the first claims are
         // fundable at different times, and nothing is released as a burst.
-        let l = WorkerLimiters::new(100_000, &[8; 8], 4);
+        // 100/s over 8 workers is 12.5/s each, so the half request worker 7
+        // lacks takes 40 ms to accrue: no scheduling delay can fund a claim.
+        let l = WorkerLimiters::new(100, &[8; 8], 4);
         for i in 0..8u64 {
             let rl = l.worker(i as usize).unwrap();
             assert_eq!(rl.inner.available(), i * 4 * SUB / 8, "worker {i}");
@@ -330,8 +340,8 @@ mod tests {
         // At 100K req/s over 8 workers, a full start released 12,500 requests
         // per worker at once. Starting at the stagger, the first 10 ms release
         // about 10 ms of the rate.
-        let l = WorkerLimiters::new(100_000, &[8; 8], 1);
         let start = std::time::Instant::now();
+        let l = WorkerLimiters::new(100_000, &[8; 8], 1);
         let mut taken = 0u64;
         while start.elapsed() < Duration::from_millis(10) {
             for i in 0..8 {
@@ -346,7 +356,8 @@ mod tests {
 
     #[test]
     fn restart_discards_what_accrued_before_the_run() {
-        // 100K req/s over 8 workers refills a worker's 12,500 cap in 125 ms.
+        // 100K req/s over 8 workers is 12,500/s each: 200 ms accrues about
+        // 2,500 requests per worker, all of which restart must discard.
         let l = WorkerLimiters::new(100_000, &[8; 8], 4);
         std::thread::sleep(Duration::from_millis(200));
         l.restart();
@@ -360,6 +371,13 @@ mod tests {
                 rl.max_tokens(),
                 12_500 + (i * 4 / 8),
                 "worker {i}: cap restored"
+            );
+            // `available` does not refill; a take does. A restart that only
+            // narrowed and restored the cap would refill the 200 ms (about
+            // 2,500 requests) here; 100 is 8 ms of this worker's rate.
+            assert!(
+                rl.try_wait_n(100).is_err(),
+                "worker {i} still held what accrued before restart"
             );
         }
     }

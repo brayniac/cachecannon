@@ -1,8 +1,8 @@
-//! A rate-limited run starts at its rate. A fake RESP server timestamps every
-//! SET of a 1 s run limited to 2,000 per second with no warmup; the first
-//! 100 ms may carry about 200 of them. Each worker's limiter used to start
-//! holding a second's share, and the run opened by sending about 2,000 at
-//! once.
+//! Shared by the `rate_limit_start_*` tests: a fake RESP server that
+//! timestamps one command, and a one-second rate-limited run against it.
+//!
+//! The runner can be started once per process, so each run is its own test
+//! binary.
 
 use cachecannon::{ColorMode, Config, OutputFormat, create_formatter, run_benchmark_full};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -11,7 +11,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const RATE: usize = 2000;
+pub const RATE: usize = 2000;
 
 fn read_line(reader: &mut impl BufRead) -> Option<Vec<u8>> {
     let mut line = Vec::new();
@@ -22,8 +22,9 @@ fn read_line(reader: &mut impl BufRead) -> Option<Vec<u8>> {
     Some(line)
 }
 
-/// Answer every command `+OK` (PING `+PONG`) and record when each SET arrived.
-fn serve(stream: TcpStream, sets: &Mutex<Vec<Instant>>) {
+/// Answer SET `+OK`, GET a miss, PING `+PONG`, anything else `+OK`, and record
+/// when each `record` command arrived after `armed` is set.
+fn serve(stream: TcpStream, record: &'static [u8], times: &Mutex<Vec<Instant>>) {
     let mut writer = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);
     while let Some(header) = read_line(&mut reader) {
@@ -42,11 +43,11 @@ fn serve(stream: TcpStream, sets: &Mutex<Vec<Instant>>) {
                 command = arg.to_ascii_uppercase();
             }
         }
+        if command == record {
+            times.lock().unwrap().push(Instant::now());
+        }
         let reply: &[u8] = match command.as_slice() {
-            b"SET" => {
-                sets.lock().unwrap().push(Instant::now());
-                b"+OK\r\n"
-            }
+            b"GET" => b"$-1\r\n",
             b"PING" => b"+PONG\r\n",
             _ => b"+OK\r\n",
         };
@@ -56,23 +57,30 @@ fn serve(stream: TcpStream, sets: &Mutex<Vec<Instant>>) {
     }
 }
 
-fn spawn() -> (SocketAddr, Arc<Mutex<Vec<Instant>>>) {
-    let sets = Arc::new(Mutex::new(Vec::new()));
-    let recorded = Arc::clone(&sets);
+fn spawn(record: &'static [u8]) -> (SocketAddr, Arc<Mutex<Vec<Instant>>>) {
+    let times = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&times);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let recorded = Arc::clone(&recorded);
-            std::thread::spawn(move || serve(stream, &recorded));
+            std::thread::spawn(move || serve(stream, record, &recorded));
         }
     });
-    (addr, sets)
+    (addr, times)
 }
 
-#[test]
-fn a_rate_limited_run_does_not_open_with_a_burst() {
-    let (addr, sets) = spawn();
+/// Run one second at [`RATE`] with no warmup, after a prefill when `prefill`
+/// is set, and return how many measured requests (GETs after a prefill, SETs
+/// without one) arrived in the first 100 ms of the run's traffic.
+pub fn first_100ms(prefill: bool) -> usize {
+    let (record, commands): (&'static [u8], &str) = if prefill {
+        (b"GET", "get = 100\n        set = 0")
+    } else {
+        (b"SET", "get = 0\n        set = 100")
+    };
+    let (addr, times) = spawn(record);
     let toml = format!(
         r#"
         [general]
@@ -90,20 +98,21 @@ fn a_rate_limited_run_does_not_open_with_a_burst() {
 
         [workload]
         rate_limit = {RATE}
+        prefill = {prefill}
+        prefill_settle = "0s"
 
         [workload.keyspace]
         count = 1000
 
         [workload.commands]
-        get = 0
-        set = 100
+        {commands}
 
         [admin]
         format = "quiet"
         "#
     );
     let path = std::env::temp_dir().join(format!(
-        "cachecannon-rate-limit-start-{}.toml",
+        "cachecannon-rate-limit-start-{}-{prefill}.toml",
         std::process::id()
     ));
     std::fs::write(&path, toml).unwrap();
@@ -117,20 +126,15 @@ fn a_rate_limited_run_does_not_open_with_a_burst() {
     )
     .unwrap();
 
-    let sets = sets.lock().unwrap();
+    let times = times.lock().unwrap();
     assert!(
-        sets.len() > RATE / 2,
-        "only {} SETs in a 1 s run",
-        sets.len()
+        times.len() > RATE / 2,
+        "only {} requests in a 1 s run",
+        times.len()
     );
-    let first = sets[0];
-    let early = sets
+    let first = times[0];
+    times
         .iter()
         .filter(|t| t.duration_since(first) < Duration::from_millis(100))
-        .count();
-    // 100 ms at 2,000/s is 200; allow one batch per connection on top.
-    assert!(
-        early <= RATE / 10 + 16 * 4,
-        "{early} SETs in the first 100 ms"
-    );
+        .count()
 }
