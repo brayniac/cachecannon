@@ -763,9 +763,18 @@ pub struct Dma {
     /// memory multiplies with connection count, against `RLIMIT_MEMLOCK`.
     #[serde(default)]
     pub buffer_capacity: Option<usize>,
-    /// Ask the server for a CRC-32c per transfer and verify it. Off by default.
+    /// Verify a CRC-32c per transfer. Off by default. Under the default module only reads are
+    /// checked: it returns a CRC-32c with every read and takes none on a write.
     #[serde(default)]
     pub checksum: bool,
+}
+
+impl Dma {
+    /// Whether a write carries a CRC-32c for the server to verify. Only vdma takes one: the default
+    /// module verifies writes itself and refuses a client checksum.
+    pub fn checksums_writes(&self) -> bool {
+        self.checksum && self.module == DmaModule::Vdma
+    }
 }
 
 /// The server module a DMA run talks to.
@@ -934,15 +943,6 @@ impl Config {
                 ));
             }
 
-            // A largeobj write takes no checksum, so the client would refuse every SET.
-            #[cfg(feature = "dma")]
-            if self.dma.checksum && self.dma.module == DmaModule::LargeObj {
-                return Err(ConfigError::Validation(
-                    "dma.checksum requires dma.module = \"vdma\": a largeobj write takes none"
-                        .to_string(),
-                ));
-            }
-
             #[cfg(feature = "dma")]
             if let Some(capacity) = self.dma.buffer_capacity
                 && capacity < self.workload.values.length
@@ -1086,6 +1086,15 @@ impl Config {
             return Err(ConfigError::Validation(
                 "workload.read_values needs a protocol with GET (resp, resp3, memcache, \
                  memcache-binary); ping has none"
+                    .to_string(),
+            ));
+        }
+
+        // The DMA path never reads values through the RESP receive path that option changes.
+        if self.workload.read_values && self.target.protocol == Protocol::Dma {
+            return Err(ConfigError::Validation(
+                "workload.read_values does not apply to protocol = \"dma\"; use \
+                 dma.checksum = true to checksum each value the server transfers"
                     .to_string(),
             ));
         }
@@ -1334,6 +1343,19 @@ mod validation_tests {
         .validate()
         .unwrap_err();
         assert!(err.to_string().contains("read_values"), "{err}");
+    }
+
+    #[cfg(feature = "dma")]
+    #[test]
+    fn read_values_rejected_for_dma() {
+        let err = toml::from_str::<Config>(
+            "[target]\nendpoints = [\"127.0.0.1:6379\"]\nprotocol = \"dma\"\n\
+             [workload]\nread_values = true",
+        )
+        .expect("parses")
+        .validate()
+        .unwrap_err();
+        assert!(err.to_string().contains("dma.checksum"), "{err}");
     }
 
     #[test]
@@ -2094,10 +2116,20 @@ mod append_config_tests {
 
     #[cfg(feature = "dma")]
     #[test]
-    fn largeobj_refuses_a_checksum() {
-        assert!(dma_config("module = \"vdma\"\nchecksum = true").is_ok());
-        let error = dma_config("checksum = true").unwrap_err();
-        assert!(error.to_string().contains("dma.checksum"), "{error}");
+    fn checksum_is_accepted_for_both_modules() {
+        // The default module takes no write checksum but returns one with every read, so the
+        // client checks reads only.
+        let vdma = dma_config("module = \"vdma\"\nchecksum = true").unwrap();
+        assert!(vdma.dma.checksums_writes());
+        let default = dma_config("checksum = true").unwrap();
+        assert!(default.dma.checksum);
+        assert!(!default.dma.checksums_writes());
+        assert!(
+            !dma_config("module = \"vdma\"")
+                .unwrap()
+                .dma
+                .checksums_writes()
+        );
     }
 
     #[cfg(feature = "dma")]

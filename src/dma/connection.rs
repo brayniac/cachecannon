@@ -258,6 +258,7 @@ async fn run_transfers(
     let value_len = config.workload.values.length;
     let pool_len = state.task_state.value_pool.len();
     let backfill_on_miss = state.task_state.backfill_on_miss;
+    let write_checksum = config.dma.checksums_writes();
     // A connection the limiter turns away parks on the worker's dispatcher, as the RESP path does,
     // instead of re-polling the limiter on a timer. `None` only if the dispatcher failed to spawn;
     // closed-loop runs have no limiter and never reach it.
@@ -372,7 +373,7 @@ async fn run_transfers(
                 // No staging copy: the value is already in the registered pool, so the transfer
                 // advertises the window where it lives and the server reads it from there.
                 let at = value_offset(rng, value_len, pool_len);
-                let checksum = state.task_state.config.dma.checksum.then(|| {
+                let checksum = write_checksum.then(|| {
                     crate::dma::checksum(&state.task_state.value_pool[at..at + value_len])
                 });
                 match source_window(at, value_len) {

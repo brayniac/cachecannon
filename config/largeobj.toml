@@ -45,5 +45,5 @@ interfaces = []
 # Registered buffer per connection. Unset means the value length; the server refuses an object the
 # advertised length cannot hold.
 # buffer_capacity = 1048576
-# A largeobj write takes no checksum argument, so `true` is refused. Reads return a CRC-32c unasked.
+# The module takes no write checksum, so `true` checks reads only: every read returns a CRC-32c.
 checksum = false

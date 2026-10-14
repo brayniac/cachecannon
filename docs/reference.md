@@ -251,7 +251,9 @@ lists.
 
 Each CRC is folded into a per-connection value passed to `black_box`, so the
 compiler cannot remove it. `values_read_bytes` counts the bytes checksummed.
-`protocol = "ping"` with `read_values = true` is rejected at config load.
+`protocol = "ping"` or `protocol = "dma"` with `read_values = true` is
+rejected at config load. For DMA, `[dma] checksum = true` computes a CRC-32c
+over each value the server transfers.
 
 Differences from the default path:
 
