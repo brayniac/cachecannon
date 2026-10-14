@@ -9,9 +9,14 @@ mod start;
 #[test]
 fn the_run_does_not_open_with_a_burst() {
     let early = start::first_100ms(true);
-    // 100 ms at 2,000/s is 200; allow one batch per connection on top.
+    // 100 ms at 2,000/s is 200; allow one batch per connection on top. The
+    // floor is 80% of it: a restart that left the cap narrowed sent 131-141.
     assert!(
         early <= start::RATE / 10 + 16 * 4,
+        "{early} requests in the first 100 ms"
+    );
+    assert!(
+        early >= start::RATE * 8 / 100,
         "{early} requests in the first 100 ms"
     );
 }
