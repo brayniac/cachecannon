@@ -534,6 +534,9 @@ pub fn run_benchmark_full(
                     {
                         kv.start_at(Instant::now());
                     }
+                    if let Some(ref rl) = ratelimiter {
+                        rl.restart();
+                    }
                     shared.set_phase(Phase::Warmup);
                     current_phase = Phase::Warmup;
                     warmup_start = Some(Instant::now());
@@ -599,6 +602,9 @@ pub fn run_benchmark_full(
                     && !warmup.is_zero()
                 {
                     kv.start_at(Instant::now());
+                }
+                if let Some(ref rl) = ratelimiter {
+                    rl.restart();
                 }
                 shared.set_phase(Phase::Warmup);
                 current_phase = Phase::Warmup;

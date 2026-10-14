@@ -161,6 +161,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     a `query worker:` error.
 
 ### Fixed
+- A rate-limited run no longer opens with a burst. Each worker's limiter
+  started full and kept refilling while connections opened and prefill ran,
+  so warmup began by releasing a second's share of requests at once (about
+  2,000 within 100 ms at `rate_limit = 2000`; at 26,820 req/s of 1 MiB values,
+  enough to make the sending NIC queue or drop packets for ten seconds). Each
+  limiter now starts holding only its stagger, at most one batch, and is reset
+  to it when warmup begins.
 - `protocol = "dma"` rate-limited runs take tokens from the worker's
   dispatcher, as RESP and memcache do. A connection the limiter turned away
   re-polled it every 100 us, so client CPU scaled with connections rather
