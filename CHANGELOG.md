@@ -58,6 +58,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `values_read_bytes` counter, which is 0 when the option is off.
   `docs/reference.md` "Reading values" lists the per-backend work and the
   timing, memory and error-handling differences.
+- `protocol = "dma"` (`--features dma`): RESP carries the commands and the
+  values transmit over libfabric, server-initiated. `[dma] module` picks the
+  server module dialect, `largeobj` (`BLOB.*`, the default) or `vdma`
+  (`DMA.*`). The fabric, buffers, and connection task are the same for both.
+- `[connection] endpoint_allocation = "key_share"` (zipf, several endpoints):
+  each endpoint gets connections in proportion to the zipf probability its
+  keys carry (at least one if it owns keys, none if it owns none) instead of
+  an equal number. In a rate-limited run in which no connection is held back
+  by its pipeline, each endpoint then receives its zipf share of requests, so
+  the servers together see the global distribution; with the default `even`,
+  every endpoint gets the same share whatever its keys' popularity. With DMA
+  at MiB values (one transfer per connection) or closed loop, the hot
+  endpoint gets less than its share. `docs/reference.md` says how to check
+  the shares a run achieved.
+- `examples/zipfbench.rs`: per-key selection cost of the reject-route, alias
+  and uniform multi-endpoint paths on one core, no network.
+  `cargo run --release --example zipfbench -- [keys] [endpoints] [theta]
+  [threads] [base_addr] [connections]`; prints each endpoint's keys, zipf
+  share and `key_share` connection count.
 
 ### Changed
 - A run whose computed send copy pool exceeds ringline's per-worker maximum
@@ -66,6 +85,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lookup). The pool was, and still is, capped there; sends past it fail and
   are counted in `requests_send_failed`. Before, the cap was applied without
   a message.
+- `keyspace.zipf_theta` must now be in (0, 10]; larger values were accepted
+  before. A large theta could underflow every key weight on an endpoint,
+  which the per-endpoint alias tables cannot sample.
 - metriken 0.9 → 0.11.3 (metriken-core 0.3), metriken-exposition 0.16 → 0.22,
   metriken-query 0.9 → 0.36, and metriken-storage 0.2 for `--parquet`'s
   msgpack-to-parquet conversion, which left metriken-exposition. No SQLite is
@@ -123,6 +145,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     a `query worker:` error.
 
 ### Fixed
+- `protocol = "dma"` rate-limited runs take tokens from the worker's
+  dispatcher, as RESP and memcache do. A connection the limiter turned away
+  re-polled it every 100 us, so client CPU scaled with connections rather
+  than rate: 1536 connections at 14,950 req/s of 1 MiB values used 17.6
+  CPUs, and 0.26 with the dispatcher; GET p99 was 378 and 387 us.
+  Closed-loop runs are unchanged.
+- Multi-endpoint `distribution = "zipf"` drew from the global zipf and
+  discarded keys that routed to another endpoint: about `1 / P(endpoint)`
+  draws, key renders and ketama hashes per request (61 at 48 endpoints and
+  100,000 keys; `examples/zipfbench` measures the per-key cost on the client
+  host). Each endpoint now samples zipf restricted to its own keys from an
+  alias table built once at startup: the same pmf the rejection produced, in
+  O(1). Closed loop against 48 server processes with 1536 connections and
+  4 KiB values, zipf went from 2.04M to 6.10M req/s on RESP (uniform keys:
+  6.1M) and from 1.9M to 3.80M on DMA (uniform: 3.73M). RESP and DMA only;
+  memcache and `recency` still reject-route. The tables use the startup key
+  partition, so in cluster mode a slot that moves during the run is not
+  followed: the old owner's connections keep sending its keys and get MOVED,
+  as the uniform path already does.
 - A connection the server closed while it had no requests in flight now
   reconnects. Its sends failed without reaching `recv`, where a close is
   noticed, so it retried for the rest of the run: a rate-limited run (64
@@ -165,6 +206,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Connection seeds mix the run seed with the connection's role (reader or
   append writer) and position through SplitMix64, so connections within a run,
   and the same connection across runs, never share a stream.
+
+### Known issues
+- With `endpoint_allocation = "even"` (the default), an
+  endpoint that owns no keys (fewer keys than endpoints, e.g. a 16 GiB
+  keyspace of 128 MiB values over 48 endpoints) still gets connections. In
+  RESP each claims a rate-limit token batch, finds no key and drops it, which
+  lowers the achieved rate. `key_share` gives such endpoints no connections.
 
 ## [0.0.28] - 2026-09-28
 

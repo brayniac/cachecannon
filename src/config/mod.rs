@@ -18,6 +18,8 @@ pub struct Config {
     pub timestamps: Timestamps,
     #[serde(default)]
     pub admin: Admin,
+    #[serde(default)]
+    pub dma: Dma,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -163,6 +165,9 @@ pub enum Protocol {
     MemcacheBinary,
     /// Simple ASCII PING/PONG protocol
     Ping,
+    /// Server-initiated RMA against valkey with vdma module. RESP carries the commands, payloads travel
+    /// libfabric. Requires the `dma` feature and libfabric.
+    Dma,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -189,6 +194,35 @@ pub struct Connection {
     /// How to distribute requests across connections.
     #[serde(default)]
     pub request_distribution: RequestDistribution,
+    /// How connections are assigned to endpoints. See [`EndpointAllocation`].
+    #[serde(default)]
+    pub endpoint_allocation: EndpointAllocation,
+}
+
+/// How connections are assigned to endpoints when there are several.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointAllocation {
+    /// Connection `i` serves endpoint `i % endpoints` (default). Every endpoint
+    /// gets the same number of connections, and so the same request share in a
+    /// rate-limited run, whatever share of the key distribution it owns.
+    #[default]
+    Even,
+    /// Each endpoint gets connections in proportion to the share of zipf
+    /// probability its keys carry: at least one if it owns keys, none if it
+    /// owns none. When every connection gets the same share of rate-limit
+    /// tokens, each endpoint then receives its zipf share of requests, so the
+    /// servers together see the global zipf distribution. That needs a
+    /// rate-limited run in which no connection is held back by its pipeline:
+    /// tokens go first come, first served among a worker's waiting
+    /// connections, so a connection with a full pipeline takes fewer (DMA, one
+    /// transfer per connection, at MiB values). In a closed-loop run an
+    /// endpoint's share also depends on its latency. Requires
+    /// `keyspace.distribution = "zipf"`; validation counts the endpoints in
+    /// `[target]`, which in cluster mode are the seeds. The memcache protocols
+    /// still reject-route zipf keys rather than using the per-endpoint alias
+    /// tables; the allocation applies to them all the same.
+    KeyShare,
 }
 
 /// How requests are distributed across connections.
@@ -227,6 +261,7 @@ impl Default for Connection {
             connect_timeout: default_connect_timeout(),
             request_timeout: default_request_timeout(),
             request_distribution: RequestDistribution::default(),
+            endpoint_allocation: EndpointAllocation::default(),
         }
     }
 }
@@ -579,8 +614,10 @@ pub struct Keyspace {
     #[serde(default)]
     pub distribution: Distribution,
     /// YCSB skew parameter for `distribution = "zipf"`; ignored for uniform.
-    /// Larger is more skewed. Must be > 0 and != 1 (the generator divides by
-    /// `1 - theta`). 0.99 is the YCSB default.
+    /// Larger is more skewed. Must be in (0, 10]; 0.99 is the YCSB default.
+    /// The upper bound keeps every key's weight `(id + 1)^-theta` above f64
+    /// underflow for any keyspace below 1e30 keys, which the per-endpoint alias
+    /// tables need (an endpoint whose weights all underflow has no sampler).
     #[serde(default = "default_zipf_theta")]
     pub zipf_theta: f64,
     /// How key ids are rendered into key bytes (`hex` default, or `uuid`).
@@ -689,6 +726,9 @@ fn default_key_length() -> usize {
 fn default_key_count() -> usize {
     1_000_000
 }
+
+/// Upper bound on `keyspace.zipf_theta`; see that field.
+pub const MAX_ZIPF_THETA: f64 = 10.0;
 
 fn default_zipf_theta() -> f64 {
     0.99
@@ -801,6 +841,52 @@ impl Default for Timestamps {
 
 fn default_timestamps_enabled() -> bool {
     true
+}
+
+/// Fabric settings for `protocol = "dma"`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Dma {
+    /// Which server module is on the other end. This selects the RESP
+    /// vocabulary the transfers are issued in.
+    #[serde(default)]
+    pub module: DmaModule,
+    /// `efa-direct` for real dma, `tcp` for a development host.
+    #[serde(default)]
+    pub provider: DmaProvider,
+    /// Fabric domains to spread workers across, one endpoint per worker. Empty discovers all
+    /// domains.
+    #[serde(default)]
+    pub interfaces: Vec<String>,
+    /// Registered buffer size per connection. Defaults to the workload's value length. Registered
+    /// memory multiplies with connection count, against `RLIMIT_MEMLOCK`.
+    #[serde(default)]
+    pub buffer_capacity: Option<usize>,
+    /// Ask the server for a CRC-32c per transfer and verify it. Off by default.
+    #[serde(default)]
+    pub checksum: bool,
+}
+
+/// The server module a DMA run talks to.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DmaModule {
+    /// vdma: `DMA.HELLO`/`DMA.GET`/`DMA.SET`, values in the ordinary keyspace.
+    Vdma,
+    /// valkey-large-object: `BLOB.HELLO`/`BLOB.GET`/`BLOB.SET`, a module type of its own. A write takes no
+    /// checksum; a read returns one unasked.
+    #[default]
+    LargeObj,
+}
+
+/// Which libfabric provider a DMA run opens.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DmaProvider {
+    /// EFA's `efa-direct` fabric — the hardware path.
+    #[default]
+    EfaDirect,
+    /// Software transport, for a development host with no RDMA hardware.
+    Tcp,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -923,6 +1009,49 @@ impl Config {
             ));
         }
 
+        if self.target.protocol == Protocol::Dma {
+            #[cfg(not(feature = "dma"))]
+            return Err(ConfigError::Validation(
+                "protocol = \"dma\" requires a build with --features dma (needs libfabric)"
+                    .to_string(),
+            ));
+
+            #[cfg(feature = "dma")]
+            if self.connection.pipeline_depth != 1 {
+                return Err(ConfigError::Validation(format!(
+                    "protocol = \"dma\" currently runs one transfer per connection; set \
+                     connection.pipeline_depth = 1 (got {}) and raise connections for concurrency",
+                    self.connection.pipeline_depth,
+                )));
+            }
+
+            #[cfg(feature = "dma")]
+            if self.workload.append.is_some() {
+                return Err(ConfigError::Validation(
+                    "protocol = \"dma\" does not support [workload.append]".to_string(),
+                ));
+            }
+
+            // A largeobj write takes no checksum, so the client would refuse every SET.
+            #[cfg(feature = "dma")]
+            if self.dma.checksum && self.dma.module == DmaModule::LargeObj {
+                return Err(ConfigError::Validation(
+                    "dma.checksum requires dma.module = \"vdma\": a largeobj write takes none"
+                        .to_string(),
+                ));
+            }
+
+            #[cfg(feature = "dma")]
+            if let Some(capacity) = self.dma.buffer_capacity
+                && capacity < self.workload.values.length
+            {
+                return Err(ConfigError::Validation(format!(
+                    "dma.buffer_capacity ({capacity}) must hold workload.values.length ({})",
+                    self.workload.values.length,
+                )));
+            }
+        }
+
         if self.connection.total_connections() == 0 {
             return Err(ConfigError::Validation(
                 "connections must be >= 1".to_string(),
@@ -946,9 +1075,26 @@ impl Config {
             // is_finite() first so NaN is caught before the ordered comparison.
             // rand_distr's rejection-inversion handles theta == 1, so unlike a
             // zeta-based generator there is no singularity to exclude here.
-            if !theta.is_finite() || theta <= 0.0 {
+            if !theta.is_finite() || theta <= 0.0 || theta > MAX_ZIPF_THETA {
                 return Err(ConfigError::Validation(format!(
-                    "keyspace.zipf_theta must be finite and > 0 (got {theta})"
+                    "keyspace.zipf_theta must be in (0, {MAX_ZIPF_THETA}] (got {theta})"
+                )));
+            }
+        }
+
+        if self.connection.endpoint_allocation == EndpointAllocation::KeyShare {
+            if self.workload.keyspace.distribution != Distribution::Zipf {
+                return Err(ConfigError::Validation(
+                    "connection.endpoint_allocation = \"key_share\" requires \
+                     keyspace.distribution = \"zipf\""
+                        .to_string(),
+                ));
+            }
+            let endpoints = self.target.endpoints.len();
+            if endpoints > 1 && self.connection.total_connections() < endpoints {
+                return Err(ConfigError::Validation(format!(
+                    "connection.endpoint_allocation = \"key_share\" gives every endpoint at \
+                     least one connection, so connections must be >= {endpoints} endpoints"
                 )));
             }
         }
@@ -1471,7 +1617,7 @@ mod validation_tests {
 
     #[test]
     fn rejects_nonpositive_or_nan_zipf_theta() {
-        for bad in ["0.0", "-0.5", "nan"] {
+        for bad in ["0.0", "-0.5", "nan", "10.5", "inf"] {
             let err = toml::from_str::<Config>(&format!(
                 r#"
                 [target]
@@ -1494,11 +1640,10 @@ mod validation_tests {
 
     #[test]
     fn accepts_zipf_with_multiple_endpoints() {
-        // Skew across a sharded fleet is realistic and supported: hot keys hash
-        // to particular shards and those shards see disproportionate load, which
-        // is the imbalance the setup exists to measure. The worker draws from the
-        // global distribution and reject-routes rather than using the uniform
-        // per-endpoint fast path.
+        // Skew across a sharded fleet is supported. Each connection samples zipf
+        // restricted to its endpoint's keys. Shards see load in proportion to
+        // their zipf share only with `connection.endpoint_allocation =
+        // "key_share"`; the default gives every endpoint the same connections.
         toml::from_str::<Config>(
             r#"
             [target]
@@ -1511,6 +1656,53 @@ mod validation_tests {
         .expect("parses")
         .validate()
         .expect("zipf across shards must be allowed");
+    }
+
+    #[test]
+    fn endpoint_allocation_defaults_to_even_and_parses_key_share() {
+        let base = r#"
+            [target]
+            endpoints = ["127.0.0.1:6379", "127.0.0.1:6380"]
+            protocol = "resp"
+            [workload.keyspace]
+            distribution = "zipf"
+            "#;
+        let cfg: Config = toml::from_str(base).expect("parses");
+        assert_eq!(cfg.connection.endpoint_allocation, EndpointAllocation::Even);
+        let cfg: Config = toml::from_str(&format!(
+            "{base}\n[connection]\nconnections = 2\nendpoint_allocation = \"key_share\"\n"
+        ))
+        .expect("parses");
+        assert_eq!(
+            cfg.connection.endpoint_allocation,
+            EndpointAllocation::KeyShare
+        );
+        cfg.validate().expect("key_share with zipf is valid");
+    }
+
+    #[test]
+    fn key_share_requires_zipf_and_a_connection_per_endpoint() {
+        let cfg = |dist: &str, conns: usize| {
+            toml::from_str::<Config>(&format!(
+                r#"
+                [target]
+                endpoints = ["127.0.0.1:6379", "127.0.0.1:6380", "127.0.0.1:6381"]
+                protocol = "resp"
+                [connection]
+                connections = {conns}
+                endpoint_allocation = "key_share"
+                [workload.keyspace]
+                distribution = "{dist}"
+                "#
+            ))
+            .expect("parses")
+            .validate()
+        };
+        let err = cfg("uniform", 3).unwrap_err();
+        assert!(format!("{err:?}").contains("requires"), "{err:?}");
+        let err = cfg("zipf", 2).unwrap_err();
+        assert!(format!("{err:?}").contains(">= 3"), "{err:?}");
+        cfg("zipf", 3).expect("one connection per endpoint is enough");
     }
 
     #[test]
@@ -2124,5 +2316,55 @@ mod append_config_tests {
             ..a
         };
         assert_eq!(slow.spread_rate(), 1);
+    }
+
+    #[cfg(feature = "dma")]
+    #[test]
+    fn shipped_dma_configs_validate() {
+        let vdma = Config::load("config/dma.toml").expect("config/dma.toml");
+        assert_eq!(vdma.dma.module, DmaModule::Vdma);
+        let largeobj = Config::load("config/largeobj.toml").expect("config/largeobj.toml");
+        assert_eq!(largeobj.dma.module, DmaModule::LargeObj);
+    }
+
+    #[cfg(feature = "dma")]
+    fn dma_config(dma: &str) -> Result<Config, ConfigError> {
+        parse_config(&format!(
+            r#"
+            [target]
+            endpoints = ["127.0.0.1:6379"]
+            protocol = "dma"
+            [workload.values]
+            length = 4096
+            [dma]
+            {dma}
+            "#
+        ))
+    }
+
+    #[cfg(feature = "dma")]
+    #[test]
+    fn dma_module_defaults_to_largeobj() {
+        assert_eq!(dma_config("").unwrap().dma.module, DmaModule::LargeObj);
+        assert_eq!(
+            dma_config("module = \"vdma\"").unwrap().dma.module,
+            DmaModule::Vdma
+        );
+    }
+
+    #[cfg(feature = "dma")]
+    #[test]
+    fn largeobj_refuses_a_checksum() {
+        assert!(dma_config("module = \"vdma\"\nchecksum = true").is_ok());
+        let error = dma_config("checksum = true").unwrap_err();
+        assert!(error.to_string().contains("dma.checksum"), "{error}");
+    }
+
+    #[cfg(feature = "dma")]
+    #[test]
+    fn buffer_capacity_must_hold_a_value() {
+        assert!(dma_config("buffer_capacity = 4096").is_ok());
+        let error = dma_config("buffer_capacity = 4095").unwrap_err();
+        assert!(error.to_string().contains("buffer_capacity"), "{error}");
     }
 }

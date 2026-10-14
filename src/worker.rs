@@ -8,7 +8,7 @@
 use crate::client::{RequestResult, RequestType};
 #[cfg(target_os = "linux")]
 use crate::config::TimestampMode;
-use crate::config::{Config, Protocol as CacheProtocol};
+use crate::config::{Config, EndpointAllocation, Protocol as CacheProtocol};
 use crate::keydist::KeyDist;
 use crate::kvreplay::KvReplay;
 use crate::limiters::WorkerLimiter;
@@ -395,7 +395,7 @@ impl TokenSlot {
 /// token rate rather than the connection count, and the cadence that governs
 /// smoothness is set by the dispatcher alone. The two quantities come apart.
 #[derive(Default)]
-struct TokenDispatcher {
+pub(crate) struct TokenDispatcher {
     queue: RefCell<VecDeque<Rc<TokenSlot>>>,
     /// Set once the dispatcher has stopped servicing. Sticky, because `drain`
     /// can only release the waiters queued at that instant -- a connection
@@ -517,8 +517,31 @@ thread_local! {
     static DISPATCHER: RefCell<Option<Rc<TokenDispatcher>>> = const { RefCell::new(None) };
 }
 
-fn dispatcher() -> Option<Rc<TokenDispatcher>> {
+pub(crate) fn dispatcher() -> Option<Rc<TokenDispatcher>> {
     DISPATCHER.with(|d| d.borrow().clone())
+}
+
+/// One request's rate-limit token, for a connection that sends one request at
+/// a time: a token the dispatcher already granted it, else one from the
+/// limiter. The carried token is spent first because `acquire` has already
+/// debited the limiter for it; polling the limiter instead would charge the
+/// request twice and lower the achieved rate.
+#[cfg(any(feature = "dma", test))]
+pub(crate) fn take_token(carried: &mut u64, rl: &WorkerLimiter) -> bool {
+    if *carried > 0 {
+        *carried -= 1;
+        true
+    } else {
+        rl.try_wait().is_ok()
+    }
+}
+
+/// Park on the dispatcher until it grants one token, and carry the grant to
+/// the next `take_token`. Returns with nothing carried when the dispatcher
+/// drains at shutdown.
+#[cfg(any(feature = "dma", test))]
+pub(crate) async fn wait_for_token(dispatch: &Rc<TokenDispatcher>, carried: &mut u64) {
+    *carried += dispatch.acquire(1).await;
 }
 
 /// Run this worker's dispatcher until the run stops.
@@ -564,13 +587,24 @@ pub(crate) fn value_slice<'a>(
     value_len: usize,
     pool_len: usize,
 ) -> &'a [u8] {
+    let offset = value_offset(rng, value_len, pool_len);
+    &value_pool[offset..offset + value_len]
+}
+
+/// Where in the pool the next value starts.
+///
+/// The DMA path needs the offset rather than the bytes: the pool is registered with the fabric, so
+/// a transfer advertises the window in place instead of copying it anywhere.
+pub(crate) fn value_offset(
+    rng: &mut Xoshiro256PlusPlus,
+    value_len: usize,
+    pool_len: usize,
+) -> usize {
     debug_assert!(
         value_len > 0 && value_len <= pool_len,
         "value_len ({value_len}) must be in 1..={pool_len}"
     );
-    let max_offset = pool_len - value_len;
-    let offset = rng.random_range(0..=max_offset);
-    &value_pool[offset..offset + value_len]
+    rng.random_range(0..=(pool_len - value_len))
 }
 
 // ── Shared task state (Arc-wrapped, accessed by all connection tasks) ────
@@ -602,11 +636,11 @@ impl PrefillQueues {
         self.queues[endpoint_idx].lock().unwrap().push_back(key_id);
     }
 
-    fn push_front(&self, endpoint_idx: usize, key_id: usize) {
+    pub(crate) fn push_front(&self, endpoint_idx: usize, key_id: usize) {
         self.queues[endpoint_idx].lock().unwrap().push_front(key_id);
     }
 
-    fn pop_front(&self, endpoint_idx: usize) -> Option<usize> {
+    pub(crate) fn pop_front(&self, endpoint_idx: usize) -> Option<usize> {
         self.queues[endpoint_idx].lock().unwrap().pop_front()
     }
 
@@ -616,12 +650,12 @@ impl PrefillQueues {
 }
 
 /// State shared across all connection tasks spawned by a single worker.
-struct TaskSharedState {
-    config: Config,
-    shared: Arc<SharedState>,
-    ratelimiter: Option<Arc<WorkerLimiter>>,
-    value_pool: Arc<Vec<u8>>,
-    endpoints: Vec<SocketAddr>,
+pub(crate) struct TaskSharedState {
+    pub(crate) config: Config,
+    pub(crate) shared: Arc<SharedState>,
+    pub(crate) ratelimiter: Option<Arc<WorkerLimiter>>,
+    pub(crate) value_pool: Arc<Vec<u8>>,
+    pub(crate) endpoints: Vec<SocketAddr>,
     ring: ketama::Ring,
     slot_table: RwLock<Option<Vec<u16>>>,
     /// Per-endpoint prefill key queues, SHARED across all workers (one queue
@@ -629,7 +663,7 @@ struct TaskSharedState {
     /// the full keyspace so any worker's connection-task can drain the queue
     /// for the endpoint it serves — required when connections-per-worker is
     /// fewer than the number of cluster nodes.
-    prefill_queues: Arc<PrefillQueues>,
+    pub(crate) prefill_queues: Arc<PrefillQueues>,
     /// Per-endpoint append queues, SHARED across all workers. The runner
     /// enqueues each batch; writer connection tasks drain the queue for the
     /// endpoint they serve. Empty queues when no append stream is configured.
@@ -639,25 +673,25 @@ struct TaskSharedState {
     append_ratelimiter: Option<Arc<Ratelimiter>>,
     /// Per-endpoint key-id lists for steady-state key selection (see
     /// `BenchWorkerConfig::endpoint_keys`). Empty for single-endpoint setups.
-    endpoint_keys: Arc<Vec<Vec<u32>>>,
+    pub(crate) endpoint_keys: Arc<Vec<Vec<u32>>>,
     /// Worker ID for logging.
-    worker_id: usize,
+    pub(crate) worker_id: usize,
     /// Whether backfill_on_miss is enabled.
-    backfill_on_miss: bool,
+    pub(crate) backfill_on_miss: bool,
     /// Whether TLS is enabled for connections.
     tls_enabled: bool,
     /// SNI server name for TLS connections.
     tls_server_name: Option<String>,
     /// Steady-state key-id distribution (see `BenchWorkerConfig::key_dist`).
-    key_dist: Arc<KeyDist>,
+    pub(crate) key_dist: Arc<KeyDist>,
     /// See `BenchWorkerConfig::kv_replay`.
     kv_replay: Option<Arc<KvReplay>>,
 }
 
 /// State shared between the BenchHandler (on_tick) and connection tasks.
 /// Wrapped in Arc so on_tick and spawned tasks can both access it.
-struct SharedWorkerState {
-    task_state: Arc<TaskSharedState>,
+pub(crate) struct SharedWorkerState {
+    pub(crate) task_state: Arc<TaskSharedState>,
     /// Prefill tracking: total keys assigned to this worker.
     prefill_total: usize,
     /// Number of prefill keys confirmed by this worker.
@@ -669,16 +703,16 @@ struct SharedWorkerState {
 }
 
 impl SharedWorkerState {
-    fn is_prefill_done(&self) -> bool {
+    pub(crate) fn is_prefill_done(&self) -> bool {
         self.prefill_done.load(Ordering::Acquire) != 0
     }
 
-    fn is_precheck_done(&self) -> bool {
+    pub(crate) fn is_precheck_done(&self) -> bool {
         self.precheck_done.load(Ordering::Acquire) != 0
     }
 
     /// Mark this worker's precheck as complete (only the first connection to succeed does this).
-    fn mark_precheck_done(&self) {
+    pub(crate) fn mark_precheck_done(&self) {
         if self
             .precheck_done
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
@@ -733,9 +767,10 @@ impl AsyncEventHandler for BenchHandler {
                 DISPATCHER.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&dispatch)));
                 let shared = Arc::clone(&worker_state.task_state.shared);
                 if let Err(e) = ringline::spawn(run_dispatcher(dispatch, rl, shared)) {
-                    // Without it every connection falls back to the bounded
-                    // wait in `acquire`, which still makes progress -- but it
-                    // is the old per-connection poll, so say so.
+                    // Without it `dispatcher()` returns `None` and every
+                    // connection falls back to polling the limiter on a short
+                    // sleep, which still makes progress -- but it is the old
+                    // per-connection poll, so say so.
                     tracing::error!(
                         worker = worker_id,
                         "failed to spawn rate-limit dispatcher: {e}; \
@@ -766,6 +801,22 @@ impl AsyncEventHandler for BenchHandler {
                 }
                 CacheProtocol::MemcacheBinary => {
                     spawn_protocol_tasks(&worker_state, my_connections, worker_id);
+                }
+                // The fabric endpoint opens before any connection task, so a card that will not
+                // open fails at startup rather than once per connection.
+                #[cfg(feature = "dma")]
+                CacheProtocol::Dma => {
+                    if crate::dma::open_fabric(
+                        worker_id,
+                        &worker_state.task_state.config,
+                        &worker_state.task_state.value_pool,
+                    ) {
+                        spawn_protocol_tasks(&worker_state, my_connections, worker_id);
+                    }
+                }
+                #[cfg(not(feature = "dma"))]
+                CacheProtocol::Dma => {
+                    tracing::error!("dma protocol requires a build with --features dma");
                 }
             }
             spawn_append_tasks(&worker_state, worker_id);
@@ -954,9 +1005,21 @@ fn spawn_protocol_tasks(
     let protocol = worker_state.task_state.config.target.protocol;
     let seed = run_seed(&worker_state.task_state.config);
 
+    // Every worker computes the same assignment and takes its own slice of it.
+    let assignment = connection_endpoints(
+        worker_state
+            .task_state
+            .config
+            .connection
+            .endpoint_allocation,
+        &worker_state.task_state.key_dist,
+        total_connections,
+        num_endpoints,
+    );
+
     for i in 0..my_connections {
         let global_conn_idx = my_start + i;
-        let endpoint_idx = global_conn_idx % num_endpoints;
+        let endpoint_idx = assignment[global_conn_idx];
         let state = Arc::clone(worker_state);
         let session_seed = connection_seed(seed, SeedRole::Reader, worker_id, i);
 
@@ -975,6 +1038,13 @@ fn spawn_protocol_tasks(
                 CacheProtocol::Ping => {
                     ping_connection_task(state, endpoint_idx, session_seed).await;
                 }
+                #[cfg(feature = "dma")]
+                CacheProtocol::Dma => {
+                    crate::dma::dma_connection_task(state, endpoint_idx, session_seed).await;
+                }
+                // Refused in `on_start`, so no task is ever spawned for it.
+                #[cfg(not(feature = "dma"))]
+                CacheProtocol::Dma => {}
             }
         }) {
             tracing::error!(
@@ -985,6 +1055,93 @@ fn spawn_protocol_tasks(
             metrics::CONNECTIONS_FAILED.increment();
         }
     }
+}
+
+/// The endpoint each of the run's `total` connections serves, indexed by
+/// global connection index. `key_share` with a per-endpoint zipf sampler gives
+/// `key_share_endpoints`; otherwise connection `i` serves endpoint
+/// `i % num_endpoints`.
+fn connection_endpoints(
+    allocation: EndpointAllocation,
+    key_dist: &KeyDist,
+    total: usize,
+    num_endpoints: usize,
+) -> Vec<usize> {
+    if allocation == EndpointAllocation::KeyShare
+        && let Some(z) = key_dist.endpoint_sampler()
+    {
+        return key_share_endpoints(z.shares(), total);
+    }
+    (0..total).map(|i| i % num_endpoints).collect()
+}
+
+/// Endpoint index for each of `total` global connection indices, with endpoint
+/// `e` getting about `shares[e] * total` connections: at least one if it owns
+/// any keys, none if it owns none. A connection to an endpoint with no keys
+/// would claim rate-limit tokens it can never spend.
+///
+/// Counts: floor of each target, raised to 1 for endpoints with keys, then
+/// adjusted one connection at a time toward the endpoints furthest below (or
+/// above) their target until they sum to `total`. Order: endpoint `e`'s `k`-th
+/// connection is placed at `(k + 0.5) / count_e` and all are sorted by that
+/// position, so every contiguous range of indices (one worker's connections)
+/// carries a mix of endpoints in roughly the same proportions.
+///
+/// With fewer connections than endpoints that own keys, the minimum of one each
+/// cannot be met; that falls back to round-robin over those endpoints. Config
+/// validation rejects fewer connections than endpoints for a static list.
+#[doc(hidden)]
+pub fn key_share_endpoints(shares: &[f64], total: usize) -> Vec<usize> {
+    let n = shares.len();
+    let live: Vec<usize> = (0..n).filter(|&e| shares[e] > 0.0).collect();
+    if live.is_empty() || total < live.len() {
+        let pool: Vec<usize> = if live.is_empty() {
+            (0..n.max(1)).collect()
+        } else {
+            live
+        };
+        return (0..total).map(|i| pool[i % pool.len()]).collect();
+    }
+    let target: Vec<f64> = shares.iter().map(|s| s * total as f64).collect();
+    let mut count: Vec<usize> = (0..n)
+        .map(|e| {
+            if shares[e] > 0.0 {
+                (target[e].floor() as usize).max(1)
+            } else {
+                0
+            }
+        })
+        .collect();
+    let mut sum: usize = count.iter().sum();
+    while sum < total {
+        let e = live
+            .iter()
+            .copied()
+            .max_by(|&a, &b| {
+                (target[a] - count[a] as f64).total_cmp(&(target[b] - count[b] as f64))
+            })
+            .expect("live is not empty");
+        count[e] += 1;
+        sum += 1;
+    }
+    while sum > total {
+        let e = (0..n)
+            .filter(|&e| count[e] > 1)
+            .min_by(|&a, &b| {
+                (target[a] - count[a] as f64).total_cmp(&(target[b] - count[b] as f64))
+            })
+            .expect("total >= live endpoints, so some endpoint has more than one");
+        count[e] -= 1;
+        sum -= 1;
+    }
+    let mut slots: Vec<(f64, usize)> = Vec::with_capacity(total);
+    for (e, &c) in count.iter().enumerate() {
+        for k in 0..c {
+            slots.push(((k as f64 + 0.5) / c as f64, e));
+        }
+    }
+    slots.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    slots.into_iter().map(|(_, e)| e).collect()
 }
 
 // ── Connection establishment helper ──────────────────────────────────────
@@ -1006,7 +1163,7 @@ fn spawn_protocol_tasks(
 /// A connect that ringline cannot submit (no free connection slot, no TLS
 /// client config) fails when the future is first polled, so it is counted and
 /// logged as a failed connect like any other.
-async fn establish_connection(
+pub(crate) async fn establish_connection(
     endpoint: SocketAddr,
     worker_id: usize,
     tls_server_name: Option<&str>,
@@ -1058,7 +1215,10 @@ async fn establish_connection(
 
 /// Resolve the TLS server name for an endpoint from task shared state.
 /// Returns None if TLS is disabled, otherwise the explicit hostname or the IP string.
-fn resolve_tls_server_name(state: &TaskSharedState, endpoint: SocketAddr) -> Option<String> {
+pub(crate) fn resolve_tls_server_name(
+    state: &TaskSharedState,
+    endpoint: SocketAddr,
+) -> Option<String> {
     if !state.tls_enabled {
         return None;
     }
@@ -1501,16 +1661,14 @@ async fn drive_resp_workload(
                 // list reproduces the global distribution exactly, so the fast
                 // path is free.
                 //
-                // SKEWED + multi-endpoint: the fast path would be WRONG. Drawing
-                // uniformly from each endpoint's own bucket makes every shard see
-                // a uniform workload and equal load, which is precisely the hot-
-                // shard effect a skewed keyspace exists to measure. So draw from
-                // the global distribution and reject-route, exactly as the RESP
-                // path does. A rejected draw must NOT consume a rate-limit token:
-                // because tokens are only spent on a match, each endpoint ends up
-                // receiving traffic in proportion to the share of the key
-                // distribution it owns -- which is the imbalance we want, not an
-                // artifact to correct for.
+                // ZIPF + multi-endpoint: draw from the zipf distribution
+                // restricted to this endpoint's keys (`EndpointZipf`), which is
+                // the distribution rejection-routing produces, in O(1) instead of
+                // ~1/P(endpoint) draw+render+route attempts per request.
+                //
+                // Other skewed distributions (recency, whose head moves) draw
+                // from the global distribution and reject-route. A rejected draw
+                // does not consume a rate-limit token.
                 let key_id = if !multi_endpoint {
                     state.task_state.key_dist.sample(rng)
                 } else if matches!(&*state.task_state.key_dist, KeyDist::Uniform { .. }) {
@@ -1521,6 +1679,12 @@ async fn drive_resp_workload(
                         break;
                     }
                     bucket[rng.random_range(0..bucket.len())] as usize
+                } else if let Some(by_endpoint) = state.task_state.key_dist.endpoint_sampler() {
+                    match by_endpoint.sample(endpoint_idx, rng) {
+                        Some(k) => k,
+                        // Endpoint owns no keys; yield to recv.
+                        None => break,
+                    }
                 } else {
                     let mut attempts = 0usize;
                     let max_attempts = max_routing_attempts(num_endpoints);
@@ -2768,7 +2932,7 @@ async fn drive_ping_workload(
 // ── Prefill helpers ──────────────────────────────────────────────────────
 
 /// Confirm a single prefill key was successfully stored.
-fn confirm_prefill_key(state: &Arc<SharedWorkerState>) {
+pub(crate) fn confirm_prefill_key(state: &Arc<SharedWorkerState>) {
     // Increment global counter (used by runner for progress reporting).
     state
         .task_state
@@ -2892,8 +3056,9 @@ fn spawn_append_tasks(worker_state: &Arc<SharedWorkerState>, worker_id: usize) {
                 CacheProtocol::Memcache | CacheProtocol::MemcacheBinary => {
                     memcache_append_task(state, endpoint_idx, seed).await;
                 }
-                // Rejected by config validation: ping has no SET.
-                CacheProtocol::Ping => {}
+                // Rejected by config validation: ping has no SET, and the
+                // DMA path has no append writer.
+                CacheProtocol::Ping | CacheProtocol::Dma => {}
             }
         }) {
             tracing::error!(
@@ -3724,12 +3889,12 @@ pub(crate) fn record_counters(result: &RequestResult) {
 /// hashing; the multiplier provides enough headroom that hitting the cap is
 /// vanishingly unlikely in a healthy setup, while still bounding CPU if the
 /// hash distribution is degenerate (e.g. a tiny keyspace).
-fn max_routing_attempts(num_endpoints: usize) -> usize {
+pub(crate) fn max_routing_attempts(num_endpoints: usize) -> usize {
     num_endpoints.saturating_mul(64).max(64)
 }
 
 /// Route a key to an endpoint index.
-fn route_key(state: &TaskSharedState, key: &[u8]) -> usize {
+pub(crate) fn route_key(state: &TaskSharedState, key: &[u8]) -> usize {
     let slot_table = state.slot_table.read().unwrap();
     route_partition(&slot_table, &state.ring, state.endpoints.len(), key)
 }
@@ -3811,7 +3976,8 @@ pub(crate) fn build_prefill_queues(
 /// plain random key-id over the whole keyspace (no routing needed). Routing
 /// uses the same slot table / ketama ring as `build_prefill_queues`, so the
 /// partition matches the prefill partition.
-pub(crate) fn build_endpoint_keys(
+#[doc(hidden)]
+pub fn build_endpoint_keys(
     key_count: usize,
     key_len: usize,
     endpoints: &[SocketAddr],
@@ -3840,7 +4006,8 @@ pub(crate) fn build_endpoint_keys(
 /// `run_benchmark_full` before any key is generated. See `config::KeyFormat`.
 pub(crate) static KEY_FORMAT: AtomicU8 = AtomicU8::new(0);
 
-fn write_key(buf: &mut [u8], id: usize) {
+#[doc(hidden)]
+pub fn write_key(buf: &mut [u8], id: usize) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     // Canonical UUID form: 8-4-4-4-12 hex with dashes at indices 8/13/18/23.
     // A typical UUID parser accepts any hex in those positions, and the trailing
@@ -3922,6 +4089,166 @@ mod tests {
         assert_eq!(order, [2, 3, 4]);
     }
 
+    /// 48 endpoints, 100,000 keys, theta 0.99, 1,536 connections: the
+    /// geometry of the runs this option exists for.
+    fn key_share_fixture() -> (Arc<Vec<Vec<u32>>>, KeyDist, usize) {
+        let endpoints: Vec<SocketAddr> = (0..48)
+            .map(|i| format!("172.31.0.10:{}", 6379 + i).parse().unwrap())
+            .collect();
+        let n = 100_000;
+        let keys = Arc::new(build_endpoint_keys(n, 16, &endpoints, &None));
+        let d = KeyDist::zipf(n, 0.99).with_endpoint_keys(&keys);
+        (keys, d, 1_536)
+    }
+
+    #[test]
+    fn connections_follow_the_configured_allocation() {
+        let (_, d, total) = key_share_fixture();
+        let shares = d.endpoint_sampler().unwrap().shares();
+        assert_eq!(
+            connection_endpoints(EndpointAllocation::KeyShare, &d, total, 48),
+            key_share_endpoints(shares, total)
+        );
+        let even: Vec<usize> = (0..total).map(|i| i % 48).collect();
+        assert_eq!(
+            connection_endpoints(EndpointAllocation::Even, &d, total, 48),
+            even
+        );
+        // Without a per-endpoint sampler (uniform keys), key_share is round-robin.
+        assert_eq!(
+            connection_endpoints(
+                EndpointAllocation::KeyShare,
+                &KeyDist::uniform(1000),
+                total,
+                48
+            ),
+            even
+        );
+    }
+
+    #[test]
+    fn key_share_connection_counts_track_zipf_shares() {
+        let (_, d, total) = key_share_fixture();
+        let shares = d.endpoint_sampler().unwrap().shares();
+        let a = key_share_endpoints(shares, total);
+        assert_eq!(a.len(), total);
+        let mut count = vec![0usize; shares.len()];
+        for &e in &a {
+            count[e] += 1;
+        }
+        for (e, &c) in count.iter().enumerate() {
+            assert!(c >= 1, "endpoint {e} has no connection");
+            // Rounding to whole connections: within one connection of target.
+            let err = (c as f64 - shares[e] * total as f64).abs();
+            assert!(
+                err < 1.0,
+                "endpoint {e}: {c} connections, target {:.2}",
+                shares[e] * total as f64
+            );
+        }
+        // Each worker's contiguous slice (48 threads x 32) mixes endpoints.
+        for w in a.chunks(32) {
+            let mut seen = w.to_vec();
+            seen.sort_unstable();
+            seen.dedup();
+            assert!(
+                seen.len() >= 16,
+                "a 32-connection slice covers only {} endpoints",
+                seen.len()
+            );
+        }
+    }
+
+    /// 128 keys over 48 endpoints (16 GiB of 128 MiB values): some endpoints
+    /// own no keys and must get no connection, the rest at least one.
+    #[test]
+    fn key_share_gives_keyless_endpoints_no_connections() {
+        let endpoints: Vec<SocketAddr> = (0..48)
+            .map(|i| format!("172.31.0.10:{}", 6379 + i).parse().unwrap())
+            .collect();
+        let keys = Arc::new(build_endpoint_keys(128, 16, &endpoints, &None));
+        let empty = keys.iter().filter(|b| b.is_empty()).count();
+        assert!(empty > 0, "fixture should leave some endpoint without keys");
+        let d = KeyDist::zipf(128, 0.99).with_endpoint_keys(&keys);
+        let a = key_share_endpoints(d.endpoint_sampler().unwrap().shares(), 1_536);
+        assert_eq!(a.len(), 1_536);
+        let mut count = vec![0usize; keys.len()];
+        for &e in &a {
+            count[e] += 1;
+        }
+        for (e, bucket) in keys.iter().enumerate() {
+            if bucket.is_empty() {
+                assert_eq!(count[e], 0, "endpoint {e} owns no keys but has connections");
+            } else {
+                assert!(
+                    count[e] >= 1,
+                    "endpoint {e} owns keys but has no connection"
+                );
+            }
+        }
+    }
+
+    /// Simulates a rate-limited run in which every connection receives the
+    /// same number of tokens, and checks what the servers see in aggregate.
+    /// Under `key_share` each endpoint's request share is within 0.07
+    /// percentage points (one connection in 1,536) of its zipf share, and the
+    /// ten hottest keys' shares are within 0.3 points of the global zipf pmf.
+    /// Under round-robin the hottest key's share is far off, which is the
+    /// control showing the check can fail.
+    #[test]
+    fn key_share_gives_endpoints_their_zipf_request_share() {
+        let (keys, d, total) = key_share_fixture();
+        let by_ep = d.endpoint_sampler().unwrap();
+        let shares = by_ep.shares().to_vec();
+        let n = 100_000usize;
+        let norm: f64 = (0..n).map(|i| (i as f64 + 1.0).powf(-0.99)).sum();
+        let pmf = |id: usize| (id as f64 + 1.0).powf(-0.99) / norm;
+        let per_conn = 400;
+        let run = |assignment: &[usize]| {
+            let mut rng = Xoshiro256PlusPlus::seed_from_u64(7);
+            let mut by_endpoint = vec![0usize; keys.len()];
+            let mut hot = [0usize; 10];
+            for &e in assignment {
+                for _ in 0..per_conn {
+                    let id = by_ep.sample(e, &mut rng).unwrap();
+                    by_endpoint[e] += 1;
+                    if id < 10 {
+                        hot[id] += 1;
+                    }
+                }
+            }
+            (by_endpoint, hot)
+        };
+        let requests = (total * per_conn) as f64;
+
+        let (by_endpoint, hot) = run(&key_share_endpoints(&shares, total));
+        for (e, &r) in by_endpoint.iter().enumerate() {
+            let got = r as f64 / requests;
+            assert!(
+                (got - shares[e]).abs() < 1.0 / total as f64,
+                "endpoint {e}: request share {got:.4}, zipf share {:.4}",
+                shares[e]
+            );
+        }
+        for (id, &h) in hot.iter().enumerate() {
+            let got = h as f64 / requests;
+            assert!(
+                (got - pmf(id)).abs() < 0.003,
+                "key {id}: share {got:.4}, zipf {:.4}",
+                pmf(id)
+            );
+        }
+
+        let round_robin: Vec<usize> = (0..total).map(|i| i % keys.len()).collect();
+        let (_, hot) = run(&round_robin);
+        let got = hot[0] as f64 / requests;
+        assert!(
+            (got - pmf(0)).abs() > 0.03,
+            "round-robin unexpectedly matched zipf for key 0: {got:.4} vs {:.4}",
+            pmf(0)
+        );
+    }
+
     /// A dispatcher with a slot already queued, without needing an executor:
     /// `dispatch` and `drain` are synchronous, and they are where every bug in
     /// this type has been so far.
@@ -3995,6 +4322,46 @@ mod tests {
         };
         let mut cx = Context::from_waker(Waker::noop());
         Pin::new(&mut wait).poll(&mut cx).is_ready()
+    }
+
+    #[test]
+    fn a_carried_token_is_spent_before_the_limiter() {
+        let rl = WorkerLimiter::per_second(1, 1);
+        let mut carried = 1;
+        assert!(take_token(&mut carried, &rl));
+        assert_eq!(carried, 0);
+        assert!(
+            rl.try_wait().is_ok(),
+            "a carried token must not debit the limiter"
+        );
+        assert!(
+            !take_token(&mut carried, &rl),
+            "nothing carried, limiter empty"
+        );
+    }
+
+    #[test]
+    fn a_granted_token_is_carried_to_the_next_request() {
+        let d = Rc::new(TokenDispatcher::default());
+        // Holds two, so a claim for more than one token would be granted it.
+        let rl = limiter(2);
+        let mut carried = 0;
+        {
+            let mut wait = std::pin::pin!(wait_for_token(&d, &mut carried));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(wait.as_mut().poll(&mut cx).is_pending());
+            d.dispatch(&rl);
+            assert!(wait.as_mut().poll(&mut cx).is_ready());
+        }
+        assert_eq!(carried, 1, "one token granted and kept, not dropped");
+        assert!(
+            take_token(&mut carried, &rl),
+            "and pays for the next request"
+        );
+        assert_eq!(carried, 0);
+        // The grant debited one of the two; spending it must not debit another.
+        assert!(rl.try_wait().is_ok(), "one token left in the limiter");
+        assert!(rl.try_wait().is_err());
     }
 
     #[test]
