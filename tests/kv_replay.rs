@@ -736,3 +736,21 @@ fn kv_replay_read_error_after_the_start_fails_the_run_after_the_rows_before_it()
         },
     );
 }
+
+/// KV replay whose trace finishes during warmup: nothing is recorded, and the
+/// run fails rather than reporting the warmup traffic as its result.
+#[test]
+fn kv_replay_trace_finished_during_warmup_fails_the_run() {
+    common::kv::isolated(
+        "kv_replay_trace_finished_during_warmup_fails_the_run",
+        || {
+            let ct = CHUNK_TOKENS;
+            let server = Server::default();
+            let trace = write_trace(&[request(1, 0, &[1], ct), request(2, 0, &[1], ct)]);
+            let (result, rows) = replay_file(&server, trace, "general.warmup = \"3s\"", 1, "resp");
+            let err = result.unwrap_err();
+            assert!(err.contains("finished during warmup"), "{err}");
+            assert_eq!(rows.len(), 2, "{rows:?}");
+        },
+    );
+}

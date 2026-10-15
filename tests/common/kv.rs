@@ -449,11 +449,23 @@ pub fn replay_file(
     } else {
         "speedup = 0"
     };
+    // A line `general.<key> = <value>` in `kv_toml` sets that one `[general]`
+    // key in place of the default `warmup = "0s"`.
+    let general_toml = kv_toml
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("general."))
+        .unwrap_or("warmup = \"0s\"")
+        .to_string();
+    let kv_toml: String = kv_toml
+        .lines()
+        .filter(|l| !l.trim().starts_with("general."))
+        .collect::<Vec<_>>()
+        .join("\n");
     let toml = format!(
         r#"
         [general]
         duration = "20s"
-        warmup = "0s"
+        {general_toml}
         threads = 1
 
         [target]

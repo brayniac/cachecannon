@@ -1044,12 +1044,13 @@ async fn run_request(
         return Ok(o);
     }
 
-    // The trace was checked against the mapper at load.
+    // RequestReader rejects chunk ids that do not fit an object id (2^48 or
+    // more) as it reads each row.
     s.objects.clear();
     s.objects.extend(
         kv.mapper
             .objects(&req.chunks)
-            .expect("chunk ids checked at load"),
+            .expect("RequestReader rejects chunk ids >= 2^48"),
     );
     s.keys.clear();
     s.key_ends.clear();

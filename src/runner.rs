@@ -92,8 +92,10 @@ pub fn run_benchmark_full(
         "rng seed (set general.seed = {seed} to repeat this key sequence)"
     );
 
-    // KV-cache replay: read the trace and the model geometry before anything
-    // starts, so a bad trace or an unsupported model fails the run here.
+    // KV-cache replay: open the trace, read its first request and max_chunks,
+    // and read the model geometry before anything starts, so an unreadable
+    // trace or an unsupported model fails the run here. A read error later in
+    // the trace is found by the reader thread (see `wait_read_ahead`).
     let kv_replay = match config.workload.kv_replay {
         Some(ref kv) => Some(Arc::new(KvReplay::load(kv)?)),
         None => None,
@@ -433,6 +435,9 @@ pub fn run_benchmark_full(
     let mut current_phase = Phase::Precheck;
 
     let mut actual_duration = duration;
+    // Set when a KV replay's trace finished before recording started; the
+    // run then fails after its results.
+    let mut kv_finished_in_warmup = false;
 
     // Saturation search state (initialized after warmup if configured)
     let mut saturation_state: Option<SaturationSearchState> = None;
@@ -709,10 +714,7 @@ pub fn run_benchmark_full(
         // A KV replay also ends when every trace request has finished.
         let kv_done = kv_replay.as_ref().is_some_and(|kv| kv.is_finished());
         if kv_done && running_start.is_none() {
-            tracing::warn!(
-                "the kv replay trace finished during warmup; nothing was recorded \
-                 (lower general.warmup)"
-            );
+            kv_finished_in_warmup = true;
             actual_duration = Duration::ZERO;
         }
         if saturation_done || kv_done || (time_done && !has_saturation) {
@@ -1092,6 +1094,15 @@ pub fn run_benchmark_full(
     // fails, because it did not replay the trace it was given.
     if let Some(e) = kv_replay.as_ref().and_then(|kv| kv.trace_error()) {
         return Err(e.into());
+    }
+    // The totals above are warmup traffic with no recording phase; a script
+    // reading them or the exit status must not take them for a result.
+    if kv_finished_in_warmup {
+        return Err(
+            "kv_replay: the trace finished during warmup, so nothing was recorded; \
+                    lower general.warmup"
+                .into(),
+        );
     }
     let read_waits = metrics::KV_TRACE_READ_WAITS.value();
     if read_waits > 0 {
@@ -1585,13 +1596,18 @@ impl SendLoad {
     }
 
     /// Send-pool slots of the largest lookup pipeline, sent whole.
-    fn lookup_slots(&self) -> usize {
-        let per_slot = if self.tls {
+    /// Bytes of a lookup one send-pool slot carries: one TLS record's
+    /// plaintext under TLS, else one ringline slot.
+    fn slot_bytes(&self) -> usize {
+        if self.tls {
             TLS_RECORD_PLAINTEXT
         } else {
             RINGLINE_SEND_SLOT_SIZE as usize
-        };
-        self.lookup_bytes.div_ceil(per_slot)
+        }
+    }
+
+    fn lookup_slots(&self) -> usize {
+        self.lookup_bytes.div_ceil(self.slot_bytes())
     }
 }
 
@@ -1630,7 +1646,7 @@ fn check_send_pool(loads: &[SendLoad], num_threads: usize) -> Result<Option<Stri
             "kv_replay: the largest request's lookup needs {} send-pool slots of {} bytes, more \
              than ringline's per-worker maximum of {max}, so it can never be sent ({})",
             l.lookup_slots(),
-            RINGLINE_SEND_SLOT_SIZE,
+            l.slot_bytes(),
             describe(l)
         ));
     }

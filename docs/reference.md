@@ -338,7 +338,9 @@ Rejected at config load: protocols other than `resp` and `resp3`, more than one
 endpoint, `cluster = true`, `connection.pipeline_depth = 0`, `tp` other than 1, `rate_limit`, `[workload.saturation_search]`,
 `prefill`, `backfill_on_miss`, `read_values` and `[workload.append]`. Rejected
 when the run starts: an empty trace, a trace file kvtrace cannot open, and a
-model with recurrent state (a hybrid linear-attention model). A read error
+model with recurrent state (a hybrid linear-attention model), and a trace
+whose largest request's lookup needs more send-pool slots than ringline's
+per-worker maximum of 65,535. A read error
 (a corrupt batch, a row out of timestamp order) found while the reader fills
 its first 16,384 requests ends the run after precheck, before any trace
 request is sent; a corrupt batch is found when the reader reaches its first
@@ -381,8 +383,11 @@ The EXISTS, GETs and SETs are also counted in `requests`, `responses`,
 `misses`. EXISTS have no per-operation latency: the lookup is sent as one
 pipeline whose replies arrive together.
 
-The clean and verbose formats print the same totals and distributions under
-"KV Replay".
+The clean and verbose formats print the request and token totals,
+`full_hits`, `misses_at_chunk_0`, `get_nil` and the distributions; `exists`
+and `no_full_chunk` are in the JSON only. A trace that finishes during
+`general.warmup` records nothing, and the run exits with an error after its
+results, whose totals are then warmup traffic.
 
 `requests_out` columns, one row per trace request that completed, in completion
 order:
@@ -399,7 +404,7 @@ order:
 | `cached_tokens`, `new_tokens` | As in the result |
 | `gets`, `get_nil`, `sets` | Operations the request sent |
 | `lookup_ns`, `load_ns`, `store_ns` | As in the result; 0 when there was no such step |
-| `recorded` | 1 if the request finished during recording, 0 during warmup |
+| `recorded` | 1 if the request finished during recording, 0 during warmup, read from the phase when it finished. A request finishing at the warmup-to-recording transition can be on either side of the JSON totals |
 
 ### Saturation Search Settings
 

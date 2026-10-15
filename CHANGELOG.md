@@ -20,9 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   length. A read error, including a row out of order, found while the reader
   fills its first 16,384 requests fails the run before any trace request is
   sent; one found later stops the replay at that row and fails the run after
-  printing results. Per
-  trace request:
-  one pipelined EXISTS per object, a GET of each object in the hit prefix,
+  printing results. A trace that finishes during warmup fails the run. Per
+  trace request: one pipelined EXISTS per object, a GET of each object in the hit prefix,
   then SETs from the end of the prefix (`write_rule = "set-from-miss"`,
   the default) or of every object EXISTS did not find
   (`"insert-if-absent"`). A full-prompt hit counts `input_tokens - 1` as
@@ -31,7 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The run ends when the trace is exhausted or at `duration`. Hybrid models
   are rejected. The JSON result gains a `kv_replay` object (totals, and
   per-request lookup, load, store, load per 1,000 cached tokens and schedule
-  lag distributions); the clean and verbose outputs print the same, and
+  lag distributions); the clean and verbose outputs print the request and
+  token totals and the distributions, and
   `requests_out` writes one CSV row per completed trace request (failed
   requests have none). EXISTS, GET and SET
   are also counted in `requests`, `responses`, the GET and SET latency

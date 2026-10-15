@@ -386,8 +386,7 @@ pub struct KvReplay {
     /// so only rank 0 stores, at full size. A `model_config` says this itself.
     #[serde(default)]
     pub mla: bool,
-    /// Tensor-parallel degree: dense models store one object per rank per
-    /// chunk. Default 1.
+    /// Tensor-parallel degree. Must be 1 (cachecannon#214). Default 1.
     #[serde(default = "default_kv_tp")]
     pub tp: u64,
     /// Which objects a request writes after its lookup. Default
