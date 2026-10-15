@@ -850,7 +850,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             workload_line(&config),
-            "kv_replay r.parquet, closed loop, model config.json (fp8), set-from-miss"
+            "kv_replay r.parquet, closed-loop, model config.json (fp8), set-from-miss"
         );
         let config: Config =
             toml::from_str("[target]\nendpoints = [\"127.0.0.1:6379\"]\n").unwrap();

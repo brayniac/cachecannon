@@ -588,7 +588,7 @@ Results:
 Newline-delimited JSON (NDJSON) for programmatic consumption:
 
 ```json
-{"type":"config","protocol":"resp","endpoints":["127.0.0.1:6379"],"threads":4,...}
+{"type":"config","target":"127.0.0.1:6379","protocol":"Resp","tls":false,"threads":4,"conns":64,"pipeline":32,"keyspace":1000000,...}
 {"type":"sample","time":1.0,"requests":523847,"errors":0,"hit_rate":0.792,"p50":48000,...}
 {"type":"sample","time":2.0,"requests":531294,"errors":0,"hit_rate":0.794,"p50":47000,...}
 {"type":"result","duration":60.0,"total_requests":31847291,"throughput":530788,...}

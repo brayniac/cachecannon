@@ -36,7 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `requests_out` writes one CSV row per completed trace request (failed
   requests have none). EXISTS, GET and SET
   are also counted in `requests`, `responses`, the GET and SET latency
-  histograms and the byte counters. Existing JSON fields are unchanged. New
+  histograms and the byte counters. Existing JSON fields are unchanged, except that a KV
+  replay's `config` line omits `keyspace`, `key_size` and `value_size`. New
   `kv_*` counters and histograms are registered statically, like every
   metric here, so `/metrics`, `/metrics/binary`, `/metrics/stream` and the
   parquet recording of every run now carry them, as zeros when
