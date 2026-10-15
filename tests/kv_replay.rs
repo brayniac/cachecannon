@@ -749,7 +749,7 @@ fn kv_replay_trace_finished_during_warmup_fails_the_run() {
             let trace = write_trace(&[request(1, 0, &[1], ct), request(2, 0, &[1], ct)]);
             let (result, rows) = replay_file(&server, trace, "general.warmup = \"3s\"", 1, "resp");
             let err = result.unwrap_err();
-            assert!(err.contains("finished during warmup"), "{err}");
+            assert!(err.contains("finished before recording started"), "{err}");
             assert_eq!(rows.len(), 2, "{rows:?}");
         },
     );

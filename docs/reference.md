@@ -337,7 +337,7 @@ during `general.warmup` are not recorded.
 Rejected at config load: protocols other than `resp` and `resp3`, more than one
 endpoint, `cluster = true`, `connection.pipeline_depth = 0`, `tp` other than 1, `rate_limit`, `[workload.saturation_search]`,
 `prefill`, `backfill_on_miss`, `read_values` and `[workload.append]`. Rejected
-when the run starts: an empty trace, a trace file kvtrace cannot open, and a
+when the run starts: an empty trace, a trace file kvtrace cannot open, a
 model with recurrent state (a hybrid linear-attention model), and a trace
 whose largest request's lookup needs more send-pool slots than ringline's
 per-worker maximum of 65,535. A read error
@@ -384,10 +384,12 @@ The EXISTS, GETs and SETs are also counted in `requests`, `responses`,
 pipeline whose replies arrive together.
 
 The clean and verbose formats print the request and token totals,
-`full_hits`, `misses_at_chunk_0`, `get_nil` and the distributions; `exists`
-and `no_full_chunk` are in the JSON only. A trace that finishes during
-`general.warmup` records nothing, and the run exits with an error after its
-results, whose totals are then warmup traffic.
+`full_hits`, `misses_at_chunk_0`, `get_nil` and the distributions; `exists`,
+`no_full_chunk` and each distribution's `count` are in the JSON only. A trace
+that finishes before recording starts (during `general.warmup`) records
+nothing, and the run exits with an error after its results. In those results
+the `kv_replay` totals are 0, and the run totals (`requests`, `responses`,
+GET and SET counts and latencies) count the warmup traffic.
 
 `requests_out` columns, one row per trace request that completed, in completion
 order:

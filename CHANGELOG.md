@@ -20,9 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   length. A read error, including a row out of order, found while the reader
   fills its first 16,384 requests fails the run before any trace request is
   sent; one found later stops the replay at that row and fails the run after
-  printing results. A trace that finishes during warmup fails the run. Per
-  trace request: one pipelined EXISTS per object, a GET of each object in the hit prefix,
-  then SETs from the end of the prefix (`write_rule = "set-from-miss"`,
+  printing results. A trace that finishes before recording starts fails the
+  run. Per trace request: one pipelined EXISTS per object, a GET of each
+  object in the hit prefix, then SETs from the end of the prefix (`write_rule = "set-from-miss"`,
   the default) or of every object EXISTS did not find
   (`"insert-if-absent"`). A full-prompt hit counts `input_tokens - 1` as
   cached. Requests start at the trace's timestamps divided by `speedup`, or

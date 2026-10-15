@@ -435,9 +435,6 @@ pub fn run_benchmark_full(
     let mut current_phase = Phase::Precheck;
 
     let mut actual_duration = duration;
-    // Set when a KV replay's trace finished before recording started; the
-    // run then fails after its results.
-    let mut kv_finished_in_warmup = false;
 
     // Saturation search state (initialized after warmup if configured)
     let mut saturation_state: Option<SaturationSearchState> = None;
@@ -714,7 +711,6 @@ pub fn run_benchmark_full(
         // A KV replay also ends when every trace request has finished.
         let kv_done = kv_replay.as_ref().is_some_and(|kv| kv.is_finished());
         if kv_done && running_start.is_none() {
-            kv_finished_in_warmup = true;
             actual_duration = Duration::ZERO;
         }
         if saturation_done || kv_done || (time_done && !has_saturation) {
@@ -1095,12 +1091,20 @@ pub fn run_benchmark_full(
     if let Some(e) = kv_replay.as_ref().and_then(|kv| kv.trace_error()) {
         return Err(e.into());
     }
-    // The totals above are warmup traffic with no recording phase; a script
-    // reading them or the exit status must not take them for a result.
-    if kv_finished_in_warmup {
+    // A trace that finished with no request recorded (during warmup, or as
+    // recording began) leaves only warmup traffic in the run totals above; a
+    // script reading them or the exit status must not take them for a
+    // result. Judged from the recorded totals, so it does not depend on when
+    // the runner saw the trace finish.
+    let nothing_recorded = results
+        .kv_replay
+        .as_ref()
+        .is_some_and(|r| r.requests + r.requests_failed == 0)
+        && kv_replay.as_ref().is_some_and(|kv| kv.is_finished());
+    if nothing_recorded {
         return Err(
-            "kv_replay: the trace finished during warmup, so nothing was recorded; \
-                    lower general.warmup"
+            "kv_replay: the trace finished before recording started, so nothing was \
+             recorded; lower general.warmup"
                 .into(),
         );
     }
@@ -1595,7 +1599,6 @@ impl SendLoad {
         (2 * batches * self.slots_per_batch()).saturating_add(self.lookup_slots())
     }
 
-    /// Send-pool slots of the largest lookup pipeline, sent whole.
     /// Bytes of a lookup one send-pool slot carries: one TLS record's
     /// plaintext under TLS, else one ringline slot.
     fn slot_bytes(&self) -> usize {
@@ -1606,6 +1609,7 @@ impl SendLoad {
         }
     }
 
+    /// Send-pool slots of the largest lookup pipeline, sent whole.
     fn lookup_slots(&self) -> usize {
         self.lookup_bytes.div_ceil(self.slot_bytes())
     }
