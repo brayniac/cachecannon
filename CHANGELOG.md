@@ -22,8 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sent; one found later stops the replay at that row and fails the run after
   printing results. A trace that finishes before recording starts fails the
   run. Per trace request: one pipelined EXISTS per object, a GET of each
-  object in the hit prefix, then SETs from the end of the prefix (`write_rule = "set-from-miss"`,
-  the default) or of every object EXISTS did not find
+  object in the hit prefix, then SETs from the end of the prefix
+  (`write_rule = "set-from-miss"`, the default) or of every object EXISTS
+  did not find
   (`"insert-if-absent"`). A full-prompt hit counts `input_tokens - 1` as
   cached. Requests start at the trace's timestamps divided by `speedup`, or
   closed-loop with `speedup = 0`; open loop records how late each started.

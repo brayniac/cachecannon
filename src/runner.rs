@@ -723,6 +723,12 @@ pub fn run_benchmark_full(
 
         // Transition from warmup to running
         if current_phase == Phase::Warmup && elapsed >= warmup {
+            // Before the phase changes: a KV request reads the phase for its
+            // CSV `recorded` flag after counting itself, so a baseline taken
+            // later could exclude a request its row marks as recorded.
+            if kv_replay.is_some() {
+                kv_baseline = Some(KvBaseline::take());
+            }
             shared.set_phase(Phase::Running);
             current_phase = Phase::Running;
             running_start = Some(Instant::now());
@@ -762,7 +768,6 @@ pub fn run_benchmark_full(
             // could finish before this transition, which the loop only checks
             // every 100 ms.
             if let Some(ref kv) = kv_replay {
-                kv_baseline = Some(KvBaseline::take());
                 kv.start_at(Instant::now());
             }
 
@@ -1091,11 +1096,11 @@ pub fn run_benchmark_full(
     if let Some(e) = kv_replay.as_ref().and_then(|kv| kv.trace_error()) {
         return Err(e.into());
     }
-    // A trace that finished with no request recorded (during warmup, or as
-    // recording began) leaves only warmup traffic in the run totals above; a
-    // script reading them or the exit status must not take them for a
-    // result. Judged from the recorded totals, so it does not depend on when
-    // the runner saw the trace finish.
+    // A trace that finished with no request recorded: during warmup the run
+    // totals above are warmup traffic (no baselines were taken); as recording
+    // began they are near zero. Either way a script reading them or the exit
+    // status must not take them for a result. Judged from the recorded
+    // totals, so it does not depend on when the runner saw the trace finish.
     let nothing_recorded = results
         .kv_replay
         .as_ref()
