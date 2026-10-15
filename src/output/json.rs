@@ -23,6 +23,22 @@ impl Default for JsonFormatter {
     }
 }
 
+/// `[workload.kv_replay]` in the config line.
+#[derive(Serialize)]
+struct KvConfigOutput {
+    trace: String,
+    /// 0 for closed loop.
+    speedup: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_config: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_dtype: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_bytes_per_token: Option<u64>,
+    mla: bool,
+    write_rule: &'static str,
+}
+
 #[derive(Serialize)]
 struct ConfigOutput {
     #[serde(rename = "type")]
@@ -33,9 +49,15 @@ struct ConfigOutput {
     threads: usize,
     conns: usize,
     pipeline: usize,
-    keyspace: u64,
-    key_size: usize,
-    value_size: usize,
+    /// The synthetic keyspace; absent for a KV replay, which ignores it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keyspace: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_size: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value_size: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_replay: Option<KvConfigOutput>,
     engine: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     ratelimit: Option<u64>,
@@ -188,35 +210,47 @@ impl KvReplayOutput {
     }
 }
 
+fn config_output(config: &Config) -> ConfigOutput {
+    let target = config
+        .target
+        .endpoints
+        .iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let kv = config.workload.kv_replay.as_ref();
+    let synthetic = kv.is_none();
+    ConfigOutput {
+        msg_type: "config",
+        target,
+        protocol: format!("{:?}", config.target.protocol),
+        tls: config.target.tls,
+        threads: config.general.threads,
+        conns: config.connection.total_connections(),
+        pipeline: config.connection.pipeline_depth,
+        keyspace: synthetic.then_some(config.workload.keyspace.count as u64),
+        key_size: synthetic.then_some(config.workload.keyspace.length),
+        value_size: synthetic.then_some(config.workload.values.length),
+        kv_replay: kv.map(|kv| KvConfigOutput {
+            trace: kv.trace.display().to_string(),
+            speedup: kv.speedup,
+            model_config: kv.model_config.as_ref().map(|p| p.display().to_string()),
+            kv_dtype: kv.kv_dtype.clone(),
+            kv_bytes_per_token: kv.kv_bytes_per_token,
+            mla: kv.mla,
+            write_rule: kv.write_rule.as_str(),
+        }),
+        engine: crate::output::IO_ENGINE.to_string(),
+        ratelimit: config.workload.rate_limit,
+        warmup_secs: config.general.warmup.as_secs(),
+        duration_secs: config.general.duration.as_secs(),
+        cpu_list: config.general.cpu_list.clone(),
+    }
+}
+
 impl OutputFormatter for JsonFormatter {
     fn print_config(&self, config: &Config) {
-        let endpoints: Vec<_> = config
-            .target
-            .endpoints
-            .iter()
-            .map(|e| e.to_string())
-            .collect();
-        let target = endpoints.join(",");
-
-        let output = ConfigOutput {
-            msg_type: "config",
-            target,
-            protocol: format!("{:?}", config.target.protocol),
-            tls: config.target.tls,
-            threads: config.general.threads,
-            conns: config.connection.total_connections(),
-            pipeline: config.connection.pipeline_depth,
-            keyspace: config.workload.keyspace.count as u64,
-            key_size: config.workload.keyspace.length,
-            value_size: config.workload.values.length,
-            engine: crate::output::IO_ENGINE.to_string(),
-            ratelimit: config.workload.rate_limit,
-            warmup_secs: config.general.warmup.as_secs(),
-            duration_secs: config.general.duration.as_secs(),
-            cpu_list: config.general.cpu_list.clone(),
-        };
-
-        match serde_json::to_string(&output) {
+        match serde_json::to_string(&config_output(config)) {
             Ok(json) => println!("{}", json),
             Err(e) => tracing::warn!("failed to serialize JSON output: {e}"),
         }
@@ -461,6 +495,39 @@ impl OutputFormatter for JsonFormatter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(toml: &str) -> Config {
+        toml::from_str(toml).unwrap()
+    }
+
+    /// A KV replay's config line describes the replay, not the synthetic
+    /// keyspace it ignores; any other run keeps the keyspace fields.
+    #[test]
+    fn config_line_describes_kv_replay_instead_of_the_keyspace() {
+        let synthetic = serde_json::to_value(config_output(&parse(
+            "[target]\nendpoints = [\"127.0.0.1:6379\"]\n",
+        )))
+        .unwrap();
+        assert!(synthetic["keyspace"].is_u64(), "{synthetic}");
+        assert!(synthetic["value_size"].is_u64(), "{synthetic}");
+        assert!(synthetic.get("kv_replay").is_none(), "{synthetic}");
+
+        let kv = serde_json::to_value(config_output(&parse(
+            "[target]\nendpoints = [\"127.0.0.1:6379\"]\n\
+             [workload.kv_replay]\ntrace = \"r.parquet\"\nspeedup = 10.0\n\
+             kv_bytes_per_token = 256\n",
+        )))
+        .unwrap();
+        for absent in ["keyspace", "key_size", "value_size"] {
+            assert!(kv.get(absent).is_none(), "{absent}: {kv}");
+        }
+        let r = &kv["kv_replay"];
+        assert_eq!(r["trace"], "r.parquet");
+        assert_eq!(r["speedup"], 10.0);
+        assert_eq!(r["kv_bytes_per_token"], 256);
+        assert_eq!(r["write_rule"], "set-from-miss");
+        assert!(r.get("model_config").is_none(), "{kv}");
+    }
 
     /// Each distribution's `count` is the number of samples it holds. A load
     /// whose first GET returned nil has a load time but no time per cached
