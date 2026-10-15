@@ -11,7 +11,7 @@ use crate::config::TimestampMode;
 use crate::config::{Config, EndpointAllocation, Protocol as CacheProtocol};
 use crate::keydist::KeyDist;
 use crate::kvreplay::KvReplay;
-use crate::limiters::WorkerLimiter;
+use crate::limiters::{PrefillPacer, WorkerLimiter};
 use crate::metrics;
 use crate::read_values::ValueReader;
 use ratelimit::{Ratelimiter, TryWaitError};
@@ -230,6 +230,9 @@ pub struct BenchWorkerConfig {
     pub config: Config,
     pub shared: Arc<SharedState>,
     pub ratelimiter: Option<Arc<WorkerLimiter>>,
+    /// Paces prefill; one shared by every worker. `None` when prefill is
+    /// unpaced.
+    pub prefill_ratelimiter: Option<Arc<PrefillPacer>>,
     /// Whether to record metrics (only true during Running phase)
     pub recording: bool,
     /// Shared per-endpoint prefill queues (full keyspace, built once by the
@@ -654,6 +657,9 @@ pub(crate) struct TaskSharedState {
     pub(crate) config: Config,
     pub(crate) shared: Arc<SharedState>,
     pub(crate) ratelimiter: Option<Arc<WorkerLimiter>>,
+    /// Paces prefill SETs, shared by every worker; `None` when prefill is
+    /// unpaced.
+    pub(crate) prefill_ratelimiter: Option<Arc<PrefillPacer>>,
     pub(crate) value_pool: Arc<Vec<u8>>,
     pub(crate) endpoints: Vec<SocketAddr>,
     ring: ketama::Ring,
@@ -930,6 +936,7 @@ impl AsyncEventHandler for BenchHandler {
             config: cfg.config.clone(),
             shared: Arc::clone(&cfg.shared),
             ratelimiter: cfg.ratelimiter.clone(),
+            prefill_ratelimiter: cfg.prefill_ratelimiter.clone(),
             value_pool: cfg.value_pool,
             endpoints,
             ring,
@@ -1515,6 +1522,10 @@ async fn drive_resp_workload(
         // Set when the limiter could not fund a batch in Warmup/Running. Only
         // then does an idle connection park on the dispatcher; see below.
         let mut starved = false;
+        // Set when the prefill pacer turned this connection away: how long to
+        // sleep if nothing is in flight. It counts as waiting until this
+        // iteration ends, including while it receives a reply instead.
+        let mut prefill_wait = None;
 
         // Only refill when there's room for a full batch, so fire_* calls
         // accumulate into a single coalesced send rather than one-per-response.
@@ -1540,6 +1551,20 @@ async fn drive_resp_workload(
                         state.task_state.prefill_queues.push_back(routed, key_id);
                         continue;
                     }
+                }
+
+                // Pace after the key is known to be ours: a token taken for an
+                // empty queue or a re-routed key would be spent on nothing
+                // while another connection waits for it.
+                if let Some(ref pacer) = state.task_state.prefill_ratelimiter
+                    && let Err(refused) = pacer.try_take()
+                {
+                    state
+                        .task_state
+                        .prefill_queues
+                        .push_front(endpoint_idx, key_id);
+                    prefill_wait = Some(refused);
+                    break;
                 }
 
                 let user_data = key_id as u64 | PREFILL_MARKER;
@@ -1777,12 +1802,20 @@ async fn drive_resp_workload(
         // parked again, each `acquire` overwriting the last grant, so the
         // dispatcher drained the limiter at the full rate for the whole
         // prefill and warmup opened with a batch held by every connection.
+        //
+        // A connection the prefill pacer turned away sleeps for as long as
+        // the pacer said.
         if client.pending_count() == 0 {
             match token_dispatch {
                 Some(ref d) if starved => {
                     carried_tokens = d.acquire(batch_size as u64).await;
                 }
-                _ => ringline::sleep(IDLE_SLEEP_MIN).await,
+                _ => {
+                    let wait = prefill_wait
+                        .as_ref()
+                        .map_or(IDLE_SLEEP_MIN, |r| r.sleep.max(IDLE_SLEEP_MIN));
+                    ringline::sleep(wait).await
+                }
             }
             continue;
         }
@@ -2389,6 +2422,10 @@ async fn drive_memcache_workload(
         // Set when the limiter could not fund a batch in Warmup/Running. Only
         // then does an idle connection park on the dispatcher; see below.
         let mut starved = false;
+        // Set when the prefill pacer turned this connection away: how long to
+        // sleep if nothing is in flight. It counts as waiting until this
+        // iteration ends, including while it receives a reply instead.
+        let mut prefill_wait = None;
 
         // Only refill when there's room for a full batch, so fire_* calls
         // accumulate into a single coalesced send rather than one-per-response.
@@ -2412,6 +2449,20 @@ async fn drive_memcache_workload(
                         state.task_state.prefill_queues.push_back(routed, key_id);
                         continue;
                     }
+                }
+
+                // Pace after the key is known to be ours: a token taken for an
+                // empty queue or a re-routed key would be spent on nothing
+                // while another connection waits for it.
+                if let Some(ref pacer) = state.task_state.prefill_ratelimiter
+                    && let Err(refused) = pacer.try_take()
+                {
+                    state
+                        .task_state
+                        .prefill_queues
+                        .push_front(endpoint_idx, key_id);
+                    prefill_wait = Some(refused);
+                    break;
                 }
 
                 let guard =
@@ -2592,12 +2643,20 @@ async fn drive_memcache_workload(
         // parked again, each `acquire` overwriting the last grant, so the
         // dispatcher drained the limiter at the full rate for the whole
         // prefill and warmup opened with a batch held by every connection.
+        //
+        // A connection the prefill pacer turned away sleeps for as long as
+        // the pacer said.
         if client.pending_count() == 0 {
             match token_dispatch {
                 Some(ref d) if starved => {
                     carried_tokens = d.acquire(batch_size as u64).await;
                 }
-                _ => ringline::sleep(IDLE_SLEEP_MIN).await,
+                _ => {
+                    let wait = prefill_wait
+                        .as_ref()
+                        .map_or(IDLE_SLEEP_MIN, |r| r.sleep.max(IDLE_SLEEP_MIN));
+                    ringline::sleep(wait).await
+                }
             }
             continue;
         }
@@ -4457,6 +4516,7 @@ mod tests {
             config,
             shared,
             ratelimiter: None,
+            prefill_ratelimiter: None,
             value_pool: Arc::new(vec![0u8; 64]),
             endpoints: vec!["127.0.0.1:6379".parse().unwrap()],
             ring: ketama::Ring::build(&["127.0.0.1:6379"]),

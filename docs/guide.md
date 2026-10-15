@@ -464,6 +464,32 @@ prefill_timeout = "600s"   # Increase for very large keyspaces
 # prefill_timeout = "0s"   # Disable timeout entirely
 ```
 
+### Pacing Prefill
+
+By default prefill is unpaced: every connection writes as fast as the server
+answers. On a fast network that can exceed what the host or the network will
+carry, and dropped packets and retransmissions during prefill leave TCP state
+behind for the measurement that follows. `prefill_rate_limit` paces prefill in
+requests per second. All workers draw on one limiter, as they draw on the same
+prefill queues, so a worker whose endpoints have run out of keys leaves the
+rate to the others. The limiter starts empty when prefill begins and holds at
+most 10 ms of the rate or one batch, whichever is more, plus one batch, so
+prefill starts at the limit rather than with a burst. A connection the limiter turns away sleeps longer the more
+connections are already waiting, so a large connection count does not poll it
+at the token rate.
+
+```toml
+[workload]
+prefill = true
+prefill_rate_limit = 10000   # requests/second; omit or 0 for unpaced
+```
+
+Choose the rate from the value size: a limit of `R` requests per second writes
+about `R * value_length` bytes per second. A paced prefill takes about
+`keyspace.count / R` seconds; a config where that exceeds `prefill_timeout` is
+rejected, so raise the timeout (or set it to `"0s"`) for a slow prefill of a
+large keyspace. The limit has no effect when `prefill` is off.
+
 ### When to Use Prefill
 
 - **Read-only benchmarks** (`get = 100, set = 0`) — without prefill, every GET will miss

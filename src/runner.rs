@@ -150,6 +150,21 @@ pub fn run_benchmark_full(
     };
     metrics::TARGET_RATE.set(initial_rate as i64);
 
+    // Prefill's own pacing: one limiter shared by every worker, as the prefill
+    // queues are; see `WorkerLimiter::paced`.
+    if config.workload.prefill_rate_limit.is_some_and(|r| r > 0) && !config.workload.prefill {
+        tracing::warn!("prefill_rate_limit is set but prefill is off; it has no effect");
+    }
+    let prefill_ratelimiter = match config.workload.prefill_rate_limit {
+        Some(rate) if rate > 0 && config.workload.prefill => {
+            Some(Arc::new(crate::limiters::PrefillPacer::new(
+                rate,
+                config.connection.effective_batch_size() as u64,
+            )))
+        }
+        _ => None,
+    };
+
     // Start admin server if configured
     let _admin_handle = if config.admin.listen.is_some() || config.admin.parquet.is_some() {
         let admin = AdminServer::new(
@@ -280,6 +295,7 @@ pub fn run_benchmark_full(
                 config: config.clone(),
                 shared: Arc::clone(&shared),
                 ratelimiter: ratelimiter.as_ref().and_then(|l| l.worker(id)),
+                prefill_ratelimiter: prefill_ratelimiter.clone(),
                 recording: false,
                 prefill_queues: Arc::clone(&prefill_queues),
                 append_queues: Arc::clone(&append_queues),
@@ -519,6 +535,9 @@ pub fn run_benchmark_full(
                     }
                 }
                 if prefill_enabled {
+                    if let Some(ref pacer) = prefill_ratelimiter {
+                        pacer.restart();
+                    }
                     shared.set_phase(Phase::Prefill);
                     current_phase = Phase::Prefill;
                     prefill_start = Instant::now();

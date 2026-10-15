@@ -47,6 +47,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The config summary (JSON `config` line, clean and verbose headers)
   describes the trace, timing, geometry and write rule instead of the
   synthetic keyspace and value size, which a KV replay ignores.
+- `workload.prefill_rate_limit` paces prefill in requests per second. All
+  workers share one limiter, as they share the prefill queues. It starts
+  empty when prefill begins and holds at most 10 ms of the rate or one batch,
+  whichever is more, plus one batch, so prefill starts at the limit rather
+  than with a burst. Unset or 0 leaves prefill unpaced, as before. A config
+  whose paced prefill cannot finish within `prefill_timeout` is rejected,
+  including after valkey-lab's `--keyspace` and `--prefill` flags.
 - `[admin] listen` serves `GET /metrics/stream[?interval=..&layout=wide|long]`,
   metriken-exposition's stream route: dendro replication frames
   (`application/vnd.metriken.replication.v1+dendro`), a handshake with
