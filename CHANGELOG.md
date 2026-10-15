@@ -8,6 +8,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `[workload.kv_replay]` replays a request-level KV-cache trace (the kvtrace
+  request format from pelikan-io/cachesim) against a RESP server used as an
+  LLM serving engine's KV-cache prefix store, and reports prompt tokens
+  served from the cache and computed. Object ids and sizes come from
+  kvtrace's `ObjectMapper` for a model geometry given as a Hugging Face
+  `config.json` or as KV bytes per token; `tp` must be 1 (tensor
+  parallelism needs a connection per rank, #214). Trace rows must be in
+  timestamp order (kvtrace enforces it). The trace is streamed by a reader
+  thread, at most 16,384 requests ahead, so memory does not grow with trace
+  length. A read error, including a row out of order, found while the reader
+  fills its first 16,384 requests fails the run before any trace request is
+  sent; one found later stops the replay at that row and fails the run after
+  printing results. A trace that finishes before recording starts fails the
+  run. Per trace request: one pipelined EXISTS per object, a GET of each
+  object in the hit prefix, then SETs from the end of the prefix
+  (`write_rule = "set-from-miss"`, the default) or of every object EXISTS
+  did not find
+  (`"insert-if-absent"`). A full-prompt hit counts `input_tokens - 1` as
+  cached. Requests start at the trace's timestamps divided by `speedup`, or
+  closed-loop with `speedup = 0`; open loop records how late each started.
+  The run ends when the trace is exhausted or at `duration`. Hybrid models
+  are rejected. The JSON result gains a `kv_replay` object (totals, and
+  per-request lookup, load, store, load per 1,000 cached tokens and schedule
+  lag distributions); the clean and verbose outputs print the request and
+  token totals and the distributions, and
+  `requests_out` writes one CSV row per completed trace request (failed
+  requests have none). EXISTS, GET and SET
+  are also counted in `requests`, `responses`, the GET and SET latency
+  histograms and the byte counters. Existing JSON fields are unchanged. New
+  `kv_*` counters and histograms are registered statically, like every
+  metric here, so `/metrics`, `/metrics/binary`, `/metrics/stream` and the
+  parquet recording of every run now carry them, as zeros when
+  `kv_replay` is not set (the `append_*` metrics already behave this way).
+  `kv_trace_read_waits` counts dispatcher polls (one per worker per
+  millisecond) that found a connection idle and the trace reader behind.
 - `[admin] listen` serves `GET /metrics/stream[?interval=..&layout=wide|long]`,
   metriken-exposition's stream route: dendro replication frames
   (`application/vnd.metriken.replication.v1+dendro`), a handshake with
@@ -58,6 +93,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   share and `key_share` connection count.
 
 ### Changed
+- A run whose computed send copy pool exceeds ringline's per-worker maximum
+  of 65,535 slots logs a warning naming the inputs (connections per worker,
+  pipeline depth, batch, value length, TLS, and for `kv_replay` the largest
+  lookup). The pool was, and still is, capped there; sends past it fail and
+  are counted in `requests_send_failed`. Before, the cap was applied without
+  a message.
 - rustls 0.23.45 → 0.23.46 for RUSTSEC-2026-0346, -0347, -0348 and -0349,
   published 2026-10-14, which failed `cargo audit` in CI.
 - `keyspace.zipf_theta` must now be in (0, 10]; larger values were accepted

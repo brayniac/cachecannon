@@ -1,6 +1,9 @@
 //! JSON (NDJSON) formatter for machine-readable output.
 
-use super::{OutputFormatter, PrefillDiagnostics, PrefillSample, Results, Sample};
+use super::{
+    KvReplayResults, LatencyStats, OutputFormatter, PrefillDiagnostics, PrefillSample, Results,
+    Sample,
+};
 use crate::config::Config;
 use serde::Serialize;
 use std::time::Duration;
@@ -107,6 +110,82 @@ struct ResultsOutput {
     schedule_slip: Option<LatencyOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     perceived_latency: Option<LatencyOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_replay: Option<KvReplayOutput>,
+}
+
+/// `[workload.kv_replay]` totals in the result line. Times are per trace
+/// request, in microseconds; `count` is the requests sampled.
+#[derive(Serialize)]
+struct KvReplayOutput {
+    /// "open-loop" or "closed-loop".
+    timing: &'static str,
+    speedup: f64,
+    write_rule: &'static str,
+    trace_requests: u64,
+    requests: u64,
+    requests_failed: u64,
+    input_tokens: u64,
+    cached_tokens: u64,
+    new_tokens: u64,
+    cached_fraction: f64,
+    full_hits: u64,
+    misses_at_chunk_0: u64,
+    no_full_chunk: u64,
+    get_nil: u64,
+    exists: u64,
+    lookup: LatencyOutput,
+    load: LatencyOutput,
+    store: LatencyOutput,
+    load_per_1k_cached_tokens: LatencyOutput,
+    /// Open loop only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schedule_lag: Option<LatencyOutput>,
+}
+
+impl LatencyOutput {
+    fn from_stats(count: u64, s: &LatencyStats) -> Self {
+        Self {
+            count,
+            p50_us: s.p50_us as u64,
+            p90_us: s.p90_us as u64,
+            p99_us: s.p99_us as u64,
+            p999_us: s.p999_us as u64,
+            p9999_us: s.p9999_us as u64,
+            max_us: s.max_us as u64,
+        }
+    }
+}
+
+impl KvReplayOutput {
+    fn new(kv: &KvReplayResults) -> Self {
+        Self {
+            timing: kv.timing(),
+            speedup: kv.speedup,
+            write_rule: kv.write_rule,
+            trace_requests: kv.trace_requests,
+            requests: kv.requests,
+            requests_failed: kv.requests_failed,
+            input_tokens: kv.input_tokens,
+            cached_tokens: kv.cached_tokens,
+            new_tokens: kv.new_tokens,
+            cached_fraction: kv.cached_fraction(),
+            full_hits: kv.full_hits,
+            misses_at_chunk_0: kv.chunk0_misses,
+            no_full_chunk: kv.no_full_chunk,
+            get_nil: kv.get_nil,
+            exists: kv.exists,
+            lookup: LatencyOutput::from_stats(kv.lookups, &kv.lookup_time),
+            load: LatencyOutput::from_stats(kv.loads, &kv.load_time),
+            store: LatencyOutput::from_stats(kv.stores, &kv.store_time),
+            load_per_1k_cached_tokens: LatencyOutput::from_stats(
+                kv.loads_with_cached_tokens,
+                &kv.load_time_per_1k_tokens,
+            ),
+            schedule_lag: (!kv.closed_loop)
+                .then(|| LatencyOutput::from_stats(kv.requests, &kv.schedule_lag)),
+        }
+    }
 }
 
 impl OutputFormatter for JsonFormatter {
@@ -369,11 +448,60 @@ impl OutputFormatter for JsonFormatter {
             } else {
                 None
             },
+            kv_replay: results.kv_replay.as_ref().map(KvReplayOutput::new),
         };
 
         match serde_json::to_string(&output) {
             Ok(json) => println!("{}", json),
             Err(e) => tracing::warn!("failed to serialize JSON output: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each distribution's `count` is the number of samples it holds. A load
+    /// whose first GET returned nil has a load time but no time per cached
+    /// token.
+    #[test]
+    fn kv_distribution_counts_are_their_sample_counts() {
+        let kv = KvReplayResults {
+            closed_loop: true,
+            speedup: 0.0,
+            write_rule: "set-from-miss",
+            trace_requests: 3,
+            requests: 3,
+            requests_failed: 0,
+            input_tokens: 0,
+            cached_tokens: 0,
+            new_tokens: 0,
+            full_hits: 0,
+            chunk0_misses: 0,
+            no_full_chunk: 0,
+            get_nil: 1,
+            exists: 0,
+            lookups: 3,
+            loads: 2,
+            stores: 1,
+            loads_with_cached_tokens: 1,
+            lookup_time: LatencyStats::default(),
+            load_time: LatencyStats::default(),
+            store_time: LatencyStats::default(),
+            load_time_per_1k_tokens: LatencyStats::default(),
+            schedule_lag: LatencyStats::default(),
+        };
+        let out = KvReplayOutput::new(&kv);
+        assert_eq!(
+            (
+                out.lookup.count,
+                out.load.count,
+                out.store.count,
+                out.load_per_1k_cached_tokens.count
+            ),
+            (3, 2, 1, 1)
+        );
+        assert!(out.schedule_lag.is_none(), "closed loop has no lag");
     }
 }

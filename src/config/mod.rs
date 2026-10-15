@@ -350,6 +350,103 @@ pub struct Workload {
     /// writer connections. Requires `keyspace.distribution = "recency"`.
     #[serde(default)]
     pub append: Option<Append>,
+    /// KV-cache prefix replay: replay a request-level KV-cache trace instead
+    /// of the synthetic keyspace. See `crate::kvreplay`.
+    #[serde(default)]
+    pub kv_replay: Option<KvReplay>,
+}
+
+/// `[workload.kv_replay]`: replay a kvtrace request trace against the server
+/// as a KV-cache prefix store, and report cached and new prompt tokens.
+///
+/// The model geometry comes either from a Hugging Face `config.json`
+/// (`model_config`) or from `kv_bytes_per_token` directly; exactly one must
+/// be set.
+#[derive(Debug, Clone, Deserialize)]
+pub struct KvReplay {
+    /// kvtrace request trace (Parquet).
+    pub trace: PathBuf,
+    /// Trace time is divided by this: 10 replays ten times faster than
+    /// recorded. 0 replays closed-loop, each connection starting its next
+    /// request as soon as the previous one finished. Default 1.
+    #[serde(default = "default_kv_speedup")]
+    pub speedup: f64,
+    /// Hugging Face `config.json` the object sizes are derived from.
+    #[serde(default)]
+    pub model_config: Option<PathBuf>,
+    /// KV cache dtype overriding the config's (`model_config` only), e.g.
+    /// `"fp8"`.
+    #[serde(default)]
+    pub kv_dtype: Option<String>,
+    /// KV bytes per token over all layers and ranks, instead of
+    /// `model_config`.
+    #[serde(default)]
+    pub kv_bytes_per_token: Option<u64>,
+    /// With `kv_bytes_per_token`: the model uses multi-head latent attention,
+    /// so only rank 0 stores, at full size. A `model_config` says this itself.
+    #[serde(default)]
+    pub mla: bool,
+    /// Tensor-parallel degree. Must be 1 (cachecannon#214). Default 1.
+    #[serde(default = "default_kv_tp")]
+    pub tp: u64,
+    /// Which objects a request writes after its lookup. Default
+    /// `"set-from-miss"`.
+    #[serde(default)]
+    pub write_rule: KvWriteRule,
+    /// Prepended to every object key. Default `"kv:"`.
+    #[serde(default = "default_kv_key_prefix")]
+    pub key_prefix: String,
+    /// How the object id is written after the prefix. Default `"hex"`.
+    #[serde(default)]
+    pub key_format: KvKeyFormat,
+    /// Write one CSV row per completed trace request to this file.
+    #[serde(default)]
+    pub requests_out: Option<PathBuf>,
+}
+
+/// Which objects a KV replay request SETs after its lookup.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum KvWriteRule {
+    /// Every object from the end of the lookup's prefix hit to the last full
+    /// chunk, whether or not the store holds it (LMCache's in-process remote
+    /// backends, on the default non-layerwise store path).
+    #[default]
+    SetFromMiss,
+    /// Every object whose EXISTS returned 0 (LMCache's multiprocess store).
+    InsertIfAbsent,
+}
+
+impl KvWriteRule {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SetFromMiss => "set-from-miss",
+            Self::InsertIfAbsent => "insert-if-absent",
+        }
+    }
+}
+
+/// How a KV replay object id is written into its key.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum KvKeyFormat {
+    /// 16 lowercase hex digits, zero-padded.
+    #[default]
+    Hex,
+    /// Decimal, no padding.
+    Decimal,
+}
+
+fn default_kv_speedup() -> f64 {
+    1.0
+}
+
+fn default_kv_tp() -> u64 {
+    1
+}
+
+fn default_kv_key_prefix() -> String {
+    "kv:".to_string()
 }
 
 /// Configuration for saturation search mode.
@@ -1122,6 +1219,10 @@ impl Config {
             ));
         }
 
+        if let Some(ref kv) = self.workload.kv_replay {
+            self.validate_kv_replay(kv)?;
+        }
+
         if let Some(ref sat) = self.workload.saturation_search {
             if sat.start_rate == 0 {
                 return Err(ConfigError::Validation(
@@ -1150,6 +1251,81 @@ impl Config {
             }
         }
 
+        Ok(())
+    }
+}
+
+impl Config {
+    /// `[workload.kv_replay]` checks that need no file access. The trace and
+    /// the model config are read when the run starts
+    /// (`crate::kvreplay::KvReplay::load`).
+    fn validate_kv_replay(&self, kv: &KvReplay) -> Result<(), ConfigError> {
+        let bad = |msg: &str| {
+            Err(ConfigError::Validation(format!(
+                "workload.kv_replay: {msg}"
+            )))
+        };
+        match (&kv.model_config, kv.kv_bytes_per_token) {
+            (Some(_), Some(_)) => return bad("set model_config or kv_bytes_per_token, not both"),
+            (None, None) => return bad("one of model_config or kv_bytes_per_token is required"),
+            (None, Some(0)) => return bad("kv_bytes_per_token must be >= 1"),
+            _ => {}
+        }
+        if kv.kv_dtype.is_some() && kv.model_config.is_none() {
+            return bad("kv_dtype applies only with model_config");
+        }
+        if kv.mla && kv.model_config.is_some() {
+            return bad("mla applies only with kv_bytes_per_token; a model_config says it itself");
+        }
+        if !kv.speedup.is_finite() || kv.speedup < 0.0 {
+            return bad(&format!(
+                "speedup must be finite and >= 0 (0 = closed loop), got {}",
+                kv.speedup
+            ));
+        }
+        // With tp > 1 every rank's operations would share the request's one
+        // connection; an engine's ranks each have their own (#214).
+        if kv.tp != 1 {
+            return bad(&format!(
+                "tp must be 1, got {}: tensor parallelism needs one connection per rank, \
+                 which kv_replay does not do yet (cachecannon#214)",
+                kv.tp
+            ));
+        }
+        // A request's GETs and SETs are sent at most pipeline_depth at a time;
+        // with 0 none would be sent and the replay would wait for a reply to
+        // nothing, with no request in flight to time out.
+        if self.connection.pipeline_depth == 0 {
+            return bad("needs connection.pipeline_depth >= 1");
+        }
+        // The lookup is one pipeline of EXISTS per connection, so every key a
+        // request touches must live on the server that connection reaches.
+        if !matches!(self.target.protocol, Protocol::Resp | Protocol::Resp3) {
+            return bad("needs protocol resp or resp3 (it issues EXISTS, GET and SET)");
+        }
+        if self.target.cluster || self.target.endpoints.len() > 1 {
+            return bad(
+                "needs a single endpoint; cluster and multi-endpoint routing are not supported",
+            );
+        }
+        // The trace sets the request sequence and its timing, so the options
+        // that generate or pace synthetic requests do not apply.
+        let w = &self.workload;
+        for (set, key) in [
+            (w.rate_limit.is_some_and(|r| r > 0), "rate_limit"),
+            (
+                w.saturation_search.is_some(),
+                "[workload.saturation_search]",
+            ),
+            (w.prefill, "prefill"),
+            (w.backfill_on_miss, "backfill_on_miss"),
+            (w.read_values, "read_values"),
+            (w.append.is_some(), "[workload.append]"),
+        ] {
+            if set {
+                return bad(&format!("cannot be combined with {key}"));
+            }
+        }
         Ok(())
     }
 }
@@ -1267,6 +1443,95 @@ mod validation_tests {
         let config: Config = toml::from_str(toml).map_err(|e| ConfigError::Parse(e.to_string()))?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// A config with `[workload.kv_replay]` set to `kv` and `extra` appended.
+    fn kv_config(kv: &str, extra: &str) -> Result<Config, ConfigError> {
+        parse_config(&format!(
+            "[target]\nendpoints = [\"127.0.0.1:6379\"]\n{extra}\n\
+             [workload.kv_replay]\ntrace = \"t.parquet\"\n{kv}\n"
+        ))
+    }
+
+    #[test]
+    fn kv_replay_defaults() {
+        let config = kv_config("kv_bytes_per_token = 4", "").unwrap();
+        let kv = config.workload.kv_replay.unwrap();
+        assert_eq!(kv.speedup, 1.0);
+        assert_eq!(kv.tp, 1);
+        assert_eq!(kv.write_rule, KvWriteRule::SetFromMiss);
+        assert_eq!(kv.key_prefix, "kv:");
+        assert_eq!(kv.key_format, KvKeyFormat::Hex);
+        let kv = kv_config(
+            "kv_bytes_per_token = 4\nwrite_rule = \"insert-if-absent\"\nkey_format = \"decimal\"",
+            "",
+        )
+        .unwrap()
+        .workload
+        .kv_replay
+        .unwrap();
+        assert_eq!(kv.write_rule, KvWriteRule::InsertIfAbsent);
+        assert_eq!(kv.key_format, KvKeyFormat::Decimal);
+    }
+
+    #[test]
+    fn kv_replay_needs_exactly_one_geometry() {
+        let err = kv_config("", "").unwrap_err().to_string();
+        assert!(
+            err.contains("one of model_config or kv_bytes_per_token"),
+            "{err}"
+        );
+        let err = kv_config("kv_bytes_per_token = 4\nmodel_config = \"c.json\"", "")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not both"), "{err}");
+        let err = kv_config("kv_bytes_per_token = 4\nkv_dtype = \"fp8\"", "")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("kv_dtype"), "{err}");
+        let err = kv_config("model_config = \"c.json\"\nmla = true", "")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mla"), "{err}");
+    }
+
+    #[test]
+    fn kv_replay_rejects_bad_values_and_synthetic_options() {
+        for (kv, extra, want) in [
+            ("speedup = -1.0", "", "speedup"),
+            ("tp = 0", "", "tp must be 1"),
+            ("tp = 2", "", "one connection per rank"),
+            ("", "[connection]\npipeline_depth = 0", "pipeline_depth"),
+            ("", "[workload]\nrate_limit = 1000", "rate_limit"),
+            ("", "[workload]\nprefill = true", "prefill"),
+            ("", "[workload]\nread_values = true", "read_values"),
+            (
+                "",
+                "[workload]\nbackfill_on_miss = true",
+                "backfill_on_miss",
+            ),
+        ] {
+            let err = kv_config(&format!("kv_bytes_per_token = 4\n{kv}"), extra)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(want), "{kv} {extra}: {err}");
+        }
+        // Closed loop.
+        kv_config("kv_bytes_per_token = 4\nspeedup = 0", "").unwrap();
+        let err = parse_config(
+            "[target]\nendpoints = [\"127.0.0.1:11211\"]\nprotocol = \"memcache\"\n\
+             [workload.kv_replay]\ntrace = \"t\"\nkv_bytes_per_token = 4\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("resp"), "{err}");
+        let err = parse_config(
+            "[target]\nendpoints = [\"127.0.0.1:6379\", \"127.0.0.1:6380\"]\n\
+             [workload.kv_replay]\ntrace = \"t\"\nkv_bytes_per_token = 4\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("single endpoint"), "{err}");
     }
 
     #[test]

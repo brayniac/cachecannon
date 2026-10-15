@@ -172,6 +172,78 @@ pub struct Results {
     pub schedule_slip: LatencyStats,
     /// Perceived (arrival-relative, CO-honest) response latency percentiles (µs).
     pub perceived_latency: LatencyStats,
+    /// KV-cache replay totals; `None` unless `[workload.kv_replay]` is set.
+    pub kv_replay: Option<KvReplayResults>,
+}
+
+/// KV-cache replay results for the recording phase (`[workload.kv_replay]`).
+/// Tokens are prompt tokens of the replayed trace requests. Times are per
+/// trace request, in microseconds.
+#[derive(Debug, Clone)]
+pub struct KvReplayResults {
+    /// Requests were issued as fast as connections freed up, not at the
+    /// trace's timestamps.
+    pub closed_loop: bool,
+    /// Trace time divisor in open loop; 0 in closed loop.
+    pub speedup: f64,
+    pub write_rule: &'static str,
+    /// Requests in the trace.
+    pub trace_requests: u64,
+    /// Requests replayed to completion.
+    pub requests: u64,
+    /// Requests abandoned on a connection error, send failure or server
+    /// error; not in any token count.
+    pub requests_failed: u64,
+    pub input_tokens: u64,
+    pub cached_tokens: u64,
+    pub new_tokens: u64,
+    /// Requests whose loaded prefix covered the whole prompt.
+    pub full_hits: u64,
+    /// Requests whose lookup found the first chunk missing.
+    pub chunk0_misses: u64,
+    /// Requests shorter than one chunk, which issue no operations.
+    pub no_full_chunk: u64,
+    /// GETs that returned nil after the lookup found the object.
+    pub get_nil: u64,
+    /// EXISTS operations.
+    pub exists: u64,
+    /// Requests with a lookup, a load and a store: the sample counts of the
+    /// three time distributions.
+    pub lookups: u64,
+    pub loads: u64,
+    pub stores: u64,
+    /// Requests with GETs that ended with cached tokens: the sample count of
+    /// `load_time_per_1k_tokens`. It can be below `loads`: for example when
+    /// a GET at the first chunk returned nil or an error, or a full hit
+    /// counted no cached tokens because the prompt was at most one token.
+    pub loads_with_cached_tokens: u64,
+    pub lookup_time: LatencyStats,
+    pub load_time: LatencyStats,
+    pub store_time: LatencyStats,
+    /// Load time divided by cached tokens, times 1,000.
+    pub load_time_per_1k_tokens: LatencyStats,
+    /// Open loop: request start minus the time the trace scheduled it.
+    pub schedule_lag: LatencyStats,
+}
+
+impl KvReplayResults {
+    /// Cached tokens over input tokens (0.0-1.0).
+    pub fn cached_fraction(&self) -> f64 {
+        if self.input_tokens > 0 {
+            self.cached_tokens as f64 / self.input_tokens as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// "closed-loop" or "open-loop".
+    pub fn timing(&self) -> &'static str {
+        if self.closed_loop {
+            "closed-loop"
+        } else {
+            "open-loop"
+        }
+    }
 }
 
 impl Results {
@@ -270,6 +342,7 @@ mod overload_tests {
             requests_send_failed: 0,
             schedule_slip: Default::default(),
             perceived_latency: Default::default(),
+            kv_replay: None,
         }
     }
 
