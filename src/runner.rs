@@ -505,10 +505,15 @@ pub fn run_benchmark_full(
                 // known now; stop before any trace request runs. The error
                 // is returned after the (empty) results.
                 if let Some(ref kv) = kv_replay {
-                    kv.wait_read_ahead();
+                    kv.wait_read_ahead(&running);
                     if kv.trace_error().is_some() {
                         shared.set_phase(Phase::Stop);
+                        actual_duration = Duration::ZERO;
                         break;
+                    }
+                    // Interrupted while waiting: the loop top stops the run.
+                    if !running.load(Ordering::SeqCst) {
+                        continue;
                     }
                 }
                 if prefill_enabled {

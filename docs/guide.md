@@ -262,9 +262,9 @@ replay reads the first request and the most chunks in any request (the
 footer's `kvtrace.max_chunks`, or a pass over the `chunks` column for a file
 without it), which sizes the send pool, and the reader thread starts filling
 its read-ahead. When precheck completes the run waits for the read-ahead to
-fill. A read error in it, including a row out of timestamp order, ends the
-run with that error before any trace request is sent. A read error further
-into the file stops the replay at that row: the requests already read
+fill. A read error found while filling it, including a row out of timestamp
+order, ends the run with that error before any trace request is sent. A read
+error found later stops the replay at that row: the requests already read
 finish, the results print, and the run exits with the error.
 `kv_trace_read_waits` counts dispatcher polls (one per worker per
 millisecond) that found a connection idle and the reader behind. In open

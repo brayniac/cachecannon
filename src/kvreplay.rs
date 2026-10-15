@@ -65,8 +65,9 @@ store_ns,recorded";
 
 /// Trace requests the reader thread may hold ready ahead of the replay.
 /// The replay holds at most this many requests in the channel, plus one in
-/// the reader's blocked send and one claimed per worker, whatever the
-/// file's length.
+/// the reader's blocked send, its current decoded batch, one held by each
+/// worker's dispatcher, those handed back after a closed connection, and one
+/// in flight per connection, whatever the file's length.
 const READ_AHEAD: usize = 16_384;
 
 /// A trace being replayed and the state of its replay, shared by every
@@ -189,9 +190,13 @@ impl KvReplay {
 
     /// Block until the reader thread has filled its read-ahead or stopped, so
     /// that a read error in the first `READ_AHEAD` (16,384) requests is known before
-    /// any request is due. Called by the runner as precheck completes.
-    pub fn wait_read_ahead(&self) {
-        while !self.reader.stopped.load(Ordering::Acquire) && !self.requests.is_full() {
+    /// any request is due. Returns early once `running` is false. Called by
+    /// the runner as precheck completes.
+    pub fn wait_read_ahead(&self, running: &AtomicBool) {
+        while !self.reader.stopped.load(Ordering::Acquire)
+            && !self.requests.is_full()
+            && running.load(Ordering::SeqCst)
+        {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
@@ -1435,6 +1440,51 @@ mod tests {
         let err = KvReplay::load(&c).err().unwrap();
         std::fs::remove_file(&path).unwrap();
         assert!(err.ends_with("no requests"), "{err}");
+    }
+
+    /// `wait_read_ahead` returns only once the reader has stopped (its error
+    /// then visible) or filled the channel, or the run is interrupted.
+    #[test]
+    fn wait_read_ahead_waits_for_the_reader() {
+        let path = std::env::temp_dir().join(format!(
+            "cachecannon-kv-wait-{}.parquet",
+            std::process::id()
+        ));
+        let mut w = kvtrace::RequestWriter::create(&path, 16, 1).unwrap();
+        w.write(&Request {
+            timestamp: 0,
+            req_id: 1,
+            input_tokens: 16,
+            output_tokens: 1,
+            chunks: vec![1],
+            session_id: None,
+        })
+        .unwrap();
+        w.finish().unwrap();
+        let mut c = cfg(Some(4));
+        c.trace = path.clone();
+        let mut kv = KvReplay::load(&c).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        // A reader that is still reading, then fails.
+        let (_tx, rx) = crossbeam_channel::bounded::<Request>(2);
+        kv.requests = rx;
+        let state = Arc::new(ReaderState::default());
+        kv.reader = Arc::clone(&state);
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let _ = state.error.set("bad row".into());
+            state.stopped.store(true, Ordering::Release);
+        });
+        kv.wait_read_ahead(&AtomicBool::new(true));
+        assert_eq!(kv.trace_error().as_deref(), Some("bad row"));
+        reader.join().unwrap();
+
+        // Interrupted: returns although the reader has neither stopped nor
+        // filled the channel.
+        kv.reader = Arc::new(ReaderState::default());
+        kv.wait_read_ahead(&AtomicBool::new(false));
+        assert_eq!(kv.trace_error(), None);
     }
 
     /// An empty channel while the reader is still running is "not ready",

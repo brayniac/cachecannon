@@ -17,9 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parallelism needs a connection per rank, #214). Trace rows must be in
   timestamp order (kvtrace enforces it). The trace is streamed by a reader
   thread, at most 16,384 requests ahead, so memory does not grow with trace
-  length. A read error, including a row out of order, in the first 16,384
-  requests fails the run before any trace request is sent; one later stops
-  the replay at that row and fails the run after printing results. Per
+  length. A read error, including a row out of order, found while the reader
+  fills its first 16,384 requests fails the run before any trace request is
+  sent; one found later stops the replay at that row and fails the run after
+  printing results. Per
   trace request:
   one pipelined EXISTS per object, a GET of each object in the hit prefix,
   then SETs from the end of the prefix (`write_rule = "set-from-miss"`,

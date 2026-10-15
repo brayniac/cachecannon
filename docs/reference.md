@@ -337,9 +337,10 @@ endpoint, `cluster = true`, `connection.pipeline_depth = 0`, `tp` other than 1, 
 `prefill`, `backfill_on_miss`, `read_values` and `[workload.append]`. Rejected
 when the run starts: an empty trace, a trace file kvtrace cannot open, and a
 model with recurrent state (a hybrid linear-attention model). A read error
-(a corrupt batch, a row out of timestamp order) in the first 16,384 requests
-ends the run after precheck, before any trace request is sent. One further
-into the file stops the replay at that row; the requests already read
+(a corrupt batch, a row out of timestamp order) found while the reader fills
+its first 16,384 requests ends the run after precheck, before any trace
+request is sent; a corrupt batch is found when the reader reaches its first
+row. One found later stops the replay at that row; the requests already read
 finish, the results print, and the run exits with the error.
 
 #### KV replay results
