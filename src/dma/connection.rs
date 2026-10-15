@@ -281,7 +281,21 @@ async fn run_transfers(
         let prefill = phase == Phase::Prefill && !state.is_prefill_done();
         let (key_id, op, source) = if prefill {
             match state.task_state.prefill_queues.pop_front(endpoint_idx) {
-                Some(key_id) => (key_id, Op::Set, Source::Prefill),
+                Some(key_id) => {
+                    // Pace after the key is known: a token taken for an empty queue would be
+                    // spent on nothing while another connection waits for it.
+                    if let Some(ref pacer) = state.task_state.prefill_ratelimiter
+                        && let Err(refused) = pacer.try_take()
+                    {
+                        state
+                            .task_state
+                            .prefill_queues
+                            .push_front(endpoint_idx, key_id);
+                        ringline::sleep(refused.sleep.max(Duration::from_micros(100))).await;
+                        continue;
+                    }
+                    (key_id, Op::Set, Source::Prefill)
+                }
                 None => {
                     ringline::sleep(Duration::from_micros(100)).await;
                     continue;

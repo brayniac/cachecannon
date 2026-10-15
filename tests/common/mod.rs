@@ -1,5 +1,6 @@
-//! Shared by the `read_values_*` tests: fake servers and a one-second
-//! benchmark run against them. `kv` is shared by `kv_replay.rs`.
+//! Shared by the `read_values_*` and `prefill_rate_limit_*` tests: fake
+//! servers and short benchmark runs against them. `kv` is shared by
+//! `kv_replay.rs`.
 //!
 //! The runner can be started once per process (`init_config_channel`), and the
 //! metrics it records are process-global, so each `read_values_*` run is its
@@ -15,8 +16,9 @@ use cachecannon::metrics::{CACHE_HITS, CACHE_MISSES, GET_COUNT, VALUES_READ_BYTE
 use cachecannon::{ColorMode, Config, OutputFormat, create_formatter, run_benchmark_full};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Every third GET on a connection is answered with a miss.
 pub const MISS_EVERY: u64 = 3;
@@ -240,4 +242,201 @@ pub fn assert_every_hit_read(protocol: &str, server: Server) {
         server.value_len,
         c.read
     );
+}
+
+/// A server for `protocol` (resp or memcache) that stores nothing, answers
+/// every SET as stored and every GET as a miss, and records when each SET
+/// arrived.
+pub fn spawn_set_recorder(protocol: &str) -> (SocketAddr, Arc<Mutex<Vec<Instant>>>) {
+    let sets = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&sets);
+    let addr = match protocol {
+        "resp" => spawn(move |stream| record_resp(stream, &recorded)),
+        "memcache" => spawn(move |stream| record_memcache(stream, &recorded)),
+        _ => unreachable!(),
+    };
+    (addr, sets)
+}
+
+fn record_resp(stream: TcpStream, sets: &Mutex<Vec<Instant>>) {
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    while let Some(header) = read_line(&mut reader) {
+        let n: usize = std::str::from_utf8(&header[1..]).unwrap().parse().unwrap();
+        let mut command = Vec::new();
+        for i in 0..n {
+            let len_line = read_line(&mut reader).unwrap();
+            let len: usize = std::str::from_utf8(&len_line[1..])
+                .unwrap()
+                .parse()
+                .unwrap();
+            let mut arg = vec![0u8; len + 2];
+            reader.read_exact(&mut arg).unwrap();
+            if i == 0 {
+                arg.truncate(len);
+                command = arg.to_ascii_uppercase();
+            }
+        }
+        let reply: &[u8] = match command.as_slice() {
+            b"SET" => {
+                sets.lock().unwrap().push(Instant::now());
+                b"+OK\r\n"
+            }
+            b"GET" => b"$-1\r\n",
+            b"PING" => b"+PONG\r\n",
+            _ => b"+OK\r\n",
+        };
+        if writer.write_all(reply).is_err() {
+            return;
+        }
+    }
+}
+
+fn record_memcache(stream: TcpStream, sets: &Mutex<Vec<Instant>>) {
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    while let Some(line) = read_line(&mut reader) {
+        let reply: &[u8] = match line.split(|b| *b == b' ').next().unwrap() {
+            b"set" => {
+                let len: usize = std::str::from_utf8(line.rsplit(|b| *b == b' ').next().unwrap())
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let mut data = vec![0u8; len + 2];
+                reader.read_exact(&mut data).unwrap();
+                sets.lock().unwrap().push(Instant::now());
+                b"STORED\r\n"
+            }
+            b"get" => b"END\r\n",
+            b"version" => b"VERSION 1.0\r\n",
+            _ => b"ERROR\r\n",
+        };
+        if writer.write_all(reply).is_err() {
+            return;
+        }
+    }
+}
+
+/// The shape of a paced-prefill run: recording servers, threads,
+/// connections (total) and pipeline depth.
+#[derive(Default)]
+pub struct Shape {
+    pub endpoints: usize,
+    pub threads: usize,
+    pub connections: usize,
+    pub pipeline: usize,
+    /// Extra lines for `[workload.keyspace]`.
+    pub keyspace: &'static str,
+    /// Extra lines for `[connection]`.
+    pub connection: &'static str,
+}
+
+/// Prefill `keys` keys at `rate` requests per second against recording
+/// servers for `protocol`, and return how long the SETs took from the first to
+/// the last across every server. Fails unless every key was written once.
+pub fn prefill_span_shaped(protocol: &str, shape: Shape, keys: usize, rate: usize) -> Duration {
+    let times = prefill_times_shaped(protocol, shape, keys, rate);
+    *times.last().unwrap() - *times.first().unwrap()
+}
+
+/// Split sorted SET arrival times into ten equal runs of keys and return each
+/// run's span, shortest first. A stall on a busy test host lengthens a few
+/// runs; the shortest runs still show the paced rate.
+pub fn decile_spans(times: &[Instant]) -> Vec<Duration> {
+    let n = times.len() / 10;
+    assert!(n >= 2, "too few SETs to split: {}", times.len());
+    let mut spans: Vec<Duration> = (0..10)
+        .map(|d| times[(d + 1) * n - 1] - times[d * n])
+        .collect();
+    spans.sort();
+    spans
+}
+
+/// As [`prefill_span_shaped`], but return every SET's arrival time, sorted.
+pub fn prefill_times_shaped(
+    protocol: &str,
+    shape: Shape,
+    keys: usize,
+    rate: usize,
+) -> Vec<Instant> {
+    let servers: Vec<_> = (0..shape.endpoints)
+        .map(|_| spawn_set_recorder(protocol))
+        .collect();
+    let endpoints = servers
+        .iter()
+        .map(|(addr, _)| format!("\"{addr}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let toml = format!(
+        r#"
+        [general]
+        duration = "1s"
+        warmup = "0s"
+        threads = {threads}
+
+        [target]
+        endpoints = [{endpoints}]
+        protocol = "{protocol}"
+
+        [connection]
+        connections = {connections}
+        pipeline_depth = {pipeline}
+        {connection_extra}
+
+        [workload]
+        prefill = true
+        prefill_settle = "0s"
+        prefill_rate_limit = {rate}
+
+        [workload.keyspace]
+        count = {keys}
+        {keyspace_extra}
+
+        [workload.commands]
+        get = 100
+        set = 0
+
+        [admin]
+        format = "quiet"
+        "#,
+        connection_extra = shape.connection,
+        keyspace_extra = shape.keyspace,
+        threads = shape.threads,
+        connections = shape.connections,
+        pipeline = shape.pipeline,
+    );
+    let path = std::env::temp_dir().join(format!(
+        "cachecannon-prefill-rate-{}-{protocol}.toml",
+        std::process::id()
+    ));
+    std::fs::write(&path, toml).unwrap();
+    let config = Config::load(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    run_benchmark_full(
+        config,
+        None,
+        create_formatter(OutputFormat::Quiet, ColorMode::Never),
+        Arc::new(AtomicBool::new(true)),
+    )
+    .unwrap();
+    let mut times: Vec<Instant> = Vec::new();
+    for (_, sets) in &servers {
+        times.extend(sets.lock().unwrap().iter().copied());
+    }
+    assert_eq!(times.len(), keys, "every key is written once by prefill");
+    times.sort();
+    times
+}
+
+/// [`prefill_span_shaped`] with one server, 2 threads, 8 connections and a
+/// pipeline of 4.
+pub fn prefill_span(protocol: &str, keys: usize, rate: usize) -> Duration {
+    let shape = Shape {
+        endpoints: 1,
+        threads: 2,
+        connections: 8,
+        pipeline: 4,
+        ..Default::default()
+    };
+    prefill_span_shaped(protocol, shape, keys, rate)
 }

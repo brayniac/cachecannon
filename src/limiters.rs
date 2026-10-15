@@ -102,6 +102,30 @@ impl WorkerLimiter {
         self.inner.set_max_tokens(cap);
     }
 
+    /// The prefill limiter: `rate` requests per second, shared by every
+    /// worker, holding at most 10 ms of the rate or one claim, whichever is
+    /// more, plus one claim, and starting empty. Prefill keys sit in queues shared by all workers, so the
+    /// rate is too; a per-worker share strands tokens on any worker whose
+    /// endpoints have drained. The spare claim keeps a connection that wakes
+    /// late from discarding tokens that accrue while it sleeps.
+    pub fn paced(rate: u64, claim: u64) -> Self {
+        let claim = claim.max(1);
+        let hold = (rate / 100).max(claim) + claim;
+        Self::build(rate, Duration::from_secs(1), hold, 0, 1, Some(0))
+    }
+
+    /// Take one request's token, or return how long to wait before trying
+    /// again.
+    pub fn try_take(&self) -> Result<(), Duration> {
+        match self.try_wait() {
+            Ok(()) => Ok(()),
+            Err(TryWaitError::Insufficient(wait)) => Err(wait),
+            // Only `n` above the cap; one token is always within it. Kept so
+            // a future cap change backs off rather than spins.
+            Err(_) => Err(Duration::from_millis(1)),
+        }
+    }
+
     /// A limiter at `rate` requests per second holding `burst`, unstaggered,
     /// with one-request claims, starting full.
     pub fn per_second(rate: u64, burst: u64) -> Self {
@@ -158,6 +182,78 @@ impl WorkerLimiter {
     #[cfg(test)]
     pub fn set_max_tokens(&self, requests: u64) {
         self.inner.set_max_tokens(requests.saturating_mul(SUB));
+    }
+}
+
+/// Paces prefill for every worker: one [`WorkerLimiter::paced`] and a count
+/// of the connections it has turned away and that are waiting.
+///
+/// A refused connection sleeps for the time until the next token times the
+/// number already waiting (capped at half the limiter's hold, so no tokens are
+/// discarded while all of them sleep). Sleeping only until the next token woke
+/// every refused connection at once: hundreds of connections polled the
+/// limiter and the prefill queues at the token rate, which cost 5-11 cores of
+/// the load generator during a paced prefill at 256-2048 connections.
+pub struct PrefillPacer {
+    limiter: WorkerLimiter,
+    waiting: AtomicU64,
+    max_sleep: Duration,
+}
+
+/// A connection the pacer turned away: how long to sleep, and its place in
+/// the count of waiting connections until this is dropped.
+pub struct Refused<'a> {
+    pub sleep: Duration,
+    waiting: &'a AtomicU64,
+}
+
+impl Drop for Refused<'_> {
+    fn drop(&mut self) {
+        self.waiting.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl PrefillPacer {
+    pub fn new(rate: u64, claim: u64) -> Self {
+        let limiter = WorkerLimiter::paced(rate, claim);
+        let hold = limiter.max_tokens() as f64 / rate.max(1) as f64;
+        Self {
+            limiter,
+            waiting: AtomicU64::new(0),
+            max_sleep: Duration::from_secs_f64(hold / 2.0),
+        }
+    }
+
+    /// Take one request's token, or count this connection as waiting and say
+    /// how long it should sleep.
+    pub fn try_take(&self) -> Result<(), Refused<'_>> {
+        match self.limiter.try_take() {
+            Ok(()) => Ok(()),
+            Err(wait) => {
+                let waiting = self.waiting.fetch_add(1, Ordering::Relaxed) + 1;
+                let sleep = wait
+                    .saturating_mul(waiting.min(u32::MAX as u64) as u32)
+                    .min(self.max_sleep.max(wait));
+                Err(Refused {
+                    sleep,
+                    waiting: &self.waiting,
+                })
+            }
+        }
+    }
+
+    /// Empty the limiter as prefill begins: it is built before connections
+    /// open and would otherwise open prefill with its hold. Same precondition
+    /// as [`WorkerLimiter::restart`]; nothing takes prefill tokens before the
+    /// Prefill phase.
+    pub fn restart(&self) {
+        self.limiter.restart();
+    }
+
+    /// Connections currently counted as waiting.
+    #[cfg(test)]
+    fn waiting(&self) -> u64 {
+        self.waiting.load(Ordering::Relaxed)
     }
 }
 
@@ -259,6 +355,67 @@ fn share_ceil(rate: u64, weight: u64, total_weight: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paced_starts_empty() {
+        // 10/s: the first token takes 100 ms to accrue.
+        let w = WorkerLimiter::paced(10, 1);
+        assert!(
+            w.try_take().is_err(),
+            "a fresh prefill limiter funded a request"
+        );
+    }
+
+    #[test]
+    fn paced_holds_ten_ms_of_the_rate_plus_a_claim() {
+        // 20K/s: 200 tokens is 10 ms, plus a claim of 1.
+        assert_eq!(WorkerLimiter::paced(20_000, 1).max_tokens(), 201);
+        // Below 100 x claim per second, 10 ms is under a claim: two claims.
+        assert_eq!(WorkerLimiter::paced(50, 4).max_tokens(), 8);
+        assert!((WorkerLimiter::paced(20_000, 1).rate_per_second() - 20_000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_pacer_spreads_waiting_connections() {
+        // 10/s with batches of 10: a token every 100 ms; hold 10 + 10 tokens,
+        // so at most 1 s of sleep. Slow enough that no scheduling delay in a
+        // loaded test run lets a take succeed between these calls.
+        let p = PrefillPacer::new(10, 10);
+        while p.try_take().is_ok() {}
+        let first = p.try_take().unwrap_err();
+        let second = p.try_take().unwrap_err();
+        let third = p.try_take().unwrap_err();
+        assert_eq!(p.waiting(), 3);
+        assert!(
+            first.sleep <= Duration::from_millis(100),
+            "{:?}",
+            first.sleep
+        );
+        // Each further waiter sleeps longer, in proportion to the queue.
+        assert!(second.sleep > first.sleep && third.sleep > second.sleep);
+        assert!(
+            third.sleep <= Duration::from_millis(300),
+            "{:?}",
+            third.sleep
+        );
+        drop((first, second, third));
+        assert_eq!(p.waiting(), 0);
+        // A long queue is capped at half the hold.
+        let many: Vec<_> = (0..100).map(|_| p.try_take().unwrap_err()).collect();
+        assert!(many.iter().all(|r| r.sleep <= Duration::from_secs(1)));
+        assert!(many.last().unwrap().sleep >= Duration::from_millis(900));
+    }
+
+    #[test]
+    fn try_take_reports_the_wait_when_empty() {
+        let w = WorkerLimiter::paced(10, 1);
+        while w.try_take().is_ok() {}
+        let wait = w.try_take().unwrap_err();
+        assert!(
+            wait > Duration::ZERO && wait <= Duration::from_millis(100),
+            "{wait:?}"
+        );
+    }
 
     #[test]
     fn shares_follow_connections_and_sum_to_the_rate() {
@@ -395,7 +552,10 @@ mod tests {
     fn staggered_workers_cross_a_claim_at_different_times() {
         // Drain each worker to below one claim; the time until its next claim
         // is fundable differs by worker, spread across the claim interval.
-        let l = WorkerLimiters::new(800, &[1; 8], 1);
+        // Each limiter accrues from its own build, so a delay between builds
+        // shifts its phase; at 1/s per worker it takes a 175 ms delay to
+        // break the bound, where at 100/s 1.75 ms did.
+        let l = WorkerLimiters::new(8, &[1; 8], 1);
         let mut waits = Vec::new();
         for i in 0..8 {
             let rl = l.worker(i).unwrap();
@@ -405,11 +565,11 @@ mod tests {
                 other => panic!("worker {i}: {other:?}"),
             }
         }
-        // 100/s per worker: a claim every 10 ms. The waits should be spread
-        // over that interval, not identical.
+        // 1/s per worker: a claim every second, staggered by 125 ms. The
+        // waits should be spread over that interval, not identical.
         let min = waits.iter().min().unwrap();
         let max = waits.iter().max().unwrap();
-        assert!(*max - *min >= Duration::from_millis(7), "waits {waits:?}");
+        assert!(*max - *min >= Duration::from_millis(700), "waits {waits:?}");
     }
 
     #[test]

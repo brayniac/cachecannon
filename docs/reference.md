@@ -174,6 +174,10 @@ prefill = false
 # Timeout for prefill phase (default: 300s, 0 to disable)
 prefill_timeout = "300s"
 
+# Prefill pace (requests/second, optional)
+# Omit or set to 0 for an unpaced prefill
+# prefill_rate_limit = 10000
+
 # Automatically SET on GET miss (cache-aside pattern)
 # See guide.md "Backfill on Miss" section for details
 backfill_on_miss = false

@@ -634,6 +634,38 @@ mod tests {
     }
 
     #[test]
+    fn keyspace_flag_is_checked_against_the_prefill_pace() {
+        // Removed when the test ends, failed assertions included.
+        struct Remove(std::path::PathBuf);
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let path = std::env::temp_dir().join(format!(
+            "valkey-lab-prefill-pace-{}.toml",
+            std::process::id()
+        ));
+        let _remove = Remove(path.clone());
+        std::fs::write(
+            &path,
+            "[target]\nendpoints = [\"127.0.0.1:6379\"]\n\
+             [workload]\nprefill = true\nprefill_rate_limit = 1000\n\
+             [workload.keyspace]\ncount = 1000\n",
+        )
+        .unwrap();
+        let config = path.to_str().unwrap();
+
+        // 1,000 keys at 1,000/s fits the default 300 s timeout; 1,000,000 does
+        // not, and the check runs after `--keyspace` is applied.
+        assert!(build_config(&bench(&["--config", config, "--keyspace", "1000"])).is_ok());
+        let err = build_config(&bench(&["--config", config, "--keyspace", "1000000"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("prefill_timeout"), "{err}");
+    }
+
+    #[test]
     fn test_parse_ratio_valid() {
         assert_eq!(parse_ratio("80:20").unwrap(), (80, 20));
         assert_eq!(parse_ratio("50:50").unwrap(), (50, 50));

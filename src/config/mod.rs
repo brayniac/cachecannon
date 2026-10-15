@@ -286,6 +286,14 @@ fn default_request_timeout() -> Duration {
 pub struct Workload {
     #[serde(default)]
     pub rate_limit: Option<u64>,
+    /// Requests per second during prefill, across all connections. Omit or set
+    /// to 0 for an unpaced prefill, which writes as fast as the connections
+    /// allow. All workers draw on one limiter, which starts empty when prefill
+    /// begins and holds at most 10 ms of the rate or one batch, whichever is
+    /// more, plus one batch, so prefill does not open with a burst.
+    /// `keyspace.count / prefill_rate_limit` must fit in `prefill_timeout`.
+    #[serde(default)]
+    pub prefill_rate_limit: Option<u64>,
     /// Prefill the cache with all keys before starting the benchmark.
     /// When enabled, each key in the keyspace is written exactly once
     /// before the warmup phase begins.
@@ -951,6 +959,27 @@ impl Config {
         Ok(config)
     }
 
+    /// A paced prefill takes about keys / rate seconds; one that cannot finish
+    /// inside `prefill_timeout` would fail after the full timeout.
+    fn validate_prefill_pace(&self) -> Result<(), ConfigError> {
+        if self.workload.prefill
+            && let Some(rate) = self.workload.prefill_rate_limit.filter(|&r| r > 0)
+            && !self.workload.prefill_timeout.is_zero()
+        {
+            let needed = self.workload.keyspace.count as f64 / rate as f64;
+            let timeout = self.workload.prefill_timeout.as_secs_f64();
+            if needed > timeout {
+                return Err(ConfigError::Validation(format!(
+                    "prefill of {} keys at prefill_rate_limit = {rate} takes about \
+                     {needed:.0}s, longer than prefill_timeout ({timeout:.0}s); raise \
+                     prefill_timeout or set it to \"0s\"",
+                    self.workload.keyspace.count
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Validate config invariants that can't be expressed via serde alone.
     /// [`load`](Self::load) calls it; a caller that changes a loaded or
     /// default config (valkey-lab's CLI flags) must call it again.
@@ -964,6 +993,8 @@ impl Config {
         if self.general.threads == 0 {
             return Err(ConfigError::Validation("threads must be >= 1".to_string()));
         }
+
+        self.validate_prefill_pace()?;
 
         // io_uring's provided-buffer ring is indexed by a mask, so ringline
         // rejects a non-power-of-two. Catching it here names the config key
@@ -1778,6 +1809,30 @@ mod validation_tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("length = 36"));
+    }
+
+    #[test]
+    fn rejects_a_paced_prefill_longer_than_its_timeout() {
+        let cfg = |timeout: &str, prefill: bool| {
+            parse_config(&format!(
+                r#"
+                [target]
+                endpoints = ["127.0.0.1:6379"]
+                [workload]
+                prefill = {prefill}
+                prefill_rate_limit = 1000
+                prefill_timeout = "{timeout}"
+                [workload.keyspace]
+                count = 400000
+                "#
+            ))
+        };
+        // 400 s of prefill against the default 300 s timeout.
+        let err = cfg("300s", true).unwrap_err().to_string();
+        assert!(err.contains("prefill_timeout"), "{err}");
+        assert!(cfg("500s", true).is_ok());
+        assert!(cfg("0s", true).is_ok());
+        assert!(cfg("300s", false).is_ok());
     }
 
     #[test]
