@@ -1417,7 +1417,7 @@ checksum = "02477b4e4b5454c404fa7ef505c85cacb89fee3987793f9a3a2bd9ab556c4e3b"
 [[package]]
 name = "kvtrace"
 version = "0.1.0"
-source = "git+https://github.com/pelikan-io/cachesim?rev=96ed8279af6d664e8ffa87e19ea92b00b29002ff#96ed8279af6d664e8ffa87e19ea92b00b29002ff"
+source = "git+https://github.com/pelikan-io/cachesim?rev=6789f4cdb8f7a0d5fdb4af0c2649fa591b44555a#6789f4cdb8f7a0d5fdb4af0c2649fa591b44555a"
 dependencies = [
  "arrow",
  "parquet",

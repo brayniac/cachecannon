@@ -107,7 +107,7 @@ webpki-roots = "0.26"
 # Request-level KV-cache traces, model geometry and the request-to-object
 # mapping (`[workload.kv_replay]`). Pinned to a commit of pelikan-io/cachesim
 # main; `hf-fetch` (an HTTP client for Hugging Face) is off.
-kvtrace = { git = "https://github.com/pelikan-io/cachesim", rev = "96ed8279af6d664e8ffa87e19ea92b00b29002ff", default-features = false }
+kvtrace = { git = "https://github.com/pelikan-io/cachesim", rev = "6789f4cdb8f7a0d5fdb4af0c2649fa591b44555a", default-features = false }
 
 # Rate limiting
 ratelimit = "2.0.0"
