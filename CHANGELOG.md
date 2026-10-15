@@ -99,6 +99,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lookup). The pool was, and still is, capped there; sends past it fail and
   are counted in `requests_send_failed`. Before, the cap was applied without
   a message.
+- rustls 0.23.45 → 0.23.46 for RUSTSEC-2026-0346, -0347, -0348 and -0349,
+  published 2026-10-14, which failed `cargo audit` in CI.
 - `keyspace.zipf_theta` must now be in (0, 10]; larger values were accepted
   before. A large theta could underflow every key weight on an endpoint,
   which the per-endpoint alias tables cannot sample.
