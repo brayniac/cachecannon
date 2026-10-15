@@ -593,7 +593,15 @@ mod tests {
 
         // A KV replay config rejects rate limiting; `--rate-limit` must not
         // get past that.
+        // Removed when the test ends, failed assertions included.
+        struct Remove(std::path::PathBuf);
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
         let path = std::env::temp_dir().join(format!("valkey-lab-kv-{}.toml", std::process::id()));
+        let _remove = Remove(path.clone());
         std::fs::write(
             &path,
             "[target]\nendpoints = [\"127.0.0.1:6379\"]\n\
@@ -622,7 +630,6 @@ mod tests {
             panic!("not parsed as saturate");
         };
         let err = build_config_from_saturate(&args).unwrap_err().to_string();
-        std::fs::remove_file(&path).unwrap();
         assert!(err.contains("saturation_search"), "{err}");
     }
 

@@ -164,8 +164,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `valkey-lab` validates its config after applying the CLI flags. The flags
   were applied after `Config::load` validated the file (or to an unvalidated
   default config without `--config`), so they could set what a config file
-  could not: `--threads 0`, `--connections 0`, or `--rate-limit` and
-  `saturate` on a `kv_replay` config. Those are now rejected before the run.
+  could not: `--threads 0` (which hung), `--connections 0` (which ran
+  nothing and exited 0), `--data-size 0`, `--distribution` other than
+  `recency` on an `[workload.append]` config, or `--rate-limit`,
+  `--prefill`, `--cluster` and `saturate` on a `kv_replay` config. Those
+  are now rejected before the run, naming the config key.
 - A run with `rate_limit` no longer opens with a burst. Each worker's limiter
   started full and kept refilling while connections opened and prefill ran,
   so warmup began by releasing a second's share of requests at once: about
