@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 
 /// Wall time within which a replay that should end before `duration` (60 s
 /// in [`replay_file`]) must finish. It covers startup, which fills a 1 GiB
-/// value pool and took 3.3-3.4 s alone and up to about 12 s in a loaded test
-/// suite on macOS, plus the replay itself; a run that reaches `duration`
-/// exceeds it.
+/// value pool and takes about 3.4 s alone, plus the replay; one run of a
+/// whole timed test took 11.8 s in a loaded suite on macOS. A run that
+/// reaches `duration` exceeds it.
 pub const RUN_BOUND: Duration = Duration::from_secs(30);
 
 /// Tokens per chunk in every test trace.
@@ -469,7 +469,11 @@ pub fn replay_file(
         ("warmup", "warmup = \"0s\""),
     ]
     .into_iter()
-    .filter(|(key, _)| !overrides.iter().any(|o| o.starts_with(key)))
+    .filter(|(key, _)| {
+        !overrides
+            .iter()
+            .any(|o| o.split('=').next().map(str::trim) == Some(*key))
+    })
     .map(|(_, line)| line)
     .chain(overrides.iter().copied())
     .collect::<Vec<_>>()
