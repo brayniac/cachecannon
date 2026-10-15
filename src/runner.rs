@@ -1073,6 +1073,20 @@ pub fn run_benchmark_full(
 
     drop(_admin_handle);
 
+    // The results above cover the requests before the error; the run still
+    // fails, because it did not replay the trace it was given.
+    if let Some(e) = kv_replay.as_ref().and_then(|kv| kv.trace_error()) {
+        return Err(e.into());
+    }
+    let read_waits = metrics::KV_TRACE_READ_WAITS.value();
+    if read_waits > 0 {
+        tracing::warn!(
+            read_waits,
+            "kv replay: connections waited for the trace reader; kv_schedule_lag includes \
+             that wait"
+        );
+    }
+
     Ok(())
 }
 

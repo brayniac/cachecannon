@@ -1275,8 +1275,14 @@ impl Config {
                 kv.speedup
             ));
         }
-        if kv.tp == 0 || kv.tp > kvtrace::MAX_TP {
-            return bad(&format!("tp must be in 1..={}", kvtrace::MAX_TP));
+        // With tp > 1 every rank's operations would share the request's one
+        // connection; an engine's ranks each have their own (#214).
+        if kv.tp != 1 {
+            return bad(&format!(
+                "tp must be 1, got {}: tensor parallelism needs one connection per rank, \
+                 which kv_replay does not do yet (cachecannon#214)",
+                kv.tp
+            ));
         }
         // A request's GETs and SETs are sent at most pipeline_depth at a time;
         // with 0 none would be sent and the replay would wait for a reply to
@@ -1485,8 +1491,8 @@ mod validation_tests {
     fn kv_replay_rejects_bad_values_and_synthetic_options() {
         for (kv, extra, want) in [
             ("speedup = -1.0", "", "speedup"),
-            ("tp = 0", "", "tp must be"),
-            ("tp = 4097", "", "tp must be"),
+            ("tp = 0", "", "tp must be 1"),
+            ("tp = 2", "", "one connection per rank"),
             ("", "[connection]\npipeline_depth = 0", "pipeline_depth"),
             ("", "[workload]\nrate_limit = 1000", "rate_limit"),
             ("", "[workload]\nprefill = true", "prefill"),

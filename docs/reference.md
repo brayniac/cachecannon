@@ -279,8 +279,8 @@ does and how tokens are counted.
 
 ```toml
 [workload.kv_replay]
-# kvtrace request trace (Parquet). Read into memory at startup and sorted by
-# timestamp.
+# kvtrace request trace (Parquet), in timestamp order (kvtrace enforces it).
+# Read during the run, at most 16,384 requests ahead of the replay.
 trace = "requests.parquet"
 
 # Trace time is divided by this: 10 replays ten times faster than recorded.
@@ -300,9 +300,9 @@ model_config = "config.json"
 # only at full size. Default false.
 # mla = false
 
-# Tensor-parallel degree. A dense model stores one object per rank per chunk,
-# each 1/min(tp, kv_heads) of the chunk when model_config gives the KV head
-# count, 1/tp otherwise. Default 1.
+# Tensor-parallel degree. Only 1 is accepted: tensor parallelism needs one
+# connection per rank, which kv_replay does not open yet (cachecannon#214).
+# Default 1.
 tp = 1
 
 # Which objects a trace request SETs after its lookup:
@@ -333,11 +333,13 @@ run ends when every trace request has finished. Trace requests that finish
 during `general.warmup` are not recorded.
 
 Rejected at config load: protocols other than `resp` and `resp3`, more than one
-endpoint, `cluster = true`, `connection.pipeline_depth = 0`, `rate_limit`, `[workload.saturation_search]`,
+endpoint, `cluster = true`, `connection.pipeline_depth = 0`, `tp` other than 1, `rate_limit`, `[workload.saturation_search]`,
 `prefill`, `backfill_on_miss`, `read_values` and `[workload.append]`. Rejected
-when the run starts: an empty trace, a model with recurrent state (a hybrid
-linear-attention model), and a `tp` the model's head counts or per-token size
-do not divide.
+when the run starts: an empty trace, a trace file kvtrace cannot open, and a
+model with recurrent state (a hybrid linear-attention model). A read error
+after the run starts (a corrupt batch, a row out of timestamp order) stops
+the replay at that row; the requests already read finish, the results print,
+and the run exits with the error.
 
 #### KV replay results
 
@@ -737,6 +739,7 @@ Each snapshot contains the full set of metrics. The file uses the metriken expos
 | `kv_exists_count` | KV replay: EXISTS operations |
 | `kv_lookups`, `kv_loads`, `kv_stores` | KV replay: requests with a lookup, GETs, SETs (sample counts of the time histograms) |
 | `kv_loads_with_cached_tokens` | KV replay: requests with GETs that ended with cached tokens (sample count of `kv_load_time_per_1k_tokens`) |
+| `kv_trace_read_waits` | KV replay: times a dispatcher had an idle connection and no request because the trace reader had not read the next one. Non-zero means the generator delayed requests; the run logs a warning |
 
 **Gauges** (point-in-time values):
 

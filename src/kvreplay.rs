@@ -52,7 +52,7 @@ use std::future::Future;
 use std::io::{BufWriter, Write};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
@@ -63,10 +63,22 @@ pub const REQUESTS_OUT_HEADER: &str = "req_id,timestamp_ns,lag_ns,input_tokens,c
 lookup_hit_chunks,hit_chunks,cached_tokens,new_tokens,gets,get_nil,sets,lookup_ns,load_ns,\
 store_ns,recorded";
 
-/// A loaded trace and the state of its replay, shared by every worker.
+/// Trace requests the reader thread may hold ready ahead of the replay.
+/// Bounds the replay's trace memory at this many requests, whatever the
+/// file's length.
+const READ_AHEAD: usize = 16_384;
+
+/// A trace being replayed and the state of its replay, shared by every
+/// worker.
 pub struct KvReplay {
-    /// The trace, sorted by timestamp.
-    requests: Vec<Request>,
+    /// Requests in file order, which kvtrace requires to be arrival order,
+    /// from the reader thread (`spawn_reader`). Disconnected once the reader
+    /// has stopped and every request it sent has been taken.
+    requests: crossbeam_channel::Receiver<Request>,
+    /// What the reader thread has done; see [`ReaderState`].
+    reader: Arc<ReaderState>,
+    /// Requests in the file, from its footer.
+    trace_requests: usize,
     /// Timestamp of the first request; trace time 0.
     first_ts: i64,
     chunk_tokens: u64,
@@ -80,34 +92,29 @@ pub struct KvReplay {
     max_objects: usize,
     /// When trace time 0 is, set by the runner as warmup starts.
     start: OnceLock<Instant>,
-    /// Index of the next request to hand out.
-    next: AtomicUsize,
     /// Requests finished, replayed or failed.
     finished: AtomicUsize,
     log: Option<Mutex<BufWriter<File>>>,
 }
 
 impl KvReplay {
-    /// Read the model geometry and the trace, and open `requests_out`.
+    /// Read the model geometry and the trace's first request, open
+    /// `requests_out`, and start the thread that reads the rest of the trace.
     pub fn load(cfg: &crate::config::KvReplay) -> Result<Self, String> {
         let geometry = geometry(cfg)?;
-        let reader = RequestReader::open(&cfg.trace)
-            .map_err(|e| format!("kv_replay trace {}: {e}", cfg.trace.display()))?;
+        let trace_err = |e: kvtrace::Error| format!("kv_replay trace {}: {e}", cfg.trace.display());
+        let mut reader = RequestReader::open(&cfg.trace).map_err(trace_err)?;
         let chunk_tokens = u64::from(reader.chunk_tokens());
-        let mut requests = reader
-            .collect::<Result<Vec<Request>, _>>()
-            .map_err(|e| format!("kv_replay trace {}: {e}", cfg.trace.display()))?;
+        let trace_requests = reader.total_requests();
+        let max_chunks = reader.max_chunks().map_err(trace_err)?;
         // With nothing to replay the run would end at once and report
         // nothing recorded, which reads as a timing problem.
-        if requests.is_empty() {
+        let Some(first) = reader.next().transpose().map_err(trace_err)? else {
             return Err(format!(
                 "kv_replay trace {}: no requests",
                 cfg.trace.display()
             ));
-        }
-        // Requests arrive in timestamp order; a stable sort keeps the file
-        // order among equal timestamps.
-        requests.sort_by_key(|r| r.timestamp);
+        };
         let mapper = ObjectMapper::new(&geometry, chunk_tokens)
             .map_err(|e| format!("kv_replay geometry: {e}"))?;
 
@@ -121,12 +128,7 @@ impl KvReplay {
             ));
         }
         let ranks = mapper.sharding().ranks as usize;
-        let max_objects = requests
-            .iter()
-            .map(|r| r.chunks.len())
-            .max()
-            .unwrap_or(0)
-            .saturating_mul(ranks);
+        let max_objects = max_chunks.saturating_mul(ranks);
 
         let log = match cfg.requests_out {
             Some(ref path) => {
@@ -142,7 +144,7 @@ impl KvReplay {
         };
 
         tracing::info!(
-            requests = requests.len(),
+            requests = trace_requests,
             chunk_tokens,
             ranks,
             object_bytes = object_size,
@@ -152,12 +154,16 @@ impl KvReplay {
                 format!("open-loop at {}x", cfg.speedup)
             },
             write_rule = cfg.write_rule.as_str(),
-            "kv replay trace loaded"
+            "kv replay trace opened"
         );
 
+        let first_ts = first.timestamp;
+        let (requests, state) = spawn_reader(cfg.trace.clone(), reader, first)?;
         Ok(Self {
-            first_ts: requests.first().map_or(0, |r| r.timestamp),
             requests,
+            reader: state,
+            trace_requests,
+            first_ts,
             chunk_tokens,
             mapper,
             key_prefix: cfg.key_prefix.as_bytes().to_vec(),
@@ -166,19 +172,24 @@ impl KvReplay {
             speedup: cfg.speedup,
             max_objects,
             start: OnceLock::new(),
-            next: AtomicUsize::new(0),
             finished: AtomicUsize::new(0),
             log,
         })
     }
 
-    /// Trace requests in the replay.
+    /// Requests in the trace file.
     pub fn len(&self) -> usize {
-        self.requests.len()
+        self.trace_requests
     }
 
     pub fn is_empty(&self) -> bool {
-        self.requests.is_empty()
+        self.trace_requests == 0
+    }
+
+    /// The error that stopped the reader thread before the end of the
+    /// trace, if one did. The requests after it were not replayed.
+    pub fn trace_error(&self) -> Option<String> {
+        self.reader.error.get().cloned()
     }
 
     pub fn closed_loop(&self) -> bool {
@@ -211,9 +222,11 @@ impl KvReplay {
         let _ = self.start.set(at);
     }
 
-    /// True once every trace request has finished.
+    /// True once the reader thread has stopped and every request it sent
+    /// has finished: the whole trace, or the requests before a read error.
     pub fn is_finished(&self) -> bool {
-        self.finished.load(Ordering::Acquire) >= self.requests.len()
+        self.reader.stopped.load(Ordering::Acquire)
+            && self.finished.load(Ordering::Acquire) >= self.reader.sent.load(Ordering::Acquire)
     }
 
     /// Flush the `requests_out` file.
@@ -225,18 +238,21 @@ impl KvReplay {
         }
     }
 
-    /// Claim the next trace request, or `None` when all have been handed out.
-    fn claim(&self) -> Option<usize> {
-        let i = self.next.fetch_add(1, Ordering::Relaxed);
-        (i < self.requests.len()).then_some(i)
+    /// Claim the next trace request.
+    fn claim(&self) -> Claim {
+        match self.requests.try_recv() {
+            Ok(req) => Claim::Request(req),
+            Err(crossbeam_channel::TryRecvError::Empty) => Claim::NotReady,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => Claim::Exhausted,
+        }
     }
 
-    /// When request `index` is due, in open loop.
-    fn scheduled_at(&self, start: Instant, index: usize) -> Option<Instant> {
+    /// When `req` is due, in open loop.
+    fn scheduled_at(&self, start: Instant, req: &Request) -> Option<Instant> {
         if self.closed_loop() {
             return None;
         }
-        let trace_ns = self.requests[index].timestamp.saturating_sub(self.first_ts) as f64;
+        let trace_ns = req.timestamp.saturating_sub(self.first_ts) as f64;
         Some(start + Duration::from_nanos((trace_ns / self.speedup) as u64))
     }
 
@@ -291,6 +307,65 @@ impl KvReplay {
 /// rejected: kvtrace's hybrid geometry is an approximation whose object
 /// sizes, allowed chunk length and snapshot count differ from vLLM and
 /// LMCache (kvtrace `objects` module docs, "Hybrid models").
+/// What the reader thread has done, for deciding when the replay is over.
+#[derive(Default)]
+struct ReaderState {
+    /// Requests sent into the channel, counted before each send.
+    sent: AtomicUsize,
+    /// Set once the thread has sent its last request.
+    stopped: AtomicBool,
+    /// The read error that stopped it before the end of the trace.
+    error: OnceLock<String>,
+}
+
+/// The result of [`KvReplay::claim`].
+enum Claim {
+    Request(Request),
+    /// The reader thread has not read the next request yet.
+    NotReady,
+    /// Every request has been handed out.
+    Exhausted,
+}
+
+/// Start the thread that reads `reader` (positioned after `first`) into a
+/// channel of at most [`READ_AHEAD`] requests, `first` first. The thread
+/// stops at the end of the trace, at a read error (recorded in
+/// [`ReaderState::error`] and logged), or when the receiver is dropped.
+fn spawn_reader(
+    path: std::path::PathBuf,
+    reader: RequestReader,
+    first: Request,
+) -> Result<(crossbeam_channel::Receiver<Request>, Arc<ReaderState>), String> {
+    let (tx, rx) = crossbeam_channel::bounded(READ_AHEAD);
+    let state = Arc::new(ReaderState::default());
+    let thread_state = Arc::clone(&state);
+    std::thread::Builder::new()
+        .name("kv-trace-reader".into())
+        .spawn(move || {
+            let state = thread_state;
+            for req in std::iter::once(Ok(first)).chain(reader) {
+                match req {
+                    Ok(req) => {
+                        state.sent.fetch_add(1, Ordering::AcqRel);
+                        if tx.send(req).is_err() {
+                            // The replay was dropped: the run is over.
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let msg = format!("kv_replay trace {}: {e}", path.display());
+                        tracing::error!("{msg}; the requests after it are not replayed");
+                        let _ = state.error.set(msg);
+                        break;
+                    }
+                }
+            }
+            state.stopped.store(true, Ordering::Release);
+        })
+        .map_err(|e| format!("kv_replay: cannot start the trace reader thread: {e}"))?;
+    Ok((rx, state))
+}
+
 pub fn geometry(cfg: &crate::config::KvReplay) -> Result<Geometry, String> {
     let sizes = match (&cfg.model_config, cfg.kv_bytes_per_token) {
         (Some(path), _) => ModelSizes::from_config_file(path, cfg.kv_dtype.as_deref())
@@ -386,9 +461,9 @@ enum Failure {
 // ── Dispatcher ─────────────────────────────────────────────────────────────
 
 /// A trace request handed to a connection.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct KvJob {
-    index: usize,
+    req: Request,
     /// When the trace says it starts; `None` in closed loop.
     scheduled: Option<Instant>,
     /// Handed back once already because its connection closed after its
@@ -400,9 +475,9 @@ struct KvJob {
 }
 
 impl KvJob {
-    fn new(index: usize, scheduled: Option<Instant>) -> Self {
+    fn new(req: Request, scheduled: Option<Instant>) -> Self {
         Self {
-            index,
+            req,
             scheduled,
             retried: false,
             dead_handovers: 0,
@@ -489,7 +564,7 @@ impl KvDispatcher {
             slot: Rc::clone(&slot),
         }
         .await;
-        slot.job.get()
+        slot.job.take()
     }
 
     /// Give a request back to run on the next idle connection. Returns false,
@@ -670,7 +745,9 @@ async fn run_dispatcher(dispatch: Rc<KvDispatcher>, kv: Arc<KvReplay>, shared: A
         // connected joins the handed-back ones: it runs on the first
         // connection back, or fails under the rule below.
         if dispatch.live.get() == 0
-            && pending.is_some_and(|j| j.scheduled.is_none_or(|d| d <= Instant::now()))
+            && pending
+                .as_ref()
+                .is_some_and(|j| j.scheduled.is_none_or(|d| d <= Instant::now()))
         {
             let job = pending.take().unwrap();
             dispatch
@@ -690,15 +767,28 @@ async fn run_dispatcher(dispatch: Rc<KvDispatcher>, kv: Arc<KvReplay>, shared: A
                 metrics::KV_REQUESTS_FAILED.increment();
             }
         }
+        let mut reader_behind = false;
         if has_slot && pending.is_none() && !exhausted {
             match kv.claim() {
-                Some(index) => pending = Some(KvJob::new(index, kv.scheduled_at(start, index))),
-                None => exhausted = true,
+                Claim::Request(req) => {
+                    let scheduled = kv.scheduled_at(start, &req);
+                    pending = Some(KvJob::new(req, scheduled));
+                    continue;
+                }
+                Claim::Exhausted => {
+                    exhausted = true;
+                    continue;
+                }
+                // A connection is idle and the next request has not been
+                // read: the generator, not the server, is holding it up.
+                Claim::NotReady => {
+                    metrics::KV_TRACE_READ_WAITS.increment();
+                    reader_behind = true;
+                }
             }
-            continue;
         }
         let now = Instant::now();
-        let due_in = pending.map(|j| {
+        let due_in = pending.as_ref().map(|j| {
             j.scheduled
                 .map_or(Duration::ZERO, |d| d.saturating_duration_since(now))
         });
@@ -718,6 +808,9 @@ async fn run_dispatcher(dispatch: Rc<KvDispatcher>, kv: Arc<KvReplay>, shared: A
         dispatch.wants_slot.set(needs_slot);
         let nap = match due_in {
             Some(d) if !d.is_zero() => d.min(IDLE_SLEEP_MAX),
+            // Polled at `START_POLL` until the reader catches up, which
+            // bounds how late that makes a request.
+            _ if reader_behind => START_POLL,
             _ => IDLE_SLEEP_MAX,
         };
         let mut timer = std::pin::pin!(ringline::sleep(nap));
@@ -822,18 +915,31 @@ pub(crate) async fn drive(
             return Err(DisconnectReason::Eof);
         }
         ran_any = true;
-        let req = &ctx.kv.requests[job.index];
         let started = Instant::now();
         let lag_ns = job
             .scheduled
             .map(|due| started.saturating_duration_since(due).as_nanos() as u64);
-        let result = run_request(client, conn, ctx, rng, &mut inflight, &mut scratch, req).await;
-        if let Err(Failure::Closed) = result
-            && dispatch.give_back(job, HandBack::LookupSent)
-        {
+        let result = run_request(
+            client,
+            conn,
+            ctx,
+            rng,
+            &mut inflight,
+            &mut scratch,
+            &job.req,
+        )
+        .await;
+        if let Err(Failure::Closed) = result {
+            if !dispatch.give_back(job, HandBack::LookupSent) {
+                // Closed a second time: counted as failed rather than
+                // retried again.
+                ctx.kv.mark_finished();
+                metrics::KV_REQUESTS_FAILED.increment();
+            }
             return Err(DisconnectReason::Eof);
         }
         ctx.kv.mark_finished();
+        let req = &job.req;
         match result {
             Ok(outcome) => {
                 // Recorded with the rest of the request's samples, when it
@@ -846,12 +952,7 @@ pub(crate) async fn drive(
                 ctx.kv.write_row(req, lag_ns, &outcome, recorded);
             }
             Err(Failure::Request) => metrics::KV_REQUESTS_FAILED.increment(),
-            // Closed a second time: counted as failed rather than retried
-            // again.
-            Err(Failure::Closed) => {
-                metrics::KV_REQUESTS_FAILED.increment();
-                return Err(DisconnectReason::Eof);
-            }
+            Err(Failure::Closed) => unreachable!("handled above"),
             Err(Failure::Disconnect(reason)) => {
                 metrics::KV_REQUESTS_FAILED.increment();
                 return Err(reason);
@@ -1215,7 +1316,7 @@ impl KvReplay {
             closed_loop: self.closed_loop(),
             speedup: self.speedup,
             write_rule: self.write_rule.as_str(),
-            trace_requests: self.requests.len() as u64,
+            trace_requests: self.trace_requests as u64,
             requests: d(0),
             requests_failed: d(1),
             input_tokens: d(2),
@@ -1309,6 +1410,40 @@ mod tests {
         let err = KvReplay::load(&c).err().unwrap();
         std::fs::remove_file(&path).unwrap();
         assert!(err.ends_with("no requests"), "{err}");
+    }
+
+    /// An empty channel while the reader is still running is "not ready",
+    /// not the end of the trace; only a disconnected channel ends it.
+    #[test]
+    fn claim_waits_for_the_reader_and_ends_when_it_stops() {
+        let path = std::env::temp_dir().join(format!(
+            "cachecannon-kv-claim-{}.parquet",
+            std::process::id()
+        ));
+        let mut w = kvtrace::RequestWriter::create(&path, 16, 1).unwrap();
+        w.write(&Request {
+            timestamp: 7,
+            req_id: 1,
+            input_tokens: 16,
+            output_tokens: 1,
+            chunks: vec![1],
+            session_id: None,
+        })
+        .unwrap();
+        w.finish().unwrap();
+        let mut c = cfg(Some(4));
+        c.trace = path.clone();
+        let mut kv = KvReplay::load(&c).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(kv.first_ts, 7);
+        assert!(matches!(kv.claim(), Claim::Request(r) if r.req_id == 1));
+
+        // A reader that has sent nothing yet.
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        kv.requests = rx;
+        assert!(matches!(kv.claim(), Claim::NotReady));
+        drop(tx);
+        assert!(matches!(kv.claim(), Claim::Exhausted));
     }
 
     #[test]

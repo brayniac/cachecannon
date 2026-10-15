@@ -13,8 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   LLM serving engine's KV-cache prefix store, and reports prompt tokens
   served from the cache and computed. Object ids and sizes come from
   kvtrace's `ObjectMapper` for a model geometry given as a Hugging Face
-  `config.json` or as KV bytes per token, with tensor parallelism (one
-  object per rank for dense models, rank 0 only for MLA). Per trace request:
+  `config.json` or as KV bytes per token; `tp` must be 1 (tensor
+  parallelism needs a connection per rank, #214). The trace is streamed by
+  a reader thread, at most 16,384 requests ahead, so its length does not
+  bound memory; a read error partway through stops the replay and fails the
+  run after printing results. Per trace request:
   one pipelined EXISTS per object, a GET of each object in the hit prefix,
   then SETs from the end of the prefix (`write_rule = "set-from-miss"`,
   the default) or of every object EXISTS did not find
@@ -33,6 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metric here, so `/metrics`, `/metrics/binary`, `/metrics/stream` and the
   parquet recording of every run now carry them, as zeros when
   `kv_replay` is not set (the `append_*` metrics already behave this way).
+  `kv_trace_read_waits` counts idle connections that waited on the trace
+  reader.
 - `[admin] listen` serves `GET /metrics/stream[?interval=..&layout=wide|long]`,
   metriken-exposition's stream route: dendro replication frames
   (`application/vnd.metriken.replication.v1+dendro`), a handshake with

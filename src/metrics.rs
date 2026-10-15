@@ -243,6 +243,7 @@ pub mod kv {
     pub const LOADS: usize = 11;
     pub const STORES: usize = 12;
     pub const LOADS_WITH_CACHED: usize = 13;
+    pub const TRACE_READ_WAITS: usize = 14;
 }
 
 #[metric(
@@ -298,6 +299,13 @@ pub static KV_NO_FULL_CHUNK: Counter = Counter::new(&KV, kv::NO_FULL_CHUNK);
     description = "KV replay: GETs of an object whose EXISTS returned 1 that returned nil"
 )]
 pub static KV_GET_NIL: Counter = Counter::new(&KV, kv::GET_NIL);
+
+#[metric(
+    name = "kv_trace_read_waits",
+    description = "KV replay: times a dispatcher had an idle connection and no trace request \
+                   because the trace reader had not read the next one yet"
+)]
+pub static KV_TRACE_READ_WAITS: Counter = Counter::new(&KV, kv::TRACE_READ_WAITS);
 
 #[metric(name = "kv_exists_count", description = "KV replay: EXISTS operations")]
 pub static KV_EXISTS_COUNT: Counter = Counter::new(&KV, kv::EXISTS);

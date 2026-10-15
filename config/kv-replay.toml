@@ -37,6 +37,7 @@ model_config = "config.json"
 # ... or from KV bytes per token over all layers:
 # kv_bytes_per_token = 131072
 # mla = false
+# Only 1 is accepted (cachecannon#214).
 tp = 1
 # "set-from-miss" or "insert-if-absent".
 write_rule = "set-from-miss"

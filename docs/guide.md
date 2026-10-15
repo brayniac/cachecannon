@@ -234,7 +234,6 @@ pipeline_depth = 32  # GETs or SETs in flight within one trace request
 trace = "requests.parquet"
 speedup = 1.0
 model_config = "config.json"
-tp = 2
 requests_out = "kv-requests.csv"
 ```
 
@@ -256,19 +255,31 @@ tokens per chunk in the file metadata. Equal chunk ids mean equal prefix
 content. Tokens after the last full chunk are not represented, because LMCache
 does not store a partial chunk.
 
+Rows are in timestamp order; kvtrace's writer and reader both enforce it. A
+reader thread streams the file during the run, at most 16,384 requests ahead
+of the replay, so trace length does not bound memory. Two things are read
+before the run starts: the first request, and the most chunks in any request
+(the footer's `kvtrace.max_chunks`, or a pass over the `chunks` column for a
+file without it), which sizes the send pool. A read error later in the file,
+including a row out of timestamp order, stops the replay at that row: the
+requests already read finish, the results print, and the run exits with the
+error. `kv_trace_read_waits` counts the times a connection was idle because
+the reader had not read the next request; that wait is part of
+`kv_schedule_lag`.
+
 kvtrace's `ObjectMapper` turns a request's chunks into the objects the engine
 stores, for a model geometry: one object per chunk per storing rank, keyed
 `key_prefix` + the object id (`chunk << 16 | slot << 12 | rank`), sized
 chunk tokens × KV bytes per token held by that rank. Following LMCache v0.5.5
 (05a013b) and vLLM v0.31.0 (db9527a), as kvtrace documents:
 
-- With tensor parallelism each rank stores its own shard as a separate object
-  (LMCache's key includes the worker id, `lmcache/utils.py:389-441`), holding
-  `1/min(tp, kv_heads)` of the KV, since vLLM replicates KV heads once `tp`
-  reaches their count (`vllm/model_executor/layers/linear.py:1053-1058`,
-  `vllm/config/model.py:1625-1628`).
-- An MLA model is stored by rank 0 only, at full size (`save_only_first_rank`,
-  `lmcache/v1/cache_engine.py:116-119`).
+- One object per chunk, of the whole KV: `tp` must be 1. With tensor
+  parallelism each rank stores its own shard as a separate object (LMCache's
+  key includes the worker id, `lmcache/utils.py:389-441`) over its own
+  connection, and the replay does not open a connection per rank yet
+  (cachecannon#214).
+- An MLA model's object is the full latent (LMCache stores it from rank 0
+  only, `save_only_first_rank`, `lmcache/v1/cache_engine.py:116-119`).
 - Hybrid models (linear-attention layers with a recurrent state) are rejected.
   kvtrace's geometry for them is an approximation: object sizes, the chunk
   length vLLM and LMCache allow, and the number of state snapshots differ from
@@ -278,11 +289,9 @@ chunk tokens × KV bytes per token held by that rank. Following LMCache v0.5.5
 
 Each trace request runs on one connection, in three dependent steps:
 
-1. **Lookup.** One `EXISTS` per object, for every full chunk on every storing
-   rank, all sent in one pipeline. No multi-key `EXISTS` is used. The hit
-   prefix is the chunks before the first chunk missing an object on any rank,
-   which is the minimum of the ranks' own prefixes: a chunk is usable only if
-   every rank can load its shard.
+1. **Lookup.** One `EXISTS` per full chunk's object, all sent in one
+   pipeline. No multi-key `EXISTS` is used. The hit prefix is the chunks
+   before the first missing object.
 2. **Load.** `GET` of every object in the hit prefix, at most
    `connection.pipeline_depth` in flight. A `GET` that returns nil (the object
    was evicted between its `EXISTS` and its `GET`) is counted in `get_nil`, and
@@ -310,11 +319,6 @@ Each trace request runs on one connection, in three dependent steps:
    many leading tokens, rounded down to a chunk, when it stores (`:326`,
    `:1059-1065`). An object that came back nil is therefore not written again
    by the request that found it missing.
-
-Under `tp > 1` all ranks' operations go on the one connection, in rank order
-within each chunk. The engine's ranks are separate processes with their own
-connections, so the lookup, load and store times here are those of one client
-doing every rank's work; they are not the per-rank times.
 
 ### Token accounting
 

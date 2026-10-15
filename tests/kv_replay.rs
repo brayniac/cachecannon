@@ -11,8 +11,8 @@ mod common;
 use cachecannon::metrics;
 use cachecannon::{ColorMode, OutputFormat, create_formatter, run_benchmark_full};
 use common::kv::{
-    CHUNK_TOKENS, Hooks, Server, key, load_config, replay, replay_on, replay_with, request,
-    temp_path,
+    CHUNK_TOKENS, Hooks, Server, key, load_config, replay, replay_file, replay_on, replay_with,
+    request, temp_path, write_trace, write_unordered_trace,
 };
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -169,46 +169,8 @@ fn kv_replay_gap_ends_the_prefix_and_insert_if_absent_fills_only_the_gap() {
     );
 }
 
-/// KV replay of a dense model at tensor parallelism 2: each chunk is one
-/// object per rank, and a chunk counts as cached only when both ranks'
-/// objects are present.
-#[test]
-fn kv_replay_tp2_prefix_is_the_minimum_over_ranks() {
-    common::kv::isolated("kv_replay_tp2_prefix_is_the_minimum_over_ranks", || {
-        let ct = CHUNK_TOKENS;
-        // After the first request's 8 SETs (4 chunks x 2 ranks), delete rank 1's
-        // object for the third chunk. Rank 0 still has all four.
-        let server = Server::with_hooks(Hooks {
-            delete_after_sets: Some((8, vec![key(3, 1)])),
-            ..Default::default()
-        });
-        let a = request(1, 0, &[1, 2, 3, 4], 4 * ct + 3);
-        let again = request(2, 1, &[1, 2, 3, 4], 4 * ct + 3);
-        let rows = replay(&server, &[a, again], "tp = 2");
-
-        let r = &rows[0];
-        assert_eq!((r.gets, r.sets), (0, 8), "{r:?}");
-        let r = &rows[1];
-        assert_eq!((r.lookup_hit_chunks, r.hit_chunks), (2, 2), "{r:?}");
-        assert_eq!(r.cached_tokens, u64::from(2 * ct), "{r:?}");
-        // Both ranks' objects of the two cached chunks are read; both ranks'
-        // objects from the third chunk on are written.
-        assert_eq!((r.gets, r.sets), (4, 4), "{r:?}");
-        assert_eq!(
-            server.ops("GET"),
-            vec![key(1, 0), key(1, 1), key(2, 0), key(2, 1)]
-        );
-        assert_eq!(
-            server.sets()[8..],
-            [key(3, 0), key(3, 1), key(4, 0), key(4, 1)]
-        );
-        // Each rank holds half of 4 bytes per token.
-        assert_eq!(server.value_len(&key(1, 1)), Some(2 * ct as usize));
-    });
-}
-
-/// KV replay of an MLA model at tensor parallelism 4: only rank 0 stores, at
-/// full size, so no other rank's object is looked up, read or written.
+/// KV replay of an MLA model: one object per chunk at the full latent size,
+/// keyed as rank 0.
 #[test]
 fn kv_replay_mla_reads_and_writes_rank_0_only() {
     common::kv::isolated("kv_replay_mla_reads_and_writes_rank_0_only", || {
@@ -216,11 +178,7 @@ fn kv_replay_mla_reads_and_writes_rank_0_only() {
         let server = Server::default();
         let a = request(1, 0, &[1, 2, 3], 3 * ct + 3);
         let again = request(2, 1, &[1, 2, 3], 3 * ct + 3);
-        let rows = replay(
-            &server,
-            &[a, again],
-            "kv_bytes_per_token = 4\nmla = true\ntp = 4",
-        );
+        let rows = replay(&server, &[a, again], "kv_bytes_per_token = 4\nmla = true");
         assert_eq!(rows[1].cached_tokens, u64::from(3 * ct), "{rows:?}");
 
         let log = server.log();
@@ -231,7 +189,7 @@ fn kv_replay_mla_reads_and_writes_rank_0_only() {
             assert_eq!(kvtrace::obj_id_fields(id).2, 0, "{op:?} is not rank 0");
         }
         assert_eq!(server.sets(), vec![key(1, 0), key(2, 0), key(3, 0)]);
-        // Rank 0 stores the whole latent.
+        // The object holds the whole latent: 4 bytes per token.
         assert_eq!(server.value_len(&key(1, 0)), Some(4 * ct as usize));
     });
 }
@@ -687,6 +645,69 @@ fn kv_replay_resp3_handed_back_request_fails_when_reconnects_close_at_once() {
             );
             assert_eq!(metrics::KV_REQUESTS_FAILED.value(), 1);
             assert!(took < Duration::from_secs(10), "the run took {took:?}");
+        },
+    );
+}
+
+/// KV replay of a trace longer than the reader thread's read-ahead (16,384
+/// requests): every request is replayed exactly once, and the run ends when
+/// the last one finishes rather than at `duration`.
+#[test]
+fn kv_replay_streams_a_trace_longer_than_the_read_ahead() {
+    common::kv::isolated(
+        "kv_replay_streams_a_trace_longer_than_the_read_ahead",
+        || {
+            const N: u64 = 20_000;
+            let server = Server::default();
+            // One chunk each, ids repeating every 100 requests so later ones hit.
+            let requests: Vec<_> = (0..N)
+                .map(|i| request(i, 0, &[i % 100], CHUNK_TOKENS))
+                .collect();
+            let started = std::time::Instant::now();
+            let (result, rows) = replay_file(&server, write_trace(&requests), "", 8, "resp");
+            result.unwrap();
+            assert!(
+                started.elapsed() < Duration::from_secs(19),
+                "ran to duration: {:?}",
+                started.elapsed()
+            );
+            let mut ids: Vec<u64> = rows.iter().map(|r| r.req_id).collect();
+            ids.sort_unstable();
+            assert_eq!(ids, (0..N).collect::<Vec<_>>());
+            assert_eq!(metrics::KV_REQUESTS.value(), N);
+        },
+    );
+}
+
+/// KV replay of a file with a row out of timestamp order: the rows before it
+/// are replayed and written, the run prints its results and then fails
+/// naming the row, and nothing after it is replayed. The run ends when the
+/// rows before the error finish, not at `duration` (20 s).
+#[test]
+fn kv_replay_read_error_mid_trace_fails_the_run_after_the_rows_before_it() {
+    common::kv::isolated(
+        "kv_replay_read_error_mid_trace_fails_the_run_after_the_rows_before_it",
+        || {
+            let ct = CHUNK_TOKENS;
+            let server = Server::default();
+            let trace = write_unordered_trace(&[
+                request(1, 0, &[1], ct),
+                request(2, 2, &[2], ct),
+                request(3, 1, &[3], ct),
+                request(4, 3, &[4], ct),
+            ]);
+            let started = std::time::Instant::now();
+            let (result, rows) = replay_file(&server, trace, "", 1, "resp");
+            let took = started.elapsed();
+            assert!(took < Duration::from_secs(15), "ran to duration: {took:?}");
+            let err = result.unwrap_err();
+            assert!(
+                err.contains("row 2 (req_id 3)") && err.contains("before the previous row's"),
+                "{err}"
+            );
+            let ids: Vec<u64> = rows.iter().map(|r| r.req_id).collect();
+            assert_eq!(ids, [1, 2]);
+            assert_eq!(server.sets(), vec![key(1, 0), key(2, 0)]);
         },
     );
 }

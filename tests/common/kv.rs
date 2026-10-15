@@ -294,6 +294,63 @@ pub fn write_trace(requests: &[Request]) -> PathBuf {
     path
 }
 
+/// Write `requests` in the given order, which need not be timestamp order,
+/// as a request trace kvtrace's writer would refuse: the same schema and
+/// metadata, through arrow directly.
+pub fn write_unordered_trace(requests: &[Request]) -> PathBuf {
+    use arrow::array::{
+        ArrayRef, ListBuilder, TimestampNanosecondArray, UInt32Array, UInt64Array, UInt64Builder,
+    };
+    use arrow::record_batch::RecordBatch;
+    use kvtrace::format::{
+        FORMAT_REQUESTS, FORMAT_VERSION, KEY_CHUNK_TOKENS, KEY_FORMAT, KEY_VERSION, request_schema,
+    };
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::metadata::KeyValue;
+
+    let path = temp_path("unordered.parquet");
+    let schema = Arc::new(request_schema());
+    let mut chunks = ListBuilder::new(UInt64Builder::new()).with_field(Arc::new(
+        arrow::datatypes::Field::new("item", arrow::datatypes::DataType::UInt64, false),
+    ));
+    for r in requests {
+        chunks.values().append_slice(&r.chunks);
+        chunks.append(true);
+    }
+    let arrays: Vec<ArrayRef> = vec![
+        Arc::new(
+            TimestampNanosecondArray::from_iter_values(requests.iter().map(|r| r.timestamp))
+                .with_timezone("UTC"),
+        ),
+        Arc::new(UInt64Array::from_iter_values(
+            requests.iter().map(|r| r.req_id),
+        )),
+        Arc::new(UInt32Array::from_iter_values(
+            requests.iter().map(|r| r.input_tokens),
+        )),
+        Arc::new(UInt32Array::from_iter_values(
+            requests.iter().map(|r| r.output_tokens),
+        )),
+        Arc::new(chunks.finish()),
+        Arc::new(UInt64Array::from(
+            requests.iter().map(|r| r.session_id).collect::<Vec<_>>(),
+        )),
+    ];
+    let mut w =
+        ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema.clone(), None).unwrap();
+    for (k, v) in [
+        (KEY_FORMAT, FORMAT_REQUESTS.to_string()),
+        (KEY_VERSION, FORMAT_VERSION.to_string()),
+        (KEY_CHUNK_TOKENS, CHUNK_TOKENS.to_string()),
+    ] {
+        w.append_key_value_metadata(KeyValue::new(k.to_string(), v));
+    }
+    w.write(&RecordBatch::try_new(schema, arrays).unwrap())
+        .unwrap();
+    w.close().unwrap();
+    path
+}
+
 /// One row of the `requests_out` CSV.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
@@ -365,8 +422,22 @@ pub fn replay_with(
     connections: usize,
     protocol: &str,
 ) -> Vec<Row> {
-    let addr = server.spawn();
     let trace = write_trace(requests);
+    let (result, rows) = replay_file(server, trace, kv_toml, connections, protocol);
+    result.unwrap();
+    rows
+}
+
+/// Replay the trace file `trace` (removed afterwards) as [`replay_with`]
+/// does, and return the run's result with the rows written before it ended.
+pub fn replay_file(
+    server: &Server,
+    trace: PathBuf,
+    kv_toml: &str,
+    connections: usize,
+    protocol: &str,
+) -> (Result<(), String>, Vec<Row>) {
+    let addr = server.spawn();
     let out = temp_path("requests.csv");
     let geometry = if kv_toml.contains("model_config") || kv_toml.contains("kv_bytes_per_token") {
         ""
@@ -407,17 +478,17 @@ pub fn replay_with(
         out = out.display(),
     );
     let config = load_config(&toml);
-    run_benchmark_full(
+    let result = run_benchmark_full(
         config,
         None,
         create_formatter(OutputFormat::Quiet, ColorMode::Never),
         Arc::new(AtomicBool::new(true)),
     )
-    .unwrap();
+    .map_err(|e| e.to_string());
     let rows = read_rows(&out);
     let _ = std::fs::remove_file(&trace);
     let _ = std::fs::remove_file(&out);
-    rows
+    (result, rows)
 }
 
 /// Parse `toml` as a config file.
