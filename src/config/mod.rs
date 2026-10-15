@@ -952,7 +952,9 @@ impl Config {
     }
 
     /// Validate config invariants that can't be expressed via serde alone.
-    fn validate(&self) -> Result<(), ConfigError> {
+    /// [`load`](Self::load) calls it; a caller that changes a loaded or
+    /// default config (valkey-lab's CLI flags) must call it again.
+    pub fn validate(&self) -> Result<(), ConfigError> {
         if self.target.endpoints.is_empty() {
             return Err(ConfigError::Validation(
                 "endpoints must be specified".to_string(),

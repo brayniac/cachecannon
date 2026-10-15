@@ -309,6 +309,15 @@ use cachecannon::config::{
 /// Build a [`Config`] from the bench CLI flags, optionally layering on top of
 /// a TOML base config loaded via `--config`.
 fn build_config(args: &BenchArgs) -> Result<Config, Box<dyn std::error::Error>> {
+    let config = layered_config(args)?;
+    config.validate()?;
+    Ok(config)
+}
+
+/// The base config with the bench flags applied, not yet validated: the
+/// flags can set values `Config::load` would have rejected, so every builder
+/// validates the result once it is complete.
+fn layered_config(args: &BenchArgs) -> Result<Config, Box<dyn std::error::Error>> {
     let mut config = load_base_config(args)?;
     apply_bench_flags(&mut config, args)?;
     Ok(config)
@@ -317,7 +326,7 @@ fn build_config(args: &BenchArgs) -> Result<Config, Box<dyn std::error::Error>> 
 /// Build a [`Config`] for the `saturate` subcommand. This layers the bench
 /// flags *and* the saturation-specific flags on top of an optional TOML base.
 fn build_config_from_saturate(args: &SaturateArgs) -> Result<Config, Box<dyn std::error::Error>> {
-    let mut config = build_config(&args.bench)?;
+    let mut config = layered_config(&args.bench)?;
 
     // Parse SLO durations
     let slo_p50 = args.slo_p50.as_deref().map(parse_duration).transpose()?;
@@ -350,6 +359,7 @@ fn build_config_from_saturate(args: &SaturateArgs) -> Result<Config, Box<dyn std
         max_bisect_steps: 8,
     });
 
+    config.validate()?;
     Ok(config)
 }
 
@@ -562,6 +572,59 @@ fn resolve_host(host: &str, port: u16) -> Result<SocketAddr, Box<dyn std::error:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default command's flags, parsed as `Cli` parses them (it frees
+    /// `-h` for `--host`).
+    fn bench(args: &[&str]) -> BenchArgs {
+        Cli::try_parse_from(std::iter::once("valkey-lab").chain(args.iter().copied()))
+            .unwrap()
+            .bench
+    }
+
+    /// Flags are applied after the base config is loaded, so the result is
+    /// validated again: a flag cannot set a value the config file could not.
+    #[test]
+    fn flags_are_validated_after_they_are_applied() {
+        assert!(build_config(&bench(&[])).is_ok());
+        let err = build_config(&bench(&["--threads", "0"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("threads must be >= 1"), "{err}");
+
+        // A KV replay config rejects rate limiting; `--rate-limit` must not
+        // get past that.
+        let path = std::env::temp_dir().join(format!("valkey-lab-kv-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            "[target]\nendpoints = [\"127.0.0.1:6379\"]\n\
+             [workload.kv_replay]\ntrace = \"r.parquet\"\nkv_bytes_per_token = 4\n",
+        )
+        .unwrap();
+        let config = path.to_str().unwrap();
+        assert!(build_config(&bench(&["--config", config])).is_ok());
+        let err = build_config(&bench(&["--config", config, "--rate-limit", "1000"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rate_limit"), "{err}");
+
+        // `saturate` adds saturation search after the flags, which a KV
+        // replay also rejects.
+        let cli = Cli::try_parse_from([
+            "valkey-lab",
+            "saturate",
+            "--config",
+            config,
+            "--slo-p99",
+            "1ms",
+        ])
+        .unwrap();
+        let Some(Command::Saturate(args)) = cli.command else {
+            panic!("not parsed as saturate");
+        };
+        let err = build_config_from_saturate(&args).unwrap_err().to_string();
+        std::fs::remove_file(&path).unwrap();
+        assert!(err.contains("saturation_search"), "{err}");
+    }
 
     #[test]
     fn test_parse_ratio_valid() {
