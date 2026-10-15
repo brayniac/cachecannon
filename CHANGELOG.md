@@ -43,6 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `kv_replay` is not set (the `append_*` metrics already behave this way).
   `kv_trace_read_waits` counts dispatcher polls (one per worker per
   millisecond) that found a connection idle and the trace reader behind.
+  The config summary (JSON `config` line, clean and verbose headers)
+  describes the trace, timing, geometry and write rule instead of the
+  synthetic keyspace and value size, which a KV replay ignores.
 - `[admin] listen` serves `GET /metrics/stream[?interval=..&layout=wide|long]`,
   metriken-exposition's stream route: dendro replication frames
   (`application/vnd.metriken.replication.v1+dendro`), a handshake with

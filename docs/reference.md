@@ -349,6 +349,13 @@ finish, the results print, and the run exits with the error.
 
 #### KV replay results
 
+The config summary describes the replay instead of the synthetic keyspace,
+which a KV replay ignores. The JSON `config` line has no `keyspace`,
+`key_size` or `value_size`, and gains a `kv_replay` object with `trace`,
+`speedup` (0 for closed loop), `model_config`, `kv_dtype` and
+`kv_bytes_per_token` (whichever are set), `mla` and `write_rule`. The clean
+and verbose formats print the same as one workload line.
+
 The JSON `result` line gains a `kv_replay` object:
 
 | Field | Meaning |

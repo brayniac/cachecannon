@@ -18,12 +18,38 @@ pub const IO_ENGINE: &str = "io_uring";
 #[cfg(not(target_os = "linux"))]
 pub const IO_ENGINE: &str = "mio";
 
+/// How a KV replay is configured, for the clean and verbose config summaries:
+/// the trace, its timing, the geometry input and the write rule. A KV replay
+/// ignores the synthetic keyspace and value settings, so the summaries print
+/// this in their place.
+pub(crate) fn kv_workload_summary(kv: &KvReplay) -> String {
+    let timing = if kv.speedup == 0.0 {
+        "closed loop".to_string()
+    } else {
+        format!("open loop at {}x", kv.speedup)
+    };
+    let geometry = match (&kv.model_config, kv.kv_bytes_per_token) {
+        (Some(path), _) => match kv.kv_dtype {
+            Some(ref dtype) => format!("model {} ({dtype})", path.display()),
+            None => format!("model {}", path.display()),
+        },
+        (None, Some(n)) if kv.mla => format!("{n} KV bytes/token, MLA"),
+        (None, Some(n)) => format!("{n} KV bytes/token"),
+        (None, None) => "no geometry".to_string(),
+    };
+    format!(
+        "kv_replay {}, {timing}, {geometry}, {}",
+        kv.trace.display(),
+        kv.write_rule.as_str()
+    )
+}
+
 pub use clean::CleanFormatter;
 pub use json::JsonFormatter;
 pub use quiet::QuietFormatter;
 pub use verbose::VerboseFormatter;
 
-use crate::config::Config;
+use crate::config::{Config, KvReplay};
 use chrono::{DateTime, Utc};
 use std::fmt;
 use std::time::Duration;
