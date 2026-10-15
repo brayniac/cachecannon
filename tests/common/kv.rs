@@ -13,6 +13,13 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Wall time within which a replay that should end before `duration` (60 s
+/// in [`replay_file`]) must finish. It covers startup, which fills a 1 GiB
+/// value pool and took 3.3-3.4 s alone and up to about 12 s in a loaded test
+/// suite on macOS, plus the replay itself; a run that reaches `duration`
+/// exceeds it.
+pub const RUN_BOUND: Duration = Duration::from_secs(30);
+
 /// Tokens per chunk in every test trace.
 pub const CHUNK_TOKENS: u32 = 16;
 
@@ -449,13 +456,24 @@ pub fn replay_file(
     } else {
         "speedup = 0"
     };
-    // A line `general.<key> = <value>` in `kv_toml` sets that one `[general]`
-    // key in place of the default `warmup = "0s"`.
-    let general_toml = kv_toml
+    // A line `general.<key> = <value>` in `kv_toml` sets that `[general]`
+    // key in place of its default. `duration` is an upper bound the tests
+    // assert runs end well before (`RUN_BOUND`): a run that reaches it is
+    // the failure they look for.
+    let overrides: Vec<&str> = kv_toml
         .lines()
-        .find_map(|l| l.trim().strip_prefix("general."))
-        .unwrap_or("warmup = \"0s\"")
-        .to_string();
+        .filter_map(|l| l.trim().strip_prefix("general."))
+        .collect();
+    let general_toml = [
+        ("duration", "duration = \"60s\""),
+        ("warmup", "warmup = \"0s\""),
+    ]
+    .into_iter()
+    .filter(|(key, _)| !overrides.iter().any(|o| o.starts_with(key)))
+    .map(|(_, line)| line)
+    .chain(overrides.iter().copied())
+    .collect::<Vec<_>>()
+    .join("\n");
     let kv_toml: String = kv_toml
         .lines()
         .filter(|l| !l.trim().starts_with("general."))
@@ -464,7 +482,6 @@ pub fn replay_file(
     let toml = format!(
         r#"
         [general]
-        duration = "20s"
         {general_toml}
         threads = 1
 
