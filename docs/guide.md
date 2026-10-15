@@ -257,20 +257,24 @@ does not store a partial chunk.
 
 Rows are in timestamp order; kvtrace's writer and reader both enforce it. A
 reader thread streams the file during the run, at most 16,384 requests ahead
-of the replay, so trace length does not bound memory. Two things are read
-before the run starts: the first request, and the most chunks in any request
-(the footer's `kvtrace.max_chunks`, or a pass over the `chunks` column for a
-file without it), which sizes the send pool. A read error later in the file,
-including a row out of timestamp order, stops the replay at that row: the
-requests already read finish, the results print, and the run exits with the
-error. `kv_trace_read_waits` counts the times a connection was idle because
-the reader had not read the next request; that wait is part of
-`kv_schedule_lag`.
+of the replay, so memory does not grow with trace length. At startup the
+replay reads the first request and the most chunks in any request (the
+footer's `kvtrace.max_chunks`, or a pass over the `chunks` column for a file
+without it), which sizes the send pool, and the reader thread starts filling
+its read-ahead. When precheck completes the run waits for the read-ahead to
+fill. A read error in it, including a row out of timestamp order, ends the
+run with that error before any trace request is sent. A read error further
+into the file stops the replay at that row: the requests already read
+finish, the results print, and the run exits with the error.
+`kv_trace_read_waits` counts dispatcher polls (one per worker per
+millisecond) that found a connection idle and the reader behind. In open
+loop that wait is part of `kv_schedule_lag`; in closed loop it lowers the
+request rate.
 
 kvtrace's `ObjectMapper` turns a request's chunks into the objects the engine
-stores, for a model geometry: one object per chunk per storing rank, keyed
-`key_prefix` + the object id (`chunk << 16 | slot << 12 | rank`), sized
-chunk tokens × KV bytes per token held by that rank. Following LMCache v0.5.5
+stores, for a model geometry: one object per chunk, keyed `key_prefix` + the
+object id (`chunk << 16 | slot << 12 | rank`, rank 0), sized chunk tokens ×
+KV bytes per token. Following LMCache v0.5.5
 (05a013b) and vLLM v0.31.0 (db9527a), as kvtrace documents:
 
 - One object per chunk, of the whole KV: `tp` must be 1. With tensor

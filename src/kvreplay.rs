@@ -64,7 +64,8 @@ lookup_hit_chunks,hit_chunks,cached_tokens,new_tokens,gets,get_nil,sets,lookup_n
 store_ns,recorded";
 
 /// Trace requests the reader thread may hold ready ahead of the replay.
-/// Bounds the replay's trace memory at this many requests, whatever the
+/// The replay holds at most this many requests in the channel, plus one in
+/// the reader's blocked send and one claimed per worker, whatever the
 /// file's length.
 const READ_AHEAD: usize = 16_384;
 
@@ -186,6 +187,15 @@ impl KvReplay {
         self.trace_requests == 0
     }
 
+    /// Block until the reader thread has filled its read-ahead or stopped, so
+    /// that a read error in the first `READ_AHEAD` (16,384) requests is known before
+    /// any request is due. Called by the runner as precheck completes.
+    pub fn wait_read_ahead(&self) {
+        while !self.reader.stopped.load(Ordering::Acquire) && !self.requests.is_full() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// The error that stopped the reader thread before the end of the
     /// trace, if one did. The requests after it were not replayed.
     pub fn trace_error(&self) -> Option<String> {
@@ -301,12 +311,6 @@ impl KvReplay {
     }
 }
 
-/// The model geometry `cfg` describes.
-///
-/// Hybrid models (linear-attention layers with a recurrent state) are
-/// rejected: kvtrace's hybrid geometry is an approximation whose object
-/// sizes, allowed chunk length and snapshot count differ from vLLM and
-/// LMCache (kvtrace `objects` module docs, "Hybrid models").
 /// What the reader thread has done, for deciding when the replay is over.
 #[derive(Default)]
 struct ReaderState {
@@ -343,6 +347,22 @@ fn spawn_reader(
         .name("kv-trace-reader".into())
         .spawn(move || {
             let state = thread_state;
+            // Sets `stopped` on every exit, a panic included, before `tx` is
+            // dropped, so a dispatcher that sees the channel disconnected
+            // can rely on it; a panic is recorded as the error.
+            struct Stopped<'a>(&'a ReaderState);
+            impl Drop for Stopped<'_> {
+                fn drop(&mut self) {
+                    if std::thread::panicking() {
+                        let _ = self
+                            .0
+                            .error
+                            .set("kv_replay: the trace reader thread panicked".into());
+                    }
+                    self.0.stopped.store(true, Ordering::Release);
+                }
+            }
+            let _stopped = Stopped(&state);
             for req in std::iter::once(Ok(first)).chain(reader) {
                 match req {
                     Ok(req) => {
@@ -360,12 +380,17 @@ fn spawn_reader(
                     }
                 }
             }
-            state.stopped.store(true, Ordering::Release);
         })
         .map_err(|e| format!("kv_replay: cannot start the trace reader thread: {e}"))?;
     Ok((rx, state))
 }
 
+/// The model geometry `cfg` describes.
+///
+/// Hybrid models (linear-attention layers with a recurrent state) are
+/// rejected: kvtrace's hybrid geometry is an approximation whose object
+/// sizes, allowed chunk length and snapshot count differ from vLLM and
+/// LMCache (kvtrace `objects` module docs, "Hybrid models").
 pub fn geometry(cfg: &crate::config::KvReplay) -> Result<Geometry, String> {
     let sizes = match (&cfg.model_config, cfg.kv_bytes_per_token) {
         (Some(path), _) => ModelSizes::from_config_file(path, cfg.kv_dtype.as_deref())
@@ -1413,7 +1438,8 @@ mod tests {
     }
 
     /// An empty channel while the reader is still running is "not ready",
-    /// not the end of the trace; only a disconnected channel ends it.
+    /// not the end of the trace; only a disconnected channel ends it. The
+    /// replay is finished only once the reader has stopped.
     #[test]
     fn claim_waits_for_the_reader_and_ends_when_it_stops() {
         let path = std::env::temp_dir().join(format!(
@@ -1436,7 +1462,9 @@ mod tests {
         let mut kv = KvReplay::load(&c).unwrap();
         std::fs::remove_file(&path).unwrap();
         assert_eq!(kv.first_ts, 7);
-        assert!(matches!(kv.claim(), Claim::Request(r) if r.req_id == 1));
+        // The reader thread sends it; `claim` could run before it has.
+        let first = kv.requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(first.req_id, 1);
 
         // A reader that has sent nothing yet.
         let (tx, rx) = crossbeam_channel::bounded(1);
@@ -1444,6 +1472,15 @@ mod tests {
         assert!(matches!(kv.claim(), Claim::NotReady));
         drop(tx);
         assert!(matches!(kv.claim(), Claim::Exhausted));
+
+        // Every request sent has finished, but the reader may send more
+        // until it stops.
+        kv.reader = Arc::new(ReaderState::default());
+        kv.reader.sent.store(1, Ordering::Release);
+        kv.finished.store(1, Ordering::Release);
+        assert!(!kv.is_finished());
+        kv.reader.stopped.store(true, Ordering::Release);
+        assert!(kv.is_finished());
     }
 
     #[test]

@@ -501,6 +501,16 @@ pub fn run_benchmark_full(
             if precheck_complete >= num_threads {
                 let elapsed = precheck_start.map_or(Duration::ZERO, |t| t.elapsed());
                 formatter.print_precheck_ok(elapsed);
+                // A read error in the trace's first READ_AHEAD requests is
+                // known now; stop before any trace request runs. The error
+                // is returned after the (empty) results.
+                if let Some(ref kv) = kv_replay {
+                    kv.wait_read_ahead();
+                    if kv.trace_error().is_some() {
+                        shared.set_phase(Phase::Stop);
+                        break;
+                    }
+                }
                 if prefill_enabled {
                     shared.set_phase(Phase::Prefill);
                     current_phase = Phase::Prefill;
@@ -1082,8 +1092,8 @@ pub fn run_benchmark_full(
     if read_waits > 0 {
         tracing::warn!(
             read_waits,
-            "kv replay: connections waited for the trace reader; kv_schedule_lag includes \
-             that wait"
+            "kv replay: connections waited for the trace reader; in open loop that wait is \
+             part of kv_schedule_lag, in closed loop it lowered the request rate"
         );
     }
 

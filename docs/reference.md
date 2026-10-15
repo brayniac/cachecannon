@@ -296,8 +296,8 @@ model_config = "config.json"
 # kv_dtype = "fp8"
 # KV bytes per token over all layers and ranks, instead of model_config.
 # kv_bytes_per_token = 131072
-# With kv_bytes_per_token: multi-head latent attention, stored by rank 0
-# only at full size. Default false.
+# With kv_bytes_per_token: multi-head latent attention, one object per
+# chunk at the full latent size. Default false.
 # mla = false
 
 # Tensor-parallel degree. Only 1 is accepted: tensor parallelism needs one
@@ -337,9 +337,10 @@ endpoint, `cluster = true`, `connection.pipeline_depth = 0`, `tp` other than 1, 
 `prefill`, `backfill_on_miss`, `read_values` and `[workload.append]`. Rejected
 when the run starts: an empty trace, a trace file kvtrace cannot open, and a
 model with recurrent state (a hybrid linear-attention model). A read error
-after the run starts (a corrupt batch, a row out of timestamp order) stops
-the replay at that row; the requests already read finish, the results print,
-and the run exits with the error.
+(a corrupt batch, a row out of timestamp order) in the first 16,384 requests
+ends the run after precheck, before any trace request is sent. One further
+into the file stops the replay at that row; the requests already read
+finish, the results print, and the run exits with the error.
 
 #### KV replay results
 
@@ -739,7 +740,7 @@ Each snapshot contains the full set of metrics. The file uses the metriken expos
 | `kv_exists_count` | KV replay: EXISTS operations |
 | `kv_lookups`, `kv_loads`, `kv_stores` | KV replay: requests with a lookup, GETs, SETs (sample counts of the time histograms) |
 | `kv_loads_with_cached_tokens` | KV replay: requests with GETs that ended with cached tokens (sample count of `kv_load_time_per_1k_tokens`) |
-| `kv_trace_read_waits` | KV replay: times a dispatcher had an idle connection and no request because the trace reader had not read the next one. Non-zero means the generator delayed requests; the run logs a warning |
+| `kv_trace_read_waits` | KV replay: dispatcher polls (one per worker per millisecond) that found a connection idle and the trace reader behind, over the whole run including warmup. Non-zero means the generator delayed requests; the run logs a warning |
 
 **Gauges** (point-in-time values):
 

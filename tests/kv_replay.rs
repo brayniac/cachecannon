@@ -679,35 +679,60 @@ fn kv_replay_streams_a_trace_longer_than_the_read_ahead() {
     );
 }
 
-/// KV replay of a file with a row out of timestamp order: the rows before it
-/// are replayed and written, the run prints its results and then fails
-/// naming the row, and nothing after it is replayed. The run ends when the
-/// rows before the error finish, not at `duration` (20 s).
+/// KV replay of a file with a row out of timestamp order among its first
+/// requests: the reader finds it before the replay starts, so no trace
+/// request runs, and the run fails naming the row.
 #[test]
-fn kv_replay_read_error_mid_trace_fails_the_run_after_the_rows_before_it() {
+fn kv_replay_read_error_before_the_start_runs_nothing() {
+    common::kv::isolated("kv_replay_read_error_before_the_start_runs_nothing", || {
+        let ct = CHUNK_TOKENS;
+        let server = Server::default();
+        let trace = write_unordered_trace(&[
+            request(1, 0, &[1], ct),
+            request(2, 2, &[2], ct),
+            request(3, 1, &[3], ct),
+            request(4, 3, &[4], ct),
+        ]);
+        let (result, rows) = replay_file(&server, trace, "", 1, "resp");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("row 2 (req_id 3)") && err.contains("before the previous row's"),
+            "{err}"
+        );
+        assert!(rows.is_empty(), "{rows:?}");
+        assert!(server.sets().is_empty());
+        assert_eq!(metrics::KV_REQUESTS.value(), 0);
+    });
+}
+
+/// KV replay of a file whose out-of-order row is past what the reader can
+/// read before the replay starts (`READ_AHEAD`, 16,384): the rows before it
+/// are replayed, the run ends when they finish rather than at `duration`
+/// (20 s), and then fails naming the row.
+#[test]
+fn kv_replay_read_error_after_the_start_fails_the_run_after_the_rows_before_it() {
     common::kv::isolated(
-        "kv_replay_read_error_mid_trace_fails_the_run_after_the_rows_before_it",
+        "kv_replay_read_error_after_the_start_fails_the_run_after_the_rows_before_it",
         || {
+            const N: u64 = 20_000;
             let ct = CHUNK_TOKENS;
             let server = Server::default();
-            let trace = write_unordered_trace(&[
-                request(1, 0, &[1], ct),
-                request(2, 2, &[2], ct),
-                request(3, 1, &[3], ct),
-                request(4, 3, &[4], ct),
-            ]);
+            let mut requests: Vec<_> = (0..N).map(|i| request(i, 1, &[i % 100], ct)).collect();
+            requests.push(request(N, 0, &[1], ct));
+            let trace = write_unordered_trace(&requests);
             let started = std::time::Instant::now();
-            let (result, rows) = replay_file(&server, trace, "", 1, "resp");
+            let (result, rows) = replay_file(&server, trace, "", 8, "resp");
             let took = started.elapsed();
             assert!(took < Duration::from_secs(15), "ran to duration: {took:?}");
             let err = result.unwrap_err();
             assert!(
-                err.contains("row 2 (req_id 3)") && err.contains("before the previous row's"),
+                err.contains(&format!("row {N} (req_id {N})"))
+                    && err.contains("before the previous row's"),
                 "{err}"
             );
-            let ids: Vec<u64> = rows.iter().map(|r| r.req_id).collect();
-            assert_eq!(ids, [1, 2]);
-            assert_eq!(server.sets(), vec![key(1, 0), key(2, 0)]);
+            let mut ids: Vec<u64> = rows.iter().map(|r| r.req_id).collect();
+            ids.sort_unstable();
+            assert_eq!(ids, (0..N).collect::<Vec<_>>());
         },
     );
 }
