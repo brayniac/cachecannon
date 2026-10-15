@@ -11,8 +11,8 @@ mod common;
 use cachecannon::metrics;
 use cachecannon::{ColorMode, OutputFormat, create_formatter, run_benchmark_full};
 use common::kv::{
-    CHUNK_TOKENS, Hooks, Server, key, load_config, replay, replay_file, replay_on, replay_with,
-    request, temp_path, write_trace, write_unordered_trace,
+    CHUNK_TOKENS, Hooks, RUN_BOUND, Server, key, load_config, replay, replay_file, replay_on,
+    replay_with, request, temp_path, write_trace, write_unordered_trace,
 };
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -537,8 +537,7 @@ fn kv_replay_handed_back_request_fails_when_nothing_reconnects() {
                 "{rows:?}"
             );
             assert_eq!(metrics::KV_REQUESTS_FAILED.value(), 1);
-            // `duration` is 20 s; the value pool and setup take about 3 s.
-            assert!(took < Duration::from_secs(10), "the run took {took:?}");
+            assert!(took < RUN_BOUND, "the run took {took:?}");
         },
     );
 }
@@ -571,7 +570,7 @@ fn kv_replay_handed_back_request_fails_when_reconnects_close_at_once() {
                 "{rows:?}"
             );
             assert_eq!(metrics::KV_REQUESTS_FAILED.value(), 1);
-            assert!(took < Duration::from_secs(10), "the run took {took:?}");
+            assert!(took < RUN_BOUND, "the run took {took:?}");
         },
     );
 }
@@ -610,7 +609,7 @@ fn kv_replay_held_request_fails_when_nothing_reconnects() {
                 "{rows:?}"
             );
             assert_eq!(metrics::KV_REQUESTS_FAILED.value(), 2);
-            assert!(took < Duration::from_secs(10), "the run took {took:?}");
+            assert!(took < RUN_BOUND, "the run took {took:?}");
         },
     );
 }
@@ -644,7 +643,7 @@ fn kv_replay_resp3_handed_back_request_fails_when_reconnects_close_at_once() {
                 "{rows:?}"
             );
             assert_eq!(metrics::KV_REQUESTS_FAILED.value(), 1);
-            assert!(took < Duration::from_secs(10), "the run took {took:?}");
+            assert!(took < RUN_BOUND, "the run took {took:?}");
         },
     );
 }
@@ -667,7 +666,7 @@ fn kv_replay_streams_a_trace_longer_than_the_read_ahead() {
             let (result, rows) = replay_file(&server, write_trace(&requests), "", 8, "resp");
             result.unwrap();
             assert!(
-                started.elapsed() < Duration::from_secs(19),
+                started.elapsed() < RUN_BOUND,
                 "ran to duration: {:?}",
                 started.elapsed()
             );
@@ -707,8 +706,8 @@ fn kv_replay_read_error_before_the_start_runs_nothing() {
 
 /// KV replay of a file whose out-of-order row is past what the reader can
 /// read before the replay starts (`READ_AHEAD`, 16,384): the rows before it
-/// are replayed, the run ends when they finish rather than at `duration`
-/// (20 s), and then fails naming the row.
+/// are replayed, the run ends when they finish rather than at `duration`,
+/// and then fails naming the row.
 #[test]
 fn kv_replay_read_error_after_the_start_fails_the_run_after_the_rows_before_it() {
     common::kv::isolated(
@@ -723,7 +722,7 @@ fn kv_replay_read_error_after_the_start_fails_the_run_after_the_rows_before_it()
             let started = std::time::Instant::now();
             let (result, rows) = replay_file(&server, trace, "", 8, "resp");
             let took = started.elapsed();
-            assert!(took < Duration::from_secs(15), "ran to duration: {took:?}");
+            assert!(took < RUN_BOUND, "ran to duration: {took:?}");
             let err = result.unwrap_err();
             assert!(
                 err.contains(&format!("row {N} (req_id {N})"))

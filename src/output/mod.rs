@@ -18,12 +18,39 @@ pub const IO_ENGINE: &str = "io_uring";
 #[cfg(not(target_os = "linux"))]
 pub const IO_ENGINE: &str = "mio";
 
+/// How a KV replay is configured, for the clean and verbose config summaries:
+/// the trace, its timing, the geometry input and the write rule. A KV replay
+/// ignores the synthetic keyspace and value settings, so the summaries print
+/// this in their place.
+pub(crate) fn kv_workload_summary(kv: &KvReplay) -> String {
+    // Spelled as `KvReplay::load` logs it.
+    let timing = if kv.speedup == 0.0 {
+        "closed-loop".to_string()
+    } else {
+        format!("open-loop at {}x", kv.speedup)
+    };
+    let geometry = match (&kv.model_config, kv.kv_bytes_per_token) {
+        (Some(path), _) => match kv.kv_dtype {
+            Some(ref dtype) => format!("model {} ({dtype})", path.display()),
+            None => format!("model {}", path.display()),
+        },
+        (None, Some(n)) if kv.mla => format!("{n} KV bytes/token, MLA"),
+        (None, Some(n)) => format!("{n} KV bytes/token"),
+        (None, None) => "no geometry".to_string(),
+    };
+    format!(
+        "kv_replay {}, {timing}, {geometry}, {}",
+        kv.trace.display(),
+        kv.write_rule.as_str()
+    )
+}
+
 pub use clean::CleanFormatter;
 pub use json::JsonFormatter;
 pub use quiet::QuietFormatter;
 pub use verbose::VerboseFormatter;
 
-use crate::config::Config;
+use crate::config::{Config, KvReplay};
 use chrono::{DateTime, Utc};
 use std::fmt;
 use std::time::Duration;
@@ -583,5 +610,39 @@ pub fn create_formatter_with_banner(
         OutputFormat::Json => Box::new(JsonFormatter::new()),
         OutputFormat::Verbose => Box::new(VerboseFormatter::new()),
         OutputFormat::Quiet => Box::new(QuietFormatter::new()),
+    }
+}
+
+#[cfg(test)]
+mod kv_summary_tests {
+    use super::*;
+
+    #[test]
+    fn kv_workload_summary_names_timing_geometry_and_write_rule() {
+        let kv = |toml: &str| -> KvReplay {
+            let config: Config = toml::from_str(&format!(
+                "[target]\nendpoints = [\"127.0.0.1:6379\"]\n[workload.kv_replay]\n\
+                 trace = \"r.parquet\"\n{toml}"
+            ))
+            .unwrap();
+            config.workload.kv_replay.unwrap()
+        };
+        for (toml, want) in [
+            (
+                "speedup = 10.0\nkv_bytes_per_token = 256",
+                "kv_replay r.parquet, open-loop at 10x, 256 KV bytes/token, set-from-miss",
+            ),
+            (
+                "speedup = 0.0\nkv_bytes_per_token = 4\nmla = true\n\
+                 write_rule = \"insert-if-absent\"",
+                "kv_replay r.parquet, closed-loop, 4 KV bytes/token, MLA, insert-if-absent",
+            ),
+            (
+                "speedup = 1.5\nmodel_config = \"c.json\"",
+                "kv_replay r.parquet, open-loop at 1.5x, model c.json, set-from-miss",
+            ),
+        ] {
+            assert_eq!(kv_workload_summary(&kv(toml)), want, "{toml}");
+        }
     }
 }

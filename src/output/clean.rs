@@ -115,6 +115,21 @@ impl CleanFormatter {
     }
 }
 
+/// The config summary's workload line, after its label.
+fn workload_line(config: &Config) -> String {
+    match config.workload.kv_replay {
+        Some(ref kv) => super::kv_workload_summary(kv),
+        None => format!(
+            "{} keys, {}B key, {}B value, {}:{} GET:SET",
+            format_count(config.workload.keyspace.count as u64),
+            config.workload.keyspace.length,
+            config.workload.values.length,
+            config.workload.commands.get,
+            config.workload.commands.set
+        ),
+    }
+}
+
 impl OutputFormatter for CleanFormatter {
     fn print_config(&self, config: &Config) {
         println!("{}", self.bold(&self.cyan(&self.banner)));
@@ -154,16 +169,7 @@ impl OutputFormatter for CleanFormatter {
         );
 
         // Workload line
-        let keyspace_count = format_count(config.workload.keyspace.count as u64);
-        println!(
-            "{}   {} keys, {}B key, {}B value, {}:{} GET:SET",
-            self.cyan("workload"),
-            keyspace_count,
-            config.workload.keyspace.length,
-            config.workload.values.length,
-            config.workload.commands.get,
-            config.workload.commands.set
-        );
+        println!("{}   {}", self.cyan("workload"), workload_line(config));
 
         // Threads line
         let threads_str = if let Some(ref cpu_list) = config.general.cpu_list {
@@ -827,5 +833,27 @@ impl OutputFormatter for CleanFormatter {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workload_line_describes_kv_replay() {
+        let config: Config = toml::from_str(
+            "[target]\nendpoints = [\"127.0.0.1:6379\"]\n\
+             [workload.kv_replay]\ntrace = \"r.parquet\"\nspeedup = 0.0\n\
+             model_config = \"config.json\"\nkv_dtype = \"fp8\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            workload_line(&config),
+            "kv_replay r.parquet, closed-loop, model config.json (fp8), set-from-miss"
+        );
+        let config: Config =
+            toml::from_str("[target]\nendpoints = [\"127.0.0.1:6379\"]\n").unwrap();
+        assert!(workload_line(&config).contains("GET:SET"));
     }
 }

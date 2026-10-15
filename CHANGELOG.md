@@ -36,13 +36,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `requests_out` writes one CSV row per completed trace request (failed
   requests have none). EXISTS, GET and SET
   are also counted in `requests`, `responses`, the GET and SET latency
-  histograms and the byte counters. Existing JSON fields are unchanged. New
+  histograms and the byte counters. Existing JSON fields are unchanged, except that a KV
+  replay's `config` line omits `keyspace`, `key_size` and `value_size`. New
   `kv_*` counters and histograms are registered statically, like every
   metric here, so `/metrics`, `/metrics/binary`, `/metrics/stream` and the
   parquet recording of every run now carry them, as zeros when
   `kv_replay` is not set (the `append_*` metrics already behave this way).
   `kv_trace_read_waits` counts dispatcher polls (one per worker per
   millisecond) that found a connection idle and the trace reader behind.
+  The config summary (JSON `config` line, clean and verbose headers)
+  describes the trace, timing, geometry and write rule instead of the
+  synthetic keyspace and value size, which a KV replay ignores.
 - `[admin] listen` serves `GET /metrics/stream[?interval=..&layout=wide|long]`,
   metriken-exposition's stream route: dendro replication frames
   (`application/vnd.metriken.replication.v1+dendro`), a handshake with
