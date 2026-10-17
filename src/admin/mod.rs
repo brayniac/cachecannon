@@ -1182,16 +1182,25 @@ mod tests {
         ));
     }
 
+    /// An offer below the floor is served at the floor, and the
+    /// frame-interval header says so.
     #[test]
-    fn metrics_stream_refuses_an_interval_below_the_floor() {
-        use std::io::Read;
+    fn metrics_stream_serves_an_interval_below_the_floor_at_the_floor() {
+        use dendro::replicate::Frame;
+        use dendro::replicate::wire::FrameReader;
 
         let server = TestServer::start();
-        let (mut conn, status, _) = server.get("/metrics/stream?interval=1ms");
-        assert!(status.starts_with("HTTP/1.1 400 "), "{status}");
-        let mut body = String::new();
-        conn.read_to_string(&mut body).unwrap();
-        assert!(body.contains("update floor"), "{body}");
+        let (conn, status, headers) = server.get("/metrics/stream?interval=1ms");
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_eq!(
+            headers.get("x-metriken-frame-interval").map(String::as_str),
+            Some("10ms")
+        );
+        let mut reader = FrameReader::new(conn).expect("no dendro preamble");
+        assert!(matches!(
+            reader.next_frame().unwrap(),
+            Some(Frame::Handshake { .. })
+        ));
     }
 
     /// The whole-body routes are unchanged by the stream route beside them.

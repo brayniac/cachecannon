@@ -9,11 +9,12 @@
 //! to put cachecannon into a `.dendro` archive as it puts an agent there: rows
 //! stamped here at read time, histograms as histograms.
 //!
-//! An interval below [`UPDATE_FLOOR`] is refused with a 400. Every pass inside
-//! the floor is shared, so such a subscription sends mostly empty frames as
-//! fast as it asks, which costs CPU on the host generating load and, at
-//! intervals near the timer's 1 ms resolution, a missed-interval warning for
-//! most frames.
+//! The request's interval is an offer: an offer below [`UPDATE_FLOOR`] is
+//! served at the floor, and the frame-interval header names the interval
+//! served, which a recorder takes as the stream's. Every pass inside the
+//! floor is shared, so serving faster than it would send mostly empty frames,
+//! at a CPU cost on the host generating load and, near the timer's 1 ms
+//! resolution, a missed-interval warning for most frames.
 //!
 //! Every metric goes through [`DefaultRouter`], so cachecannon's metrics and
 //! the ringline ones linked into it land in one windowless group,
@@ -67,7 +68,7 @@ pub async fn serve<S: AsyncWrite + Unpin>(
     query: &str,
     passes: &Passes,
 ) -> io::Result<()> {
-    let request = match StreamRequest::parse(query) {
+    let mut request = match StreamRequest::parse(query) {
         Ok(request) => request,
         Err(refusal) => {
             return socket
@@ -75,14 +76,7 @@ pub async fn serve<S: AsyncWrite + Unpin>(
                 .await;
         }
     };
-    if request.interval < passes.floor() {
-        let message = format!(
-            "interval {:?} is below the {:?} update floor",
-            request.interval,
-            passes.floor()
-        );
-        return socket.write_all(&refusal_response(400, &message)).await;
-    }
+    request.interval = request.interval.max(passes.floor());
     let layout = request.layout;
     let mut subscription = StreamSubscription::new(request, passes.floor(), labels(), metadata());
 
@@ -117,9 +111,8 @@ fn head(subscription: &StreamSubscription) -> Vec<u8> {
     head.into_bytes()
 }
 
-/// A refused request (a malformed or zero interval, one below the floor, an
-/// unknown layout, a parameter given twice), answered with its status and
-/// message.
+/// A refused request (a malformed or zero interval, an unknown layout, a
+/// parameter given twice), answered with its status and message.
 fn refusal_response(status: u16, message: &str) -> Vec<u8> {
     let reason = match status {
         400 => "Bad Request",
