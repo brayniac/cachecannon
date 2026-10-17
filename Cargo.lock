@@ -2374,7 +2374,6 @@ dependencies = [
  "histogram 0.11.5",
  "itoa",
  "ketama 0.0.2",
- "libc",
  "memcache-proto",
  "ringline",
  "thiserror",
@@ -2386,7 +2385,6 @@ version = "0.6.0"
 source = "git+https://github.com/ringline-rs/ringline?rev=dfff2e5#dfff2e567b9ea124ab1bfdf5d9dfac8c6add670c"
 dependencies = [
  "histogram 0.11.5",
- "libc",
  "ping-proto",
  "ringline",
  "thiserror",
@@ -2401,7 +2399,6 @@ dependencies = [
  "histogram 0.11.5",
  "itoa",
  "ketama 0.0.2",
- "libc",
  "resp-proto",
  "ringline",
  "thiserror",

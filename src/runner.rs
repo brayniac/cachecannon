@@ -1,5 +1,3 @@
-#[cfg(target_os = "linux")]
-use crate::config::TimestampMode;
 use crate::config::{Config, Protocol as CacheProtocol};
 use crate::keydist::KeyDist;
 use crate::kvreplay::{KvBaseline, KvReplay};
@@ -325,7 +323,6 @@ pub fn run_benchmark_full(
 
     let total_conns = config.connection.total_connections();
     let standalone_task_capacity = standalone_task_capacity(total_conns, num_threads);
-    let timer_slots = timer_slots(total_conns, num_threads);
     let main_load = match kv_replay {
         Some(ref kv) => SendLoad::kv_replay(&config, kv),
         None => SendLoad::main(&config),
@@ -344,7 +341,6 @@ pub fn run_benchmark_full(
     let mut ringline_builder = ringline::ConfigBuilder::new()
         .workers(num_threads)
         .standalone_task_capacity(standalone_task_capacity)
-        .timer_slots(timer_slots)
         .send_pool(send_pool_slots, RINGLINE_SEND_SLOT_SIZE)
         .send_slab_slots(send_slab_slots)
         .pin_to_core(false) // We pin in create_for_worker instead
@@ -363,11 +359,6 @@ pub fn run_benchmark_full(
         .loop_diag(config.general.ringline_diag);
     if let Some(tls_client) = tls_client {
         ringline_builder = ringline_builder.tls_client(tls_client);
-    }
-    #[cfg(target_os = "linux")]
-    {
-        ringline_builder =
-            ringline_builder.timestamps(matches!(config.timestamps.mode, TimestampMode::Software));
     }
     let ringline_config = ringline_builder.build()?;
 
@@ -1391,16 +1382,6 @@ fn standalone_task_capacity(total_connections: usize, num_threads: usize) -> u32
 /// logged at info. Below it they are logged at debug.
 const APPEND_INFO_LOG_MIN_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Allows two concurrent timers per connection. A connection can hold a request
-/// timeout and a retry sleep across its lifecycle, and timer slots are small
-/// enough that the margin costs nothing next to being one short.
-fn timer_slots(total_connections: usize, num_threads: usize) -> u32 {
-    connections_per_worker(total_connections, num_threads)
-        .saturating_mul(2)
-        .saturating_add(POOL_HEADROOM)
-        .clamp(RINGLINE_POOL_DEFAULT, RINGLINE_POOL_MAX) as u32
-}
-
 /// ringline's own defaults for the recv ring, restated so the resolved geometry
 /// is visible in one place and so the verbose line can print it.
 ///
@@ -1703,7 +1684,6 @@ mod tests {
     use super::{
         RECV_BUFFER_SIZE_DEFAULT, RECV_RING_SIZE_DEFAULT, SendLoad, check_send_pool,
         resolved_recv_geometry, send_pool_slots, send_slab_slots, standalone_task_capacity,
-        timer_slots,
     };
     use crate::config::Config;
 
@@ -1896,29 +1876,6 @@ mod tests {
     }
 
     #[test]
-    fn timer_slots_cover_the_connection_count_that_panicked() {
-        // ringline panics the worker when the timer pool is exhausted, and the
-        // default 256 aborted a 4096-connection run over 8 threads.
-        let slots = timer_slots(4096, 8);
-        assert!(
-            slots as usize >= 4096usize.div_ceil(8),
-            "timer slots {slots} must cover 512 connections per worker"
-        );
-    }
-
-    #[test]
-    fn timer_slots_allow_more_than_one_timer_per_connection() {
-        // A connection can hold a request timeout and a retry sleep at once.
-        assert!(timer_slots(4096, 8) as usize >= 2 * 4096usize.div_ceil(8));
-    }
-
-    #[test]
-    fn timer_slots_keep_the_ringline_default_as_a_floor() {
-        assert_eq!(timer_slots(8, 8), 256);
-        assert_eq!(timer_slots(0, 8), 256);
-    }
-
-    #[test]
     fn recv_geometry_falls_back_to_ringlines_defaults() {
         // Unset must mean "exactly what ringline would have done", so that
         // merging this knob changes no existing run's behaviour.
@@ -1943,12 +1900,6 @@ mod tests {
             resolved_recv_geometry(&test_config(Some(16), Some(262144))),
             (16, 262144)
         );
-    }
-
-    #[test]
-    fn timer_slots_survive_zero_threads_and_absurd_counts() {
-        assert_eq!(timer_slots(64, 0), 256);
-        assert!((timer_slots(usize::MAX, 1) as u64) < (1 << 31));
     }
 
     #[test]

@@ -124,13 +124,7 @@ rand = "0.9"
 rand_xoshiro = "0.7"
 rand_distr = "0.5"
 
-# Kernel SO_TIMESTAMPING support is Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]
-ringline = { version = "0.7.0-alpha.0", features = ["timestamps"] }
-ringline-redis = { version = "0.7.0", features = ["timestamps"] }
-ringline-memcache = { version = "0.7.1", features = ["timestamps"] }
-ringline-ping = { version = "0.6.0", features = ["timestamps"] }
-
 # Jemalloc allocator (glibc only — not needed on musl/macOS/Windows).
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
