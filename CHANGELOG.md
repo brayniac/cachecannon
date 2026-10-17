@@ -61,7 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disconnects. A rezolus recorder that reads this content type records the
   benchmark into a `.dendro` archive beside agents, with the latency histograms
   as histograms. Every metric is in one windowless group, `cachecannon/main`.
-  `/metrics` and `/metrics/binary` are unchanged.
+  An interval below the 10 ms update floor is served at the floor, which the
+  frame-interval header names. `/metrics` and `/metrics/binary` are
+  unchanged.
 - `requests_send_failed` counts RESP and memcache main-workload requests not
   sent because a send failed, and is included in `offered`. It is in the
   JSON result, and the clean and verbose outputs print it when it is
