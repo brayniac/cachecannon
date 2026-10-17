@@ -207,10 +207,13 @@ dendro = { version = "0.4", default-features = false }
 # match a 0.7 pre-release, and cargo then builds a second ringline from
 # crates.io alongside the patched one the client crates use.
 [patch.crates-io]
-# dfff2e5 is ringline main after #649, which moved ringline to metriken 0.11.3
-# (metriken-core 0.3). metriken-core declares `links`, so ringline and
-# cachecannon must agree on one metriken-core; 1be7049 was still on metriken 0.9.
-ringline = { git = "https://github.com/ringline-rs/ringline", rev = "dfff2e5" }
-ringline-redis = { git = "https://github.com/ringline-rs/ringline", rev = "dfff2e5" }
-ringline-memcache = { git = "https://github.com/ringline-rs/ringline", rev = "dfff2e5" }
-ringline-ping = { git = "https://github.com/ringline-rs/ringline", rev = "dfff2e5" }
+# Segment views step 5, build A: ringline main (ada6398) with resp-proto and
+# memcache-proto main by git rev, from brayniac/ringline exp/segviews-a.
+# metriken-core declares `links`, so ringline and cachecannon must agree on
+# one metriken-core (0.3, metriken 0.11.3).
+ringline = { git = "https://github.com/brayniac/ringline", rev = "4460f0508f691d06422fbb46950db440ea33ec3a" }
+ringline-redis = { git = "https://github.com/brayniac/ringline", rev = "4460f0508f691d06422fbb46950db440ea33ec3a" }
+ringline-memcache = { git = "https://github.com/brayniac/ringline", rev = "4460f0508f691d06422fbb46950db440ea33ec3a" }
+ringline-ping = { git = "https://github.com/brayniac/ringline", rev = "4460f0508f691d06422fbb46950db440ea33ec3a" }
+resp-proto = { git = "https://github.com/ringline-rs/resp-proto", rev = "d0054e338fa200a73b6b40692faa7094363779d3" }
+memcache-proto = { git = "https://github.com/ringline-rs/memcache-proto", rev = "aa93e3ca2528f431607b4a4bfbdfabfd63ba0bf3" }
