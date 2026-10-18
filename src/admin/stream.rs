@@ -50,7 +50,7 @@ pub fn passes() -> Passes {
 }
 
 /// The handshake's labels: what a recorder names this source by.
-fn labels() -> BTreeMap<String, String> {
+pub(super) fn labels() -> BTreeMap<String, String> {
     [("source".to_string(), "cachecannon".to_string())].into()
 }
 

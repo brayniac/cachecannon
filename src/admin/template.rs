@@ -28,8 +28,9 @@ mod tests {
 
     /// The unit systems the Rezolus viewer can scale: rezolus's
     /// `dashboard::plot::Unit` (`crates/dashboard/src/plot.rs`). The viewer
-    /// refuses a template with any other value, so one outside this list
-    /// would stop the KPI section rendering.
+    /// warns about any other value and renders that KPI with `count`
+    /// scaling; `rezolus recording annotate` and rezolus's registry refuse
+    /// it.
     const UNIT_SYSTEMS: [&str; 9] = [
         "time",
         "bytes",
@@ -41,6 +42,13 @@ mod tests {
         "count",
         "rate",
     ];
+
+    /// The KPI types the viewer charts by name
+    /// (`crates/dashboard/src/dashboard/service.rs` in rezolus): `gauge` and
+    /// `histogram` have their own plots, and anything else is charted as a
+    /// counter, so a type outside this list is a typo the viewer does not
+    /// report.
+    const KPI_TYPES: [&str; 4] = ["gauge", "histogram", "delta_counter", "counter"];
 
     fn template() -> serde_json::Value {
         serde_json::from_str(SERVICE_QUERIES).expect("the template is JSON")
@@ -58,6 +66,21 @@ mod tests {
             for key in ["role", "title", "query", "type"] {
                 assert!(kpi[key].is_string(), "KPI {kpi} has no string {key}");
             }
+            let kind = kpi["type"].as_str().unwrap();
+            assert!(
+                KPI_TYPES.contains(&kind),
+                "KPI {} has type {kind:?}, which the viewer charts as a counter",
+                kpi["title"]
+            );
+            // rezolus takes any role: it groups the KPIs, names the group
+            // (capitalized) and is part of each chart's id
+            // (`kpi-<role>-<title>`), so it is held to a lowercase word.
+            let role = kpi["role"].as_str().unwrap();
+            assert!(
+                !role.is_empty() && role.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+                "KPI {} has role {role:?}, which is not a lowercase word",
+                kpi["title"]
+            );
             if let Some(unit) = kpi.get("unit_system") {
                 let unit = unit.as_str().expect("unit_system is a string");
                 assert!(
@@ -94,30 +117,131 @@ mod tests {
         assert!(checked > 0, "no metric names found in the queries");
     }
 
-    /// The identifiers in `query` that are directly followed by `{`.
-    fn selected_metrics(query: &str) -> Vec<&str> {
-        let bytes = query.as_bytes();
-        let mut out = Vec::new();
-        for (i, b) in bytes.iter().enumerate() {
-            if *b != b'{' {
-                continue;
+    /// Every metric a query names carries `source="cachecannon"`, the
+    /// handshake's source label (`stream::labels`): a recording names its
+    /// source after it, and a series without the matcher would also match
+    /// another source's series in the same archive.
+    #[test]
+    fn every_metric_selects_the_handshakes_source() {
+        let source = super::super::stream::labels()["source"].clone();
+        let wanted = format!("source=\"{source}\"");
+        let doc = template();
+        for kpi in doc["kpis"].as_array().unwrap() {
+            let query = kpi["query"].as_str().unwrap();
+            for (name, matchers) in metric_references(query) {
+                assert!(
+                    matchers.is_some_and(|m| m.split(',').any(|m| m.trim() == wanted)),
+                    "KPI {}: {name} does not select {wanted}",
+                    kpi["title"]
+                );
             }
-            let start = bytes[..i]
-                .iter()
-                .rposition(|c| !(c.is_ascii_alphanumeric() || *c == b'_' || *c == b':'))
-                .map_or(0, |p| p + 1);
-            if start < i {
-                out.push(&query[start..i]);
+        }
+    }
+
+    /// PromQL words that are not metric names and are not followed by `(`.
+    const KEYWORDS: [&str; 8] = [
+        "by",
+        "without",
+        "on",
+        "ignoring",
+        "group_left",
+        "group_right",
+        "bool",
+        "offset",
+    ];
+
+    /// PromQL aggregations, which may be followed by `by`/`without` rather
+    /// than `(`: `sum by (op) (…)`.
+    const AGGREGATIONS: [&str; 12] = [
+        "sum",
+        "min",
+        "max",
+        "avg",
+        "group",
+        "stddev",
+        "stdvar",
+        "count",
+        "count_values",
+        "bottomk",
+        "topk",
+        "quantile",
+    ];
+
+    /// The metric names `query` refers to, each with its matchers (the text
+    /// inside its `{…}`) or `None` for a bare name: every identifier outside
+    /// `{…}` and `[…]` that is not a function call (followed by `(`), a
+    /// keyword, an aggregation, a label list after a keyword, or a number.
+    fn metric_references(query: &str) -> Vec<(&str, Option<&str>)> {
+        let bytes = query.as_bytes();
+        let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b':';
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' | b'[' | b'"' => {
+                    let close = match bytes[i] {
+                        b'{' => '}',
+                        b'[' => ']',
+                        _ => '"',
+                    };
+                    i += 1 + query[i + 1..].find(close).unwrap_or(query.len() - i - 1) + 1;
+                }
+                b if ident(b) => {
+                    let start = i;
+                    while i < bytes.len() && ident(bytes[i]) {
+                        i += 1;
+                    }
+                    let word = &query[start..i];
+                    let next = query[i..].trim_start();
+                    if KEYWORDS.contains(&word) {
+                        // `by (op)`: the list holds label names; skip it.
+                        if next.starts_with('(') {
+                            let open = query.len() - next.len();
+                            i = open
+                                + query[open..]
+                                    .find(')')
+                                    .map_or(query.len() - open, |e| e + 1);
+                        }
+                        continue;
+                    }
+                    if bytes[start].is_ascii_digit()
+                        || next.starts_with('(')
+                        || AGGREGATIONS.contains(&word)
+                    {
+                        continue;
+                    }
+                    let matchers = next.strip_prefix('{').map(|rest| {
+                        let end = rest.find('}').unwrap_or(rest.len());
+                        &rest[..end]
+                    });
+                    out.push((word, matchers));
+                }
+                _ => i += 1,
             }
         }
         out
     }
 
+    /// The metric names in `query`.
+    fn selected_metrics(query: &str) -> Vec<&str> {
+        metric_references(query)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
     #[test]
-    fn selected_metrics_reads_names_before_a_selector() {
+    fn metric_references_find_every_name() {
         assert_eq!(
-            selected_metrics("sum(irate(requests_sent{source=\"x\"}[5s])) / get_count{}"),
-            ["requests_sent", "get_count"]
+            metric_references(
+                "sum by (op) (irate(requests_sent{source=\"x\"}[5s])) / get_count \
+                 > 0.5 * histogram_quantile(0.99, set_latency{})"
+            ),
+            [
+                ("requests_sent", Some("source=\"x\"")),
+                ("get_count", None),
+                ("set_latency", Some("")),
+            ]
         );
     }
 }

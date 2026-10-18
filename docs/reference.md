@@ -566,11 +566,37 @@ Rezolus viewer shows as cachecannon's section. It is sent as the
 `service_queries` key of the `/metrics/stream` handshake's metadata, which
 `rezolus record` keeps in the recording's metadata, and written under the same
 key into the `[admin] parquet` file's metadata. The viewer renders the template
-the recording carries, so a template change reaches the viewer with a
-cachecannon release. Rezolus's built-in copy is used only for recordings that
-carry none (made before this, or scraped from `/metrics`, which carries no
-metadata). A query may select only metrics cachecannon registers and a
-`unit_system` the viewer knows; tests in `src/admin/template.rs` check both.
+a `.dendro` recording carries, so a template change reaches the viewer with a
+cachecannon release.
+
+Every query selects `source="cachecannon"`. Where that label is missing, the
+section renders with empty charts:
+
+- The `[admin] parquet` file on its own: its columns carry no `source` label
+  (the source is in the file metadata only), so the charts are empty until
+  rezolus attaches a single-source parquet's source to its series as a label.
+- `rezolus recording combine … -o out.parquet` drops the template in rezolus
+  up to 6.0.0-alpha.62. `rezolus recording combine … -o out.rez` keeps it,
+  and its charts have data.
+- A recording relabelled with another source, such as
+  `rezolus record --endpoint http://host:9090,source=cc-a`: the carried
+  template still selects `source="cachecannon"`, so its charts are empty.
+  Keep the source `cachecannon`, and tell two runs apart with another label
+  (`--label arm=a`).
+
+Rezolus's built-in copy of the template renders instead of the carried one:
+
+- for a recording that carries none: made by an older cachecannon, scraped
+  from `/metrics` (which carries no metadata), or recorded by rezolus 5.x
+  from `/metrics/binary`;
+- when the carried JSON does not parse;
+- for a parquet combined by a rezolus that drops the template (above);
+- with `rezolus view --registry-templates`, which prefers the built-in copy.
+
+Tests in `src/admin/template.rs` check that each query selects
+`source="cachecannon"` and only metrics cachecannon registers, that each KPI's
+`type` is one the viewer charts and its `role` a lowercase word, and that every
+`unit_system` is one the viewer knows.
 
 ## Output Formats
 
