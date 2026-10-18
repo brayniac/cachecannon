@@ -55,9 +55,18 @@ fn labels() -> BTreeMap<String, String> {
 }
 
 /// The handshake's metadata. The version is here, not in `labels`, so two
-/// builds recorded side by side are the same source kind.
+/// builds recorded side by side are the same source kind. `service_queries`
+/// is cachecannon's KPI template ([`super::template`]), about 3 KB, which a
+/// recorder keeps in the source's metadata for the viewer.
 fn metadata() -> BTreeMap<String, String> {
-    [("version".to_string(), env!("CARGO_PKG_VERSION").to_string())].into()
+    [
+        ("version".to_string(), env!("CARGO_PKG_VERSION").to_string()),
+        (
+            super::template::KEY_SERVICE_QUERIES.to_string(),
+            super::template::SERVICE_QUERIES.to_string(),
+        ),
+    ]
+    .into()
 }
 
 /// Serve one stream request on `socket` until a write fails, which is how a

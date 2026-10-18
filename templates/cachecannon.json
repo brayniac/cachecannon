@@ -1,0 +1,112 @@
+{
+  "service_name": "cachecannon",
+  "service_metadata": {},
+  "kpis": [
+    {
+      "role": "load",
+      "title": "Target Rate",
+      "query": "target_rate{source=\"cachecannon\"}",
+      "type": "gauge",
+      "unit_system": "count",
+      "subgroup": "Target Rate",
+      "full_width": true
+    },
+    {
+      "role": "throughput",
+      "title": "Request Rate",
+      "query": "sum(irate(requests_sent{source=\"cachecannon\"}[5s]))",
+      "type": "delta_counter",
+      "unit_system": "rate"
+    },
+    {
+      "role": "throughput",
+      "title": "Response Rate",
+      "query": "sum(irate(responses_received{source=\"cachecannon\"}[5s]))",
+      "type": "delta_counter",
+      "unit_system": "rate",
+      "denominator": true
+    },
+    {
+      "role": "throughput",
+      "title": "Bytes Received Rate",
+      "query": "sum(irate(bytes_rx{source=\"cachecannon\"}[5s]))",
+      "type": "delta_counter",
+      "unit_system": "datarate"
+    },
+    {
+      "role": "throughput",
+      "title": "Bytes Sent Rate",
+      "query": "sum(irate(bytes_tx{source=\"cachecannon\"}[5s]))",
+      "type": "delta_counter",
+      "unit_system": "datarate"
+    },
+    {
+      "role": "latency",
+      "title": "Response Latency",
+      "query": "response_latency{source=\"cachecannon\"}",
+      "type": "histogram",
+      "subtype": "percentiles",
+      "unit_system": "time",
+      "subgroup": "Response Latency",
+      "full_width": true
+    },
+    {
+      "role": "latency",
+      "title": "GET Latency",
+      "query": "get_latency{source=\"cachecannon\"}",
+      "type": "histogram",
+      "subtype": "percentiles",
+      "unit_system": "time"
+    },
+    {
+      "role": "latency",
+      "title": "SET Latency",
+      "query": "set_latency{source=\"cachecannon\"}",
+      "type": "histogram",
+      "subtype": "percentiles",
+      "unit_system": "time"
+    },
+    {
+      "role": "error",
+      "title": "Request Error Rate",
+      "query": "sum(irate(request_errors{source=\"cachecannon\"}[5s]))",
+      "type": "delta_counter",
+      "unit_system": "rate"
+    },
+    {
+      "role": "error",
+      "title": "Connection Failure Rate",
+      "query": "sum(irate(connections_failed{source=\"cachecannon\"}[5s]))",
+      "type": "delta_counter",
+      "unit_system": "rate"
+    },
+    {
+      "role": "custom",
+      "title": "Cache Hit Rate",
+      "query": "sum(irate(cache_hits{source=\"cachecannon\"}[5s]))",
+      "type": "delta_counter",
+      "unit_system": "rate"
+    },
+    {
+      "role": "custom",
+      "title": "Cache Miss Rate",
+      "query": "sum(irate(cache_misses{source=\"cachecannon\"}[5s]))",
+      "type": "delta_counter",
+      "unit_system": "rate"
+    },
+    {
+      "role": "custom",
+      "title": "GET Rate",
+      "query": "sum(irate(get_count{source=\"cachecannon\"}[5s]))",
+      "type": "delta_counter",
+      "unit_system": "rate"
+    },
+    {
+      "role": "custom",
+      "title": "SET Rate",
+      "query": "sum(irate(set_count{source=\"cachecannon\"}[5s]))",
+      "type": "delta_counter",
+      "unit_system": "rate"
+    }
+  ]
+}

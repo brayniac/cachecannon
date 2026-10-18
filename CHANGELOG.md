@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- cachecannon carries its own KPI template (`templates/cachecannon.json`, a
+  Rezolus `ServiceExtension`) in its recordings: the `/metrics/stream`
+  handshake sends it as `service_queries` metadata, which `rezolus record`
+  keeps in the `.dendro` source's metadata, and the `[admin] parquet` file
+  stores it under the same key. The Rezolus viewer renders the template the
+  recording carries, so a change to it no longer needs a Rezolus release.
 - `[workload.kv_replay]` replays a request-level KV-cache trace (the kvtrace
   request format from pelikan-io/cachesim) against a RESP server used as an
   LLM serving engine's KV-cache prefix store, and reports prompt tokens

@@ -550,12 +550,27 @@ frame interval and layout, `/metrics/stream?interval=500ms&layout=long`
 is refused with 400. An interval below the 10 ms update floor is served at the
 floor, and `x-metriken-frame-interval` names the interval served. The response
 has no `Content-Length`: it is dendro's preamble and a handshake
-(`source=cachecannon`, the version in its metadata), then one frame per
+(`source=cachecannon`; the version and the KPI template in its metadata, see
+[KPI template](#kpi-template)), then one frame per
 interval, aligned to the Unix epoch, until the client disconnects. The
 `x-metriken-frame-interval`, `x-metriken-update-floor` (10 ms) and
 `x-metriken-layout` headers describe it. Every metric is in one group,
 `cachecannon/main`, stamped when it is read, with no acquisition window;
 histograms are sent as histograms, not as summaries.
+
+### KPI Template
+
+cachecannon's KPI template is `templates/cachecannon.json`, a Rezolus
+`ServiceExtension`: the throughput, latency, error and cache-hit charts the
+Rezolus viewer shows as cachecannon's section. It is sent as the
+`service_queries` key of the `/metrics/stream` handshake's metadata, which
+`rezolus record` keeps in the recording's metadata, and written under the same
+key into the `[admin] parquet` file's metadata. The viewer renders the template
+the recording carries, so a template change reaches the viewer with a
+cachecannon release. Rezolus's built-in copy is used only for recordings that
+carry none (made before this, or scraped from `/metrics`, which carries no
+metadata). A query may select only metrics cachecannon registers and a
+`unit_system` the viewer knows; tests in `src/admin/template.rs` check both.
 
 ## Output Formats
 
@@ -725,6 +740,8 @@ The benchmark can record all metrics to a Parquet file for post-hoc analysis wit
 - Snapshots are only recorded during the **Running** phase (not during Connect, Prefill, or Warmup)
 - One snapshot is captured per `parquet_interval`
 - A final snapshot is captured on shutdown
+- The file metadata carries `source`, `version`, `sampling_interval_ms` and the
+  [KPI template](#kpi-template) as `service_queries`
 
 ### Parquet Schema
 
