@@ -8,7 +8,7 @@
 use crate::client::{RequestResult, RequestType};
 #[cfg(target_os = "linux")]
 use crate::config::TimestampMode;
-use crate::config::{Config, EndpointAllocation, Protocol as CacheProtocol};
+use crate::config::{Config, EndpointAllocation, Protocol as CacheProtocol, Routing};
 use crate::keydist::KeyDist;
 use crate::kvreplay::KvReplay;
 use crate::limiters::{PrefillPacer, WorkerLimiter};
@@ -581,6 +581,219 @@ async fn run_dispatcher(
     }
 }
 
+// ── Routed dispatch ─────────────────────────────────────────────────────
+
+/// How many requests a node's queue holds, as a multiple of what this
+/// worker's connections to that node can have in flight
+/// (`connections x pipeline_depth`). A request funded while the queue is full
+/// is dropped and counted in `routed_queue_dropped`.
+const ROUTED_QUEUE_PIPELINES: usize = 16;
+
+/// Most requests the routed dispatcher funds before yielding to the
+/// connection tasks on its worker.
+const ROUTED_MINT_BATCH: usize = 1024;
+
+/// A request the routed dispatcher funded, drew a key for and routed, waiting
+/// for a connection to the owning node to send it.
+struct RoutedRequest {
+    key_id: usize,
+    funded_at: Instant,
+}
+
+struct NodeQueue {
+    requests: VecDeque<RoutedRequest>,
+    cap: usize,
+    /// Connection tasks for this node with nothing in flight, waiting for a
+    /// request.
+    waiters: Vec<Waker>,
+}
+
+/// One worker's routed requests, one queue per node. Worker-local, like
+/// `TokenDispatcher`: the dispatcher and every connection task of a worker
+/// run on its thread.
+pub(crate) struct RoutedQueues {
+    nodes: Vec<RefCell<NodeQueue>>,
+    /// Set when the dispatcher stops. Every waiter is woken and later waits
+    /// return at once.
+    closed: Cell<bool>,
+}
+
+impl RoutedQueues {
+    /// `connections[n]` is how many of this worker's connections serve node
+    /// `n`. A node with none gets a queue that holds nothing, so every request
+    /// routed to it is dropped; `check_node_counts` rules that out for a
+    /// startup node list.
+    fn new(connections: &[usize], pipeline_depth: usize) -> Self {
+        let nodes = connections
+            .iter()
+            .map(|&c| {
+                RefCell::new(NodeQueue {
+                    requests: VecDeque::new(),
+                    cap: c
+                        .saturating_mul(pipeline_depth)
+                        .saturating_mul(ROUTED_QUEUE_PIPELINES),
+                    waiters: Vec::new(),
+                })
+            })
+            .collect();
+        Self {
+            nodes,
+            closed: Cell::new(false),
+        }
+    }
+
+    /// Queue `request` for `node` and wake one idle connection to it. Returns
+    /// false, leaving the queue unchanged, when the queue is full.
+    fn push(&self, node: usize, request: RoutedRequest) -> bool {
+        let mut q = self.nodes[node].borrow_mut();
+        if q.requests.len() >= q.cap {
+            return false;
+        }
+        q.requests.push_back(request);
+        if let Some(w) = q.waiters.pop() {
+            w.wake();
+        }
+        true
+    }
+
+    fn pop(&self, node: usize) -> Option<RoutedRequest> {
+        self.nodes[node].borrow_mut().requests.pop_front()
+    }
+
+    /// Wait until `node` has a request queued or the dispatcher has stopped.
+    /// Untimed for the reason `TokenDispatcher::acquire` is: liveness comes
+    /// from `close`, which the dispatcher calls when the run stops.
+    fn wait(&self, node: usize) -> impl Future<Output = ()> + '_ {
+        std::future::poll_fn(move |cx| {
+            let mut q = self.nodes[node].borrow_mut();
+            if self.closed.get() || !q.requests.is_empty() {
+                return Poll::Ready(());
+            }
+            q.waiters.push(cx.waker().clone());
+            Poll::Pending
+        })
+    }
+
+    fn close(&self) {
+        self.closed.set(true);
+        for node in &self.nodes {
+            for w in node.borrow_mut().waiters.drain(..) {
+                w.wake();
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// This worker's routed queues. `None` unless `workload.routing =
+    /// "routed"`.
+    static ROUTED: RefCell<Option<Rc<RoutedQueues>>> = const { RefCell::new(None) };
+}
+
+fn routed_queues() -> Option<Rc<RoutedQueues>> {
+    ROUTED.with(|r| r.borrow().clone())
+}
+
+/// Return `Pending` once, so the other tasks on this worker run before the
+/// caller continues.
+async fn yield_now() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            return Poll::Ready(());
+        }
+        yielded = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    })
+    .await
+}
+
+/// Run this worker's routed dispatcher until the run stops.
+///
+/// Each token the limiter grants funds one request: the dispatcher draws its
+/// key from the global distribution, routes it, and queues it for the owning
+/// node. The token is spent whether or not the queue has room, so a node that
+/// cannot keep up shows as dropped requests rather than a lower offered rate.
+async fn run_routed_dispatcher(
+    queues: Rc<RoutedQueues>,
+    rl: Arc<WorkerLimiter>,
+    state: Arc<SharedWorkerState>,
+    seed: u64,
+) {
+    let task_state = &state.task_state;
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+    let mut key_buf = vec![0u8; task_state.config.workload.keyspace.length];
+    let multi_endpoint = task_state.endpoints.len() > 1;
+    loop {
+        let phase = task_state.shared.phase();
+        if phase.should_stop() {
+            queues.close();
+            return;
+        }
+        // The limiters are restarted before Warmup and nothing may take
+        // tokens until then (`WorkerLimiter::restart`).
+        if phase != Phase::Warmup && phase != Phase::Running {
+            ringline::sleep(Duration::from_millis(1)).await;
+            continue;
+        }
+
+        let slip_ns = rl.slip_ns();
+        metrics::CURRENT_SLIP_NS.set(slip_ns as i64);
+        let funded_at = Instant::now();
+        let mut nap = None;
+        for _ in 0..ROUTED_MINT_BATCH {
+            match rl.try_wait() {
+                Ok(()) => {}
+                Err(TryWaitError::Insufficient(d)) => {
+                    nap = Some(d);
+                    break;
+                }
+                // `ExceedsCapacity` cannot happen for one token, and other
+                // variants are not understood: retry after the idle poll.
+                Err(_) => {
+                    nap = Some(IDLE_SLEEP_MIN);
+                    break;
+                }
+            }
+            let key_id = task_state.key_dist.sample(&mut rng);
+            let node = if multi_endpoint {
+                write_key(&mut key_buf, key_id);
+                route_key(task_state, &key_buf)
+            } else {
+                0
+            };
+            let _ = metrics::SCHEDULE_SLIP.increment(slip_ns);
+            if !queues.push(node, RoutedRequest { key_id, funded_at }) {
+                metrics::ROUTED_QUEUE_DROPPED.increment();
+            }
+        }
+        match nap {
+            Some(d) => ringline::sleep(d.clamp(Duration::from_micros(1), IDLE_SLEEP_MAX)).await,
+            // Funded a full batch and the limiter may hold more: let the
+            // connections send before funding the next one.
+            None => yield_now().await,
+        }
+    }
+}
+
+/// Record a routed main-workload reply's latency: the reply's own latency
+/// plus `queued_ns`, the time between the dispatcher funding the request and a
+/// connection sending it. Replaces the `on_result` latency recording, which
+/// sees only the time from send to reply.
+fn record_routed_latency(result: &RequestResult, queued_ns: u64) {
+    let latency = result.latency_ns.saturating_add(queued_ns);
+    let _ = match result.request_type {
+        RequestType::Get => metrics::GET_LATENCY.increment(latency),
+        RequestType::Set => metrics::SET_LATENCY.increment(latency),
+        RequestType::Delete => metrics::DELETE_LATENCY.increment(latency),
+        RequestType::Ping | RequestType::Other => Ok(()),
+    };
+    let _ = metrics::RESPONSE_LATENCY.increment(latency);
+    let _ = metrics::PERCEIVED_LATENCY
+        .increment(latency.saturating_add(metrics::CURRENT_SLIP_NS.value() as u64));
+}
+
 /// Borrow a random `value_len`-byte slice of the value pool, for the
 /// copy-based `fire_set` path (the bytes are copied into the send pool
 /// synchronously, so the borrow only needs to outlive the fire call).
@@ -768,7 +981,34 @@ impl AsyncEventHandler for BenchHandler {
             // Install this worker's dispatcher before any connection task can
             // look for it. A closed-loop run has no limiter and gets none, so
             // `dispatcher()` returns `None` and those tasks keep the old poll.
-            if let Some(rl) = worker_state.task_state.ratelimiter.clone() {
+            // A routed run gets the routed dispatcher instead; its connections
+            // take requests from it and never claim tokens.
+            let routed = worker_state.task_state.config.workload.routing == Routing::Routed;
+            if routed && let Some(rl) = worker_state.task_state.ratelimiter.clone() {
+                let (_, my_endpoints) =
+                    my_connection_endpoints(&worker_state, my_connections, worker_id);
+                let mut per_node = vec![0usize; worker_state.task_state.endpoints.len().max(1)];
+                for &e in &my_endpoints {
+                    per_node[e] += 1;
+                }
+                let config = &worker_state.task_state.config;
+                let queues = Rc::new(RoutedQueues::new(
+                    &per_node,
+                    config.connection.pipeline_depth,
+                ));
+                ROUTED.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&queues)));
+                let seed = connection_seed(run_seed(config), SeedRole::Dispatcher, worker_id, 0);
+                if let Err(e) = ringline::spawn(run_routed_dispatcher(
+                    queues,
+                    rl,
+                    Arc::clone(&worker_state),
+                    seed,
+                )) {
+                    // No other task can fund routed requests, so this worker
+                    // would send nothing. Fail loudly rather than run idle.
+                    panic!("worker {worker_id}: failed to spawn routed dispatcher: {e}");
+                }
+            } else if let Some(rl) = worker_state.task_state.ratelimiter.clone() {
                 let dispatch = Rc::new(TokenDispatcher::default());
                 DISPATCHER.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&dispatch)));
                 let shared = Arc::clone(&worker_state.task_state.shared);
@@ -993,40 +1233,12 @@ fn spawn_protocol_tasks(
     my_connections: usize,
     worker_id: usize,
 ) {
-    let num_endpoints = worker_state.task_state.endpoints.len();
-    let total_connections = worker_state
-        .task_state
-        .config
-        .connection
-        .total_connections();
-    let num_threads = worker_state.task_state.config.general.threads;
-
-    let base_per_thread = total_connections / num_threads;
-    let remainder = total_connections % num_threads;
-    let my_start = if worker_id < remainder {
-        worker_id * (base_per_thread + 1)
-    } else {
-        remainder * (base_per_thread + 1) + (worker_id - remainder) * base_per_thread
-    };
-
     let protocol = worker_state.task_state.config.target.protocol;
     let seed = run_seed(&worker_state.task_state.config);
+    let (my_start, my_endpoints) = my_connection_endpoints(worker_state, my_connections, worker_id);
 
-    // Every worker computes the same assignment and takes its own slice of it.
-    let assignment = connection_endpoints(
-        worker_state
-            .task_state
-            .config
-            .connection
-            .endpoint_allocation,
-        &worker_state.task_state.key_dist,
-        total_connections,
-        num_endpoints,
-    );
-
-    for i in 0..my_connections {
+    for (i, &endpoint_idx) in my_endpoints.iter().enumerate() {
         let global_conn_idx = my_start + i;
-        let endpoint_idx = assignment[global_conn_idx];
         let state = Arc::clone(worker_state);
         let session_seed = connection_seed(seed, SeedRole::Reader, worker_id, i);
 
@@ -1062,6 +1274,38 @@ fn spawn_protocol_tasks(
             metrics::CONNECTIONS_FAILED.increment();
         }
     }
+}
+
+/// This worker's connections: the global index of its first one, and the
+/// endpoint each serves. Every worker computes the same assignment over all
+/// connections and takes its own contiguous slice of it.
+fn my_connection_endpoints(
+    worker_state: &SharedWorkerState,
+    my_connections: usize,
+    worker_id: usize,
+) -> (usize, Vec<usize>) {
+    let config = &worker_state.task_state.config;
+    let total_connections = config.connection.total_connections();
+    let num_threads = config.general.threads;
+
+    let base_per_thread = total_connections / num_threads;
+    let remainder = total_connections % num_threads;
+    let my_start = if worker_id < remainder {
+        worker_id * (base_per_thread + 1)
+    } else {
+        remainder * (base_per_thread + 1) + (worker_id - remainder) * base_per_thread
+    };
+
+    let assignment = connection_endpoints(
+        config.connection.endpoint_allocation,
+        &worker_state.task_state.key_dist,
+        total_connections,
+        worker_state.task_state.endpoints.len(),
+    );
+    (
+        my_start,
+        assignment[my_start..my_start + my_connections].to_vec(),
+    )
 }
 
 /// The endpoint each of the run's `total` connections serves, indexed by
@@ -1254,55 +1498,69 @@ pub(crate) fn resolve_tls_server_name(
 
 // ── on_result callback factories ─────────────────────────────────────────
 
-/// Create a RESP on_result callback that records latency and byte metrics.
+/// Create a RESP on_result callback that records latency and byte metrics, or
+/// only TTFB and bytes for a routed connection.
 /// Counter metrics (RESPONSES_RECEIVED, GET_COUNT, etc.) are recorded by record_counters().
-fn make_resp_callback() -> impl Fn(&ringline_redis::CommandResult) {
+fn make_resp_callback(routed: bool) -> impl Fn(&ringline_redis::CommandResult) {
     move |r| {
-        match r.command {
-            ringline_redis::CommandType::Get => {
-                let _ = metrics::GET_LATENCY.increment(r.latency_ns);
-                if let Some(ttfb) = r.ttfb_ns {
-                    let _ = metrics::GET_TTFB.increment(ttfb);
-                }
-            }
-            ringline_redis::CommandType::Set => {
-                let _ = metrics::SET_LATENCY.increment(r.latency_ns);
-            }
-            ringline_redis::CommandType::Del => {
-                let _ = metrics::DELETE_LATENCY.increment(r.latency_ns);
-            }
-            _ => {}
+        if let ringline_redis::CommandType::Get = r.command
+            && let Some(ttfb) = r.ttfb_ns
+        {
+            let _ = metrics::GET_TTFB.increment(ttfb);
         }
-        let _ = metrics::RESPONSE_LATENCY.increment(r.latency_ns);
-        let _ = metrics::PERCEIVED_LATENCY
-            .increment(r.latency_ns + metrics::CURRENT_SLIP_NS.value() as u64);
+        // A routed connection records latency in its recv loop, where the
+        // request's queue wait is known (`record_routed_latency`).
+        if !routed {
+            match r.command {
+                ringline_redis::CommandType::Get => {
+                    let _ = metrics::GET_LATENCY.increment(r.latency_ns);
+                }
+                ringline_redis::CommandType::Set => {
+                    let _ = metrics::SET_LATENCY.increment(r.latency_ns);
+                }
+                ringline_redis::CommandType::Del => {
+                    let _ = metrics::DELETE_LATENCY.increment(r.latency_ns);
+                }
+                _ => {}
+            }
+            let _ = metrics::RESPONSE_LATENCY.increment(r.latency_ns);
+            let _ = metrics::PERCEIVED_LATENCY
+                .increment(r.latency_ns + metrics::CURRENT_SLIP_NS.value() as u64);
+        }
         metrics::BYTES_TX.add(r.tx_bytes as u64);
         metrics::BYTES_RX.add(r.rx_bytes as u64);
     }
 }
 
-/// Create a Memcache on_result callback that records latency and byte metrics.
+/// Create a Memcache on_result callback that records latency and byte metrics,
+/// or only TTFB and bytes for a routed connection.
 /// Counter metrics (RESPONSES_RECEIVED, GET_COUNT, etc.) are recorded by record_counters().
-fn make_memcache_callback() -> impl Fn(&ringline_memcache::CommandResult) {
+fn make_memcache_callback(routed: bool) -> impl Fn(&ringline_memcache::CommandResult) {
     move |r| {
-        match r.command {
-            ringline_memcache::CommandType::Get => {
-                let _ = metrics::GET_LATENCY.increment(r.latency_ns);
-                if let Some(ttfb) = r.ttfb_ns {
-                    let _ = metrics::GET_TTFB.increment(ttfb);
-                }
-            }
-            ringline_memcache::CommandType::Set => {
-                let _ = metrics::SET_LATENCY.increment(r.latency_ns);
-            }
-            ringline_memcache::CommandType::Delete => {
-                let _ = metrics::DELETE_LATENCY.increment(r.latency_ns);
-            }
-            _ => {}
+        if let ringline_memcache::CommandType::Get = r.command
+            && let Some(ttfb) = r.ttfb_ns
+        {
+            let _ = metrics::GET_TTFB.increment(ttfb);
         }
-        let _ = metrics::RESPONSE_LATENCY.increment(r.latency_ns);
-        let _ = metrics::PERCEIVED_LATENCY
-            .increment(r.latency_ns + metrics::CURRENT_SLIP_NS.value() as u64);
+        // A routed connection records latency in its recv loop, where the
+        // request's queue wait is known (`record_routed_latency`).
+        if !routed {
+            match r.command {
+                ringline_memcache::CommandType::Get => {
+                    let _ = metrics::GET_LATENCY.increment(r.latency_ns);
+                }
+                ringline_memcache::CommandType::Set => {
+                    let _ = metrics::SET_LATENCY.increment(r.latency_ns);
+                }
+                ringline_memcache::CommandType::Delete => {
+                    let _ = metrics::DELETE_LATENCY.increment(r.latency_ns);
+                }
+                _ => {}
+            }
+            let _ = metrics::RESPONSE_LATENCY.increment(r.latency_ns);
+            let _ = metrics::PERCEIVED_LATENCY
+                .increment(r.latency_ns + metrics::CURRENT_SLIP_NS.value() as u64);
+        }
         metrics::BYTES_TX.add(r.tx_bytes as u64);
         metrics::BYTES_RX.add(r.rx_bytes as u64);
     }
@@ -1361,7 +1619,8 @@ async fn resp_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: usize
         let conn = connection.as_conn();
         let _close = CloseOnDrop(conn);
         metrics::CONNECTIONS_ACTIVE.increment();
-        let builder = ringline_redis::Client::builder(connection).on_result(make_resp_callback());
+        let builder = ringline_redis::Client::builder(connection)
+            .on_result(make_resp_callback(routed_queues().is_some()));
         #[cfg(target_os = "linux")]
         let builder =
             builder.kernel_timestamps(matches!(config.timestamps.mode, TimestampMode::Software));
@@ -1507,6 +1766,9 @@ async fn drive_resp_workload(
     let batch_size = config.connection.effective_batch_size();
     // `None` for a closed-loop run; see `TokenDispatcher`.
     let token_dispatch = dispatcher();
+    // `Some` with `workload.routing = "routed"`: Warmup and Running requests
+    // come from this worker's routed dispatcher instead of the limiter.
+    let routed = routed_queues();
     // Tokens the dispatcher already charged to this connection, carried to the
     // next iteration. `acquire` debits the limiter, so re-polling it here
     // instead of spending these would hand them back to nobody and quietly
@@ -1514,6 +1776,9 @@ async fn drive_resp_workload(
     let mut carried_tokens: u64 = 0;
     let mut prefill_in_flight: VecDeque<usize> = VecDeque::new();
     let mut inflight = InFlight::new(config.connection.request_timeout, pipeline_depth);
+    if routed.is_some() {
+        inflight = inflight.tracking_queued();
+    }
     let mut value_reader = ReadValues::new(config.workload.read_values);
 
     loop {
@@ -1538,6 +1803,9 @@ async fn drive_resp_workload(
         // Set when the limiter could not fund a batch in Warmup/Running. Only
         // then does an idle connection park on the dispatcher; see below.
         let mut starved = false;
+        // Set when a routed send failed. The connection then sleeps instead
+        // of waiting on its node queue, which may still hold requests.
+        let mut send_failed = false;
         // Set when the prefill pacer turned this connection away: how long to
         // sleep if nothing is in flight. It counts as waiting until this
         // iteration ends, including while it receives a reply instead.
@@ -1615,6 +1883,84 @@ async fn drive_resp_workload(
                         );
                         break;
                     }
+                }
+            }
+        } else if (phase == Phase::Warmup || phase == Phase::Running)
+            && want_fire
+            && let Some(ref queues) = routed
+        {
+            // Routed: the dispatcher already funded, keyed and routed every
+            // request in this node's queue. A backfill SET is not one of
+            // them, so it takes its own token from the limiter.
+            while client.pending_count() < pipeline_depth {
+                if !backfill_queue.is_empty()
+                    && let Some(ref rl) = state.task_state.ratelimiter
+                    && rl.try_wait().is_ok()
+                    && let Some(key_id) = backfill_queue.pop()
+                {
+                    write_key(key_buf, key_id);
+                    let user_data = key_id as u64 | BACKFILL_MARKER;
+                    let before = client.pending_count();
+                    let res = if value_len >= ZC_VALUE_THRESHOLD {
+                        let guard = make_value_guard(
+                            rng,
+                            &state.task_state.value_pool,
+                            value_len,
+                            pool_len,
+                        );
+                        client.fire_set_with_guard(key_buf, guard, user_data)
+                    } else {
+                        let value =
+                            value_slice(rng, &state.task_state.value_pool, value_len, pool_len);
+                        client.fire_set(key_buf, value, user_data)
+                    };
+                    if res.is_ok() {
+                        fired_count += 1;
+                        inflight.push_queued(fired_at, 0);
+                    } else {
+                        fired_count -=
+                            note_failed_fire(before, client.pending_count(), &mut inflight, true)
+                                as u64;
+                        backfill_queue.push(key_id);
+                        send_failed = true;
+                        break;
+                    }
+                    continue;
+                }
+
+                let Some(request) = queues.pop(endpoint_idx) else {
+                    break;
+                };
+                write_key(key_buf, request.key_id);
+                let queued_ns = fired_at
+                    .saturating_duration_since(request.funded_at)
+                    .as_nanos() as u64;
+
+                let roll = rng.random_range(0..100);
+                let before = client.pending_count();
+                let sent = if roll < get_ratio {
+                    client.fire_get(key_buf, request.key_id as u64).is_ok()
+                } else if roll < get_ratio + delete_ratio {
+                    client.fire_del(key_buf, 0).is_ok()
+                } else if value_len >= ZC_VALUE_THRESHOLD {
+                    let guard =
+                        make_value_guard(rng, &state.task_state.value_pool, value_len, pool_len);
+                    client.fire_set_with_guard(key_buf, guard, 0).is_ok()
+                } else {
+                    let value = value_slice(rng, &state.task_state.value_pool, value_len, pool_len);
+                    client.fire_set(key_buf, value, 0).is_ok()
+                };
+
+                if sent {
+                    fired_count += 1;
+                    let _ = metrics::ROUTED_QUEUE_WAIT.increment(queued_ns);
+                    inflight.push_queued(fired_at, queued_ns);
+                } else {
+                    fired_count -=
+                        note_failed_fire(before, client.pending_count(), &mut inflight, true)
+                            as u64;
+                    send_failed = true;
+                    break;
                 }
             }
         } else if (phase == Phase::Warmup || phase == Phase::Running) && want_fire {
@@ -1822,6 +2168,13 @@ async fn drive_resp_workload(
         // A connection the prefill pacer turned away sleeps for as long as
         // the pacer said.
         if client.pending_count() == 0 {
+            if let Some(ref queues) = routed
+                && (phase == Phase::Warmup || phase == Phase::Running)
+                && !send_failed
+            {
+                queues.wait(endpoint_idx).await;
+                continue;
+            }
             match token_dispatch {
                 Some(ref d) if starved => {
                     carried_tokens = d.acquire(batch_size as u64).await;
@@ -1865,7 +2218,7 @@ async fn drive_resp_workload(
                 return Err(reason);
             }
         };
-        inflight.pop();
+        let queued_ns = inflight.pop();
 
         // Handle prefill tracking. The PREFILL_MARKER bit in user_data
         // identifies prefill SETs unambiguously across phases, so we don't
@@ -1908,8 +2261,12 @@ async fn drive_resp_workload(
             check_resp_redirect_parsed(redirect, state);
         }
 
-        // Record counter metrics (latency is recorded by the on_result callback)
+        // Record counter metrics. Latency is recorded by the on_result
+        // callback, or here for a routed connection.
         record_counters(&result);
+        if routed.is_some() {
+            record_routed_latency(&result, queued_ns);
+        }
     }
 }
 
@@ -2304,7 +2661,7 @@ async fn memcache_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: u
         let _close = CloseOnDrop(conn);
         metrics::CONNECTIONS_ACTIVE.increment();
         let builder = ringline_memcache::Client::builder(connection)
-            .on_result(make_memcache_callback())
+            .on_result(make_memcache_callback(routed_queues().is_some()))
             .max_batch_size(config.connection.effective_batch_size());
         #[cfg(target_os = "linux")]
         let builder =
@@ -2408,6 +2765,9 @@ async fn drive_memcache_workload(
     let batch_size = config.connection.effective_batch_size();
     // `None` for a closed-loop run; see `TokenDispatcher`.
     let token_dispatch = dispatcher();
+    // `Some` with `workload.routing = "routed"`: Warmup and Running requests
+    // come from this worker's routed dispatcher instead of the limiter.
+    let routed = routed_queues();
     // Tokens the dispatcher already charged to this connection, carried to the
     // next iteration. `acquire` debits the limiter, so re-polling it here
     // instead of spending these would hand them back to nobody and quietly
@@ -2415,6 +2775,9 @@ async fn drive_memcache_workload(
     let mut carried_tokens: u64 = 0;
     let mut prefill_in_flight: VecDeque<usize> = VecDeque::new();
     let mut inflight = InFlight::new(config.connection.request_timeout, pipeline_depth);
+    if routed.is_some() {
+        inflight = inflight.tracking_queued();
+    }
     let mut value_reader = ReadValues::new(config.workload.read_values);
 
     loop {
@@ -2439,6 +2802,9 @@ async fn drive_memcache_workload(
         // Set when the limiter could not fund a batch in Warmup/Running. Only
         // then does an idle connection park on the dispatcher; see below.
         let mut starved = false;
+        // Set when a routed send failed. The connection then sleeps instead
+        // of waiting on its node queue, which may still hold requests.
+        let mut send_failed = false;
         // Set when the prefill pacer turned this connection away: how long to
         // sleep if nothing is in flight. It counts as waiting until this
         // iteration ends, including while it receives a reply instead.
@@ -2509,6 +2875,71 @@ async fn drive_memcache_workload(
                         );
                         break;
                     }
+                }
+            }
+        } else if (phase == Phase::Warmup || phase == Phase::Running)
+            && want_fire
+            && let Some(ref queues) = routed
+        {
+            // Routed: the dispatcher already funded, keyed and routed every
+            // request in this node's queue. A backfill SET is not one of
+            // them, so it takes its own token from the limiter.
+            while client.pending_count() < pipeline_depth {
+                if !backfill_queue.is_empty()
+                    && let Some(ref rl) = state.task_state.ratelimiter
+                    && rl.try_wait().is_ok()
+                    && let Some(key_id) = backfill_queue.pop()
+                {
+                    write_key(key_buf, key_id);
+                    let user_data = key_id as u64 | BACKFILL_MARKER;
+                    let before = client.pending_count();
+                    let guard =
+                        make_value_guard(rng, &state.task_state.value_pool, value_len, pool_len);
+                    let res = client.fire_set_with_guard(key_buf, guard, 0, 0, user_data);
+                    if res.is_ok() {
+                        fired_count += 1;
+                        inflight.push_queued(fired_at, 0);
+                    } else {
+                        fired_count -=
+                            note_failed_fire(before, client.pending_count(), &mut inflight, true)
+                                as u64;
+                        backfill_queue.push(key_id);
+                        send_failed = true;
+                        break;
+                    }
+                    continue;
+                }
+
+                let Some(request) = queues.pop(endpoint_idx) else {
+                    break;
+                };
+                write_key(key_buf, request.key_id);
+                let queued_ns = fired_at
+                    .saturating_duration_since(request.funded_at)
+                    .as_nanos() as u64;
+
+                let roll = rng.random_range(0..100);
+                let before = client.pending_count();
+                let sent = if roll < get_ratio {
+                    client.fire_get(key_buf, request.key_id as u64).is_ok()
+                } else if roll < get_ratio + delete_ratio {
+                    client.fire_delete(key_buf, 0).is_ok()
+                } else {
+                    let guard =
+                        make_value_guard(rng, &state.task_state.value_pool, value_len, pool_len);
+                    client.fire_set_with_guard(key_buf, guard, 0, 0, 0).is_ok()
+                };
+
+                if sent {
+                    fired_count += 1;
+                    let _ = metrics::ROUTED_QUEUE_WAIT.increment(queued_ns);
+                    inflight.push_queued(fired_at, queued_ns);
+                } else {
+                    fired_count -=
+                        note_failed_fire(before, client.pending_count(), &mut inflight, true)
+                            as u64;
+                    send_failed = true;
+                    break;
                 }
             }
         } else if (phase == Phase::Warmup || phase == Phase::Running) && want_fire {
@@ -2664,6 +3095,13 @@ async fn drive_memcache_workload(
         // A connection the prefill pacer turned away sleeps for as long as
         // the pacer said.
         if client.pending_count() == 0 {
+            if let Some(ref queues) = routed
+                && (phase == Phase::Warmup || phase == Phase::Running)
+                && !send_failed
+            {
+                queues.wait(endpoint_idx).await;
+                continue;
+            }
             match token_dispatch {
                 Some(ref d) if starved => {
                     carried_tokens = d.acquire(batch_size as u64).await;
@@ -2694,7 +3132,7 @@ async fn drive_memcache_workload(
                 return Err(reason);
             }
         };
-        inflight.pop();
+        let queued_ns = inflight.pop();
 
         if let Some(reader) = value_reader.as_mut()
             && let ringline_memcache::CompletedOp::Get {
@@ -2742,8 +3180,12 @@ async fn drive_memcache_workload(
             let _ = metrics::BACKFILL_SET_LATENCY.increment(result.latency_ns);
         }
 
-        // Record counter metrics
+        // Record counter metrics. Latency is recorded by the on_result
+        // callback, or here for a routed connection.
         record_counters(&result);
+        if routed.is_some() {
+            record_routed_latency(&result, queued_ns);
+        }
     }
 }
 
@@ -3074,6 +3516,8 @@ pub(crate) fn connection_share(
 pub(crate) enum SeedRole {
     Reader = 0,
     Append = 1,
+    /// The routed dispatcher, which draws every routed request's key.
+    Dispatcher = 2,
 }
 
 /// RNG seed for one connection: the run seed mixed with the connection's role
@@ -3710,6 +4154,11 @@ fn requeue_newest(
 /// that request's reply arrives. See `recv_with_timeout` for why.
 pub(crate) struct InFlight {
     fired: VecDeque<Instant>,
+    /// With `workload.routing = "routed"`, how long each request in flight
+    /// waited in its node's queue before it was sent (nanoseconds), parallel
+    /// to `fired`. Empty and unused otherwise.
+    queued: VecDeque<u64>,
+    track_queued: bool,
     timeout: Duration,
     timer: Option<ringline::SleepFuture>,
 }
@@ -3718,19 +4167,41 @@ impl InFlight {
     pub(crate) fn new(timeout: Duration, capacity: usize) -> Self {
         Self {
             fired: VecDeque::with_capacity(capacity),
+            queued: VecDeque::new(),
+            track_queued: false,
             timeout,
             timer: None,
         }
     }
 
-    #[inline]
-    pub(crate) fn push(&mut self, fired_at: Instant) {
-        self.fired.push_back(fired_at);
+    /// Also record each request's queue wait, for routed connections.
+    fn tracking_queued(mut self) -> Self {
+        self.track_queued = true;
+        self.queued = VecDeque::with_capacity(self.fired.capacity());
+        self
     }
 
     #[inline]
-    pub(crate) fn pop(&mut self) {
+    pub(crate) fn push(&mut self, fired_at: Instant) {
+        self.push_queued(fired_at, 0);
+    }
+
+    /// [`push`](Self::push) for a request that waited `queued_ns` in a routed
+    /// queue before it was sent.
+    #[inline]
+    fn push_queued(&mut self, fired_at: Instant, queued_ns: u64) {
+        self.fired.push_back(fired_at);
+        if self.track_queued {
+            self.queued.push_back(queued_ns);
+        }
+    }
+
+    /// Remove the oldest request, the one the reply just received answers.
+    /// Returns how long it waited in a routed queue; 0 when not tracked.
+    #[inline]
+    pub(crate) fn pop(&mut self) -> u64 {
         self.fired.pop_front();
+        self.queued.pop_front().unwrap_or(0)
     }
 
     /// Drop the `n` most recently pushed requests: ones the client discarded
@@ -3738,6 +4209,7 @@ impl InFlight {
     pub(crate) fn forget_newest(&mut self, n: usize) {
         let keep = self.fired.len().saturating_sub(n);
         self.fired.truncate(keep);
+        self.queued.truncate(keep);
     }
 
     fn len(&self) -> usize {
@@ -3878,6 +4350,82 @@ fn connect_timer_exhausted() -> Result<Connection, std::io::Error> {
 }
 
 #[cfg(test)]
+mod routed_tests {
+    use super::{ROUTED_QUEUE_PIPELINES, RoutedQueues, RoutedRequest};
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake, Waker};
+    use std::time::Instant;
+
+    struct CountWakes(AtomicUsize);
+    impl Wake for CountWakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn request(key_id: usize) -> RoutedRequest {
+        RoutedRequest {
+            key_id,
+            funded_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn queue_holds_connections_times_depth_times_the_multiple() {
+        // Node 0: 2 connections of depth 3; node 1: none.
+        let q = RoutedQueues::new(&[2, 0], 3);
+        let cap = 2 * 3 * ROUTED_QUEUE_PIPELINES;
+        for k in 0..cap {
+            assert!(q.push(0, request(k)), "request {k} fits");
+        }
+        assert!(!q.push(0, request(cap)), "the queue is full");
+        assert!(
+            !q.push(1, request(0)),
+            "a node with no connection holds nothing"
+        );
+        assert_eq!(q.pop(0).map(|r| r.key_id), Some(0), "first in, first out");
+        assert!(q.push(0, request(cap)), "popping made room");
+        assert!(q.pop(1).is_none());
+    }
+
+    #[test]
+    fn push_wakes_a_waiter_and_close_wakes_them_all() {
+        let q = RoutedQueues::new(&[1, 1], 1);
+        let wakes = Arc::new(CountWakes(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut cx = Context::from_waker(&waker);
+
+        let mut w0 = Box::pin(q.wait(0));
+        assert!(w0.as_mut().poll(&mut cx).is_pending(), "node 0 is empty");
+        q.push(1, request(1));
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 0, "node 1 has no waiter");
+        q.push(0, request(0));
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+        assert!(w0.as_mut().poll(&mut cx).is_ready());
+        drop(w0);
+
+        q.pop(0);
+        q.pop(1);
+        let mut a = Box::pin(q.wait(0));
+        let mut b = Box::pin(q.wait(1));
+        assert!(a.as_mut().poll(&mut cx).is_pending());
+        assert!(b.as_mut().poll(&mut cx).is_pending());
+        q.close();
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 3);
+        assert_eq!(a.as_mut().poll(&mut cx), Poll::Ready(()));
+        assert_eq!(b.as_mut().poll(&mut cx), Poll::Ready(()));
+        drop((a, b));
+        let mut late = Box::pin(q.wait(0));
+        assert!(
+            late.as_mut().poll(&mut cx).is_ready(),
+            "a wait after close returns"
+        );
+    }
+}
+
+#[cfg(test)]
 mod inflight_tests {
     use super::InFlight;
     use std::time::{Duration, Instant};
@@ -3911,6 +4459,31 @@ mod inflight_tests {
             Some(Duration::from_millis(1300).min(Duration::from_millis(1000)))
         );
         assert_eq!(f.len(), 1);
+    }
+
+    #[test]
+    fn queued_waits_follow_their_requests() {
+        let t0 = Instant::now();
+        let mut f = InFlight::new(Duration::from_secs(1), 4).tracking_queued();
+        f.push_queued(t0, 10);
+        f.push(t0);
+        f.push_queued(t0, 30);
+        f.push_queued(t0, 40);
+        // The client discarded the two newest before sending them.
+        f.forget_newest(2);
+        assert_eq!(f.pop(), 10);
+        assert_eq!(f.pop(), 0, "a request pushed without a wait waited 0");
+        assert_eq!(f.len(), 0);
+        f.push_queued(t0, 50);
+        assert_eq!(f.pop(), 50, "the discarded waits are gone");
+    }
+
+    #[test]
+    fn untracked_pop_reports_no_wait() {
+        let t0 = Instant::now();
+        let mut f = InFlight::new(Duration::from_secs(1), 4);
+        f.push_queued(t0, 10);
+        assert_eq!(f.pop(), 0);
     }
 
     #[test]

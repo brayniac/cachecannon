@@ -524,6 +524,17 @@ impl OutputFormatter for CleanFormatter {
             }
         }
 
+        if results.routed_queue_dropped > 0 {
+            println!(
+                "{}",
+                self.red(&format!(
+                    "Routed: {} of {} offered dropped at a full node queue (a node did not keep up)",
+                    results.routed_queue_dropped,
+                    results.offered()
+                ))
+            );
+        }
+
         if results.requests_send_failed > 0 {
             println!(
                 "{}",

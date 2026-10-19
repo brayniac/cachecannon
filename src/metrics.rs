@@ -18,6 +18,7 @@ pub mod request {
     pub const ERRORS: usize = 2;
     pub const TIMEOUTS: usize = 3;
     pub const SEND_FAILED: usize = 4;
+    pub const ROUTED_DROPPED: usize = 5;
 }
 
 /// Counter slot indices for cache metrics.
@@ -62,6 +63,12 @@ pub static REQUESTS_SENT: Counter = Counter::new(&REQUEST, request::SENT);
     description = "RESP and memcache main-workload requests not sent because a send failed (usually a full send pool or zero-copy slab)"
 )]
 pub static REQUESTS_SEND_FAILED: Counter = Counter::new(&REQUEST, request::SEND_FAILED);
+
+#[metric(
+    name = "routed_queue_dropped",
+    description = "Routed requests the dispatcher funded but dropped because the owning node's queue was full"
+)]
+pub static ROUTED_QUEUE_DROPPED: Counter = Counter::new(&REQUEST, request::ROUTED_DROPPED);
 
 #[metric(name = "responses_received", description = "Total responses received")]
 pub static RESPONSES_RECEIVED: Counter = Counter::new(&REQUEST, request::RECEIVED);
@@ -419,6 +426,12 @@ pub static DELETE_LATENCY: AtomicHistogram = AtomicHistogram::new(7, 64);
     description = "GET time-to-first-byte histogram (nanoseconds)"
 )]
 pub static GET_TTFB: AtomicHistogram = AtomicHistogram::new(7, 64);
+
+#[metric(
+    name = "routed_queue_wait",
+    description = "Routed requests: time from the dispatcher funding a request to a connection sending it (nanoseconds); included in response_latency"
+)]
+pub static ROUTED_QUEUE_WAIT: AtomicHistogram = AtomicHistogram::new(7, 64);
 
 #[metric(
     name = "backfill_set_latency",

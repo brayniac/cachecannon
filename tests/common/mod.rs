@@ -440,3 +440,209 @@ pub fn prefill_span(protocol: &str, keys: usize, rate: usize) -> Duration {
     };
     prefill_span_shaped(protocol, shape, keys, rate)
 }
+
+/// A server for `protocol` (resp or memcache) that answers every GET as a
+/// miss, after `delay`, and counts the GETs it received.
+pub fn spawn_get_counter(
+    protocol: &str,
+    delay: Duration,
+) -> (SocketAddr, Arc<std::sync::atomic::AtomicU64>) {
+    let gets = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counted = Arc::clone(&gets);
+    let addr = match protocol {
+        "resp" => spawn(move |stream| count_resp(stream, &counted, delay)),
+        "memcache" => spawn(move |stream| count_memcache(stream, &counted, delay)),
+        _ => unreachable!(),
+    };
+    (addr, gets)
+}
+
+fn count_resp(stream: TcpStream, gets: &std::sync::atomic::AtomicU64, delay: Duration) {
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    while let Some(header) = read_line(&mut reader) {
+        let n: usize = std::str::from_utf8(&header[1..]).unwrap().parse().unwrap();
+        let mut command = Vec::new();
+        for i in 0..n {
+            let len_line = read_line(&mut reader).unwrap();
+            let len: usize = std::str::from_utf8(&len_line[1..])
+                .unwrap()
+                .parse()
+                .unwrap();
+            let mut arg = vec![0u8; len + 2];
+            reader.read_exact(&mut arg).unwrap();
+            if i == 0 {
+                arg.truncate(len);
+                command = arg.to_ascii_uppercase();
+            }
+        }
+        let reply: &[u8] = match command.as_slice() {
+            b"GET" => {
+                gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::thread::sleep(delay);
+                b"$-1\r\n"
+            }
+            b"PING" => b"+PONG\r\n",
+            _ => b"+OK\r\n",
+        };
+        if writer.write_all(reply).is_err() {
+            return;
+        }
+    }
+}
+
+fn count_memcache(stream: TcpStream, gets: &std::sync::atomic::AtomicU64, delay: Duration) {
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    while let Some(line) = read_line(&mut reader) {
+        let reply: &[u8] = match line.split(|b| *b == b' ').next().unwrap() {
+            b"get" => {
+                gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::thread::sleep(delay);
+                b"END\r\n"
+            }
+            b"version" => b"VERSION 1.0\r\n",
+            _ => b"ERROR\r\n",
+        };
+        if writer.write_all(reply).is_err() {
+            return;
+        }
+    }
+}
+
+/// The shape of a routed run.
+pub struct Routed<'a> {
+    pub protocol: &'a str,
+    pub endpoints: &'a [SocketAddr],
+    pub threads: usize,
+    pub connections: usize,
+    pub pipeline: usize,
+    pub rate: u64,
+    pub duration: &'a str,
+    /// `[workload] routing`.
+    pub routing: &'a str,
+    /// Lines for `[workload.keyspace]`.
+    pub keyspace: &'a str,
+}
+
+/// Run a GET-only, rate-limited benchmark of `shape`, with no warmup.
+pub fn run_routed(shape: &Routed) {
+    let endpoints = shape
+        .endpoints
+        .iter()
+        .map(|addr| format!("\"{addr}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let toml = format!(
+        r#"
+        [general]
+        duration = "{duration}"
+        warmup = "0s"
+        threads = {threads}
+
+        [target]
+        endpoints = [{endpoints}]
+        protocol = "{protocol}"
+
+        [connection]
+        connections = {connections}
+        pipeline_depth = {pipeline}
+
+        [workload]
+        rate_limit = {rate}
+        routing = "{routing}"
+
+        [workload.keyspace]
+        {keyspace}
+
+        [workload.commands]
+        get = 100
+        set = 0
+
+        [admin]
+        format = "quiet"
+        "#,
+        duration = shape.duration,
+        threads = shape.threads,
+        protocol = shape.protocol,
+        connections = shape.connections,
+        pipeline = shape.pipeline,
+        rate = shape.rate,
+        routing = shape.routing,
+        keyspace = shape.keyspace,
+    );
+    let path = std::env::temp_dir().join(format!(
+        "cachecannon-routed-{}-{}.toml",
+        std::process::id(),
+        shape.protocol
+    ));
+    std::fs::write(&path, toml).unwrap();
+    let config = Config::load(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    run_benchmark_full(
+        config,
+        None,
+        create_formatter(OutputFormat::Quiet, ColorMode::Never),
+        Arc::new(AtomicBool::new(true)),
+    )
+    .unwrap();
+}
+
+/// Run routed against three servers with zipf keys and check that each server
+/// received its key share of the GETs. An even split, which is what pinned
+/// routing gives, fails: the shares differ by more than the tolerance.
+pub fn assert_routed_key_share(protocol: &str) {
+    use cachecannon::keydist::KeyDist;
+
+    const KEYS: usize = 1000;
+    const THETA: f64 = 0.99;
+    let shares = |endpoints: &[SocketAddr]| {
+        let keys = Arc::new(cachecannon::worker::build_endpoint_keys(
+            KEYS, 16, endpoints, &None,
+        ));
+        let dist = KeyDist::zipf(KEYS, THETA).with_endpoint_keys(&keys);
+        dist.endpoint_sampler().unwrap().shares().to_vec()
+    };
+    let spread = |s: &[f64]| {
+        s.iter().cloned().fold(f64::MIN, f64::max) - s.iter().cloned().fold(f64::MAX, f64::min)
+    };
+    // Placement follows the servers' addresses, and the ports are whatever
+    // the OS hands out, so some placements split the keys nearly evenly. Pick
+    // servers whose placement is clearly uneven, or an even split would pass.
+    let (servers, endpoints, expected) = (0..100)
+        .find_map(|_| {
+            let servers: Vec<_> = (0..3)
+                .map(|_| spawn_get_counter(protocol, Duration::ZERO))
+                .collect();
+            let endpoints: Vec<SocketAddr> = servers.iter().map(|(a, _)| *a).collect();
+            let expected = shares(&endpoints);
+            (spread(&expected) > 0.1).then_some((servers, endpoints, expected))
+        })
+        .expect("no uneven placement in 100 tries");
+    run_routed(&Routed {
+        protocol,
+        endpoints: &endpoints,
+        threads: 2,
+        connections: 6,
+        pipeline: 4,
+        rate: 5000,
+        duration: "2s",
+        routing: "routed",
+        keyspace: "count = 1000\ndistribution = \"zipf\"\nzipf_theta = 0.99",
+    });
+
+    let counts: Vec<u64> = servers
+        .iter()
+        .map(|(_, g)| g.load(std::sync::atomic::Ordering::Relaxed))
+        .collect();
+    let total: u64 = counts.iter().sum();
+    assert!(total > 5000, "too few GETs to compare shares: {counts:?}");
+    for (i, (&c, &want)) in counts.iter().zip(&expected).enumerate() {
+        let got = c as f64 / total as f64;
+        assert!(
+            (got - want).abs() < 0.03,
+            "server {i} received {got:.3} of GETs, its key share is {want:.3} \
+             (counts {counts:?}, shares {expected:?})"
+        );
+    }
+}

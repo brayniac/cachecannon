@@ -746,6 +746,60 @@ prefill = true
 
 See `config/valkey-cluster.toml` for a ready-to-use configuration.
 
+## Routing across nodes
+
+With several nodes (a list of endpoints, cluster mode, or auto discovery),
+`workload.routing` sets how a request reaches a node.
+
+```toml
+[workload]
+rate_limit = 100000
+routing = "routed"   # default "pinned"
+```
+
+**Pinned** (default): each connection serves one node and draws only keys that
+node owns. Each node is loaded as if it were a single-server benchmark: with
+`endpoint_allocation = "even"` every node gets the same share of the rate, or
+the same number of closed-loop connections, whatever share of the key
+distribution it owns. The result is the sum of per-node capacities.
+
+**Routed**: each request draws its key from the whole keyspace and is sent to
+the node that owns it, the way a client population loads a cluster. With zipf
+keys the node that owns the hottest keys receives more of the rate than the
+others.
+
+How a routed run works:
+
+1. Each worker runs a dispatcher. For each token the rate limiter grants, it
+   draws a key, routes it, and queues the request for the owning node.
+2. A connection to that node takes the request from the queue and sends it.
+3. Latency is measured from the moment the dispatcher funded the request, so
+   time spent queued behind a slow node is part of `response_latency`, the
+   per-command latencies and `perceived_latency`. The queueing part alone is
+   in `routed_queue_wait`.
+4. Each node's queue on a worker holds 16 times what that worker's
+   connections to the node can have in flight (`connections x
+   pipeline_depth`). A request funded while the queue is full is dropped and
+   counted in `routed_queue_dropped`, and the run summary reports it as part
+   of the offered load. A saturation search counts responses, so drops lower
+   the achieved rate and fail the step when it falls below
+   `min_throughput_ratio`.
+5. Backfill SETs (`backfill_on_miss`) are sent on the connection that saw the
+   miss and take their own token from the limiter.
+
+Requirements, checked at startup:
+
+- A rate limit: `workload.rate_limit > 0` or `[workload.saturation_search]`.
+  Closed-loop routing is not supported yet.
+- Protocol `resp`, `resp3`, `memcache` or `memcache-binary`.
+- At least `threads x nodes` connections, so every worker has a connection to
+  every node. In cluster and auto discovery modes the nodes are the ones found
+  by discovery.
+- Not with `connection.endpoint_allocation = "key_share"`, which approximates
+  the same per-node load by giving hot nodes more connections.
+
+The node list is still read once at startup, in both models.
+
 ## Memcached Auto Discovery
 
 `auto_discovery` runs against every node of an ElastiCache for Memcached

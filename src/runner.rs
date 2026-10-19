@@ -418,6 +418,7 @@ pub fn run_benchmark_full(
     let mut baseline_perceived: Option<Histogram> = None;
     let mut baseline_requests_dropped = 0u64;
     let mut baseline_requests_send_failed = 0u64;
+    let mut baseline_routed_queue_dropped = 0u64;
     let mut kv_baseline: Option<KvBaseline> = None;
     let mut current_phase = Phase::Precheck;
 
@@ -758,6 +759,7 @@ pub fn run_benchmark_full(
             baseline_perceived = metrics::PERCEIVED_LATENCY.load();
             baseline_requests_dropped = ratelimiter.as_ref().map(|rl| rl.dropped()).unwrap_or(0);
             baseline_requests_send_failed = metrics::REQUESTS_SEND_FAILED.value();
+            baseline_routed_queue_dropped = metrics::ROUTED_QUEUE_DROPPED.value();
             // A KV replay starts with warmup when there is one, so its first
             // requests warm the cache unrecorded. Without one it starts here,
             // after the baselines: started at the warmup phase, a short trace
@@ -1030,6 +1032,8 @@ pub fn run_benchmark_full(
 
     let requests_send_failed =
         metrics::REQUESTS_SEND_FAILED.value() - baseline_requests_send_failed;
+    let routed_queue_dropped =
+        metrics::ROUTED_QUEUE_DROPPED.value() - baseline_routed_queue_dropped;
 
     let get_latencies = delta_latency_stats(&metrics::GET_LATENCY, &baseline_get_latency);
     let get_ttfb = delta_latency_stats(&metrics::GET_TTFB, &baseline_get_ttfb);
@@ -1068,6 +1072,7 @@ pub fn run_benchmark_full(
         conns_total: total_connections as u64,
         requests_dropped,
         requests_send_failed,
+        routed_queue_dropped,
         schedule_slip,
         perceived_latency,
         // A run stopped before recording has no baseline; its deltas are 0.
@@ -1235,6 +1240,24 @@ pub(crate) fn check_node_counts(
              --connections={} < {} cluster nodes. Increase --connections to >= {} \
              (ideally >= threads x nodes for an even spread).",
             total_connections, num_endpoints, num_endpoints
+        )
+        .into());
+    }
+
+    // Routed requests are queued per worker per node, so every worker needs a
+    // connection to every node. Connections are assigned `i % nodes` over the
+    // global index and each worker takes a contiguous slice, so a slice of at
+    // least `nodes` connections covers every node; `threads x nodes` in total
+    // guarantees that slice.
+    let threads = config.general.threads;
+    if config.workload.routing == crate::config::Routing::Routed
+        && num_endpoints > 1
+        && total_connections < threads.saturating_mul(num_endpoints)
+    {
+        return Err(format!(
+            "routing = \"routed\" needs connections ({total_connections}) >= threads ({threads}) \
+             x nodes ({num_endpoints}) = {}, so every worker has a connection to every node",
+            threads.saturating_mul(num_endpoints)
         )
         .into());
     }
@@ -1750,6 +1773,25 @@ mod tests {
         timer_slots,
     };
     use crate::config::Config;
+
+    #[test]
+    fn routed_needs_a_connection_to_every_node_on_every_worker() {
+        let config = |connections: usize, routing: &str| -> Config {
+            toml::from_str(&format!(
+                "[general]\nthreads = 2\n[target]\nendpoints = [\"127.0.0.1:6379\"]\n\
+                 [connection]\nconnections = {connections}\n\
+                 [workload]\nrouting = \"{routing}\"\nrate_limit = 1000\n"
+            ))
+            .expect("test config must parse")
+        };
+        let err = super::check_node_counts(&config(5, "routed"), 3)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("threads (2) x nodes (3) = 6"), "{err}");
+        super::check_node_counts(&config(6, "routed"), 3).unwrap();
+        super::check_node_counts(&config(5, "pinned"), 3).unwrap();
+        super::check_node_counts(&config(1, "routed"), 1).unwrap();
+    }
 
     /// A minimal parsed config with the two recv keys set as given.
     fn test_config(ring: Option<u16>, buffer: Option<u32>) -> Config {

@@ -231,6 +231,25 @@ pub enum EndpointAllocation {
     KeyShare,
 }
 
+/// How a request reaches a node when there are several.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Routing {
+    /// Each connection serves one node and draws only that node's keys
+    /// (default). Every node is loaded as if it were a single-server
+    /// benchmark, so the result is the sum of per-node capacities.
+    #[default]
+    Pinned,
+    /// Each request draws its key from the whole keyspace and is sent to the
+    /// node that owns it, so a node receives its key share of the rate. Each
+    /// worker's dispatcher draws and routes the key and queues the request for
+    /// that node; latency is measured from that moment, so time spent queued
+    /// behind a slow node is counted. Requires a rate limit
+    /// (`workload.rate_limit > 0` or `[workload.saturation_search]`), a RESP or
+    /// memcache protocol, and at least `threads x nodes` connections.
+    Routed,
+}
+
 /// How requests are distributed across connections.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -337,6 +356,9 @@ pub struct Workload {
     /// On GET miss, automatically SET the key to backfill the cache (cache-aside pattern).
     #[serde(default, alias = "set_on_miss")]
     pub backfill_on_miss: bool,
+    /// How a request reaches a node when there are several. See [`Routing`].
+    #[serde(default)]
+    pub routing: Routing,
     /// Read every GET hit's value bytes: compute a CRC-32c over each value
     /// as the protocol client returns it. Off by default.
     ///
@@ -1155,6 +1177,10 @@ impl Config {
             }
         }
 
+        if self.workload.routing == Routing::Routed {
+            self.validate_routed()?;
+        }
+
         let is_recency = self.workload.keyspace.distribution == Distribution::Recency;
         match (&self.workload.append, is_recency) {
             (None, true) => {
@@ -1316,6 +1342,42 @@ impl Config {
     /// `[workload.kv_replay]` checks that need no file access. The trace and
     /// the model config are read when the run starts
     /// (`crate::kvreplay::KvReplay::load`).
+    /// `workload.routing = "routed"`. The node-count requirement (`threads x
+    /// nodes` connections) is checked after discovery, in
+    /// `runner::check_node_counts`, because validation sees only the seeds.
+    fn validate_routed(&self) -> Result<(), ConfigError> {
+        let bad = |why: &str| {
+            Err(ConfigError::Validation(format!(
+                "routing = \"routed\" {why}"
+            )))
+        };
+        // The same condition that creates the ratelimiter in the runner. A
+        // closed-loop routed run would need a cap on outstanding requests that
+        // does not exist yet.
+        if self.workload.rate_limit.unwrap_or(0) == 0 && self.workload.saturation_search.is_none() {
+            return bad(
+                "needs workload.rate_limit > 0 or [workload.saturation_search]; \
+                 closed-loop routing is not supported yet",
+            );
+        }
+        if !matches!(
+            self.target.protocol,
+            Protocol::Resp | Protocol::Resp3 | Protocol::Memcache | Protocol::MemcacheBinary
+        ) {
+            return bad("needs a RESP or memcache protocol");
+        }
+        if self.workload.kv_replay.is_some() {
+            return bad("does not apply to [workload.kv_replay], which sets its own requests");
+        }
+        if self.connection.endpoint_allocation == EndpointAllocation::KeyShare {
+            return bad(
+                "cannot be combined with connection.endpoint_allocation = \"key_share\"; \
+                 routing already gives each node its key share of the rate",
+            );
+        }
+        Ok(())
+    }
+
     fn validate_kv_replay(&self, kv: &KvReplay) -> Result<(), ConfigError> {
         let bad = |msg: &str| {
             Err(ConfigError::Validation(format!(
@@ -1606,6 +1668,48 @@ mod validation_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("cannot both"), "{err}");
+    }
+
+    #[test]
+    fn routed_needs_a_limiter_and_a_cache_protocol() {
+        let config = |workload: &str, extra: &str| {
+            parse_config(&format!(
+                "[target]\nendpoints = [\"127.0.0.1:6379\"]\n{extra}\n\
+                 [workload]\nrouting = \"routed\"\n{workload}"
+            ))
+        };
+        let routed = parse_config("[target]\nendpoints = [\"127.0.0.1:6379\"]\n").unwrap();
+        assert_eq!(
+            routed.workload.routing,
+            Routing::Pinned,
+            "pinned is the default"
+        );
+
+        config("rate_limit = 1000\n", "").unwrap();
+        config(
+            "[workload.saturation_search]\nstart_rate = 1000\n[workload.saturation_search.slo]\np99 = \"1ms\"\n",
+            "",
+        )
+        .unwrap();
+        config("rate_limit = 1000\n", "protocol = \"memcache\"").unwrap();
+
+        let err = config("", "").unwrap_err().to_string();
+        assert!(err.contains("rate_limit"), "{err}");
+        let err = config("rate_limit = 0\n", "").unwrap_err().to_string();
+        assert!(err.contains("rate_limit"), "{err}");
+        let err = config("rate_limit = 1000\n", "protocol = \"ping\"")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("RESP or memcache"), "{err}");
+        let err = parse_config(
+            "[target]\nendpoints = [\"127.0.0.1:6379\"]\n\
+             [connection]\nendpoint_allocation = \"key_share\"\n\
+             [workload]\nrouting = \"routed\"\nrate_limit = 1000\n\
+             [workload.keyspace]\ndistribution = \"zipf\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("key_share"), "{err}");
     }
 
     #[test]
