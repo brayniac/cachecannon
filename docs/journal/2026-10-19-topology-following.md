@@ -1,11 +1,14 @@
 # Following cluster topology changes mid-run
 
 - **Opened:** 2026-10-19
-- **Status:** OPEN — design, pre-build. No code yet. Records how cachecannon
-  fixes its node list at startup, what that gets wrong in both cluster modes,
-  a proposed design for adding and removing nodes and their connections during
-  a run, and the key-selection modes that design forces a decision on.
-- **PRs:** #239 (startup-only ElastiCache auto discovery, merged as `f37e532`)
+- **Status:** OPEN — step 2 (routed open loop) built; steps 3-6 not started.
+  Records how cachecannon fixes its node list at startup, what that gets wrong
+  in both cluster modes, a proposed design for adding and removing nodes and
+  their connections during a run, and the key-selection modes that design
+  forces a decision on. See "Step 2, as built" for where the build differs
+  from the design.
+- **PRs:** #239 (startup-only ElastiCache auto discovery, merged as `f37e532`),
+  #240 (guide correction, step 1), #241 (this entry); step 2 in review
 
 Code references are pinned to `f37e532`.
 
@@ -215,7 +218,7 @@ requirements follow:
   request's funding time. Latency recording for RESP and memcache moves into
   the recv loop, which has `user_data`.
 - The per-node queue is bounded. A request that finds it full, or whose node
-  has no live connection, is dropped and counted in a new `requests_dropped`
+  has no live connection, is dropped and counted in a new `routed_queue_dropped`
   counter. Saturation search counts responses, not requests sent, so when
   drops push the achieved rate below `min_throughput_ratio` of the target
   (`src/saturation.rs:389-394`), the step fails the same way a throughput
@@ -388,8 +391,8 @@ startup slot table it uses today (`src/runner.rs:823`).
   already re-routes keys on disconnect and can be generalised.
 - **Listed but unreachable node:** connections keep retrying with the existing
   backoff, since a replaced ElastiCache node stays listed for minutes. Requests
-  routed to it are dropped and counted in `requests_dropped`, and that is the
-  correct result during a replacement.
+  routed to it are dropped and counted in `routed_queue_dropped`, and that is
+  the correct result during a replacement.
 - **Pools:** `standalone_task_capacity` and `timer_slots` need a ceiling that
   covers growth. The simplest option is a `target.max_nodes` setting that sizes
   the pools for `max_nodes × per-node connections`, with a warning when a
@@ -436,7 +439,54 @@ many nodes a run can have, and that has not been decided.
    support in `cluster.rs`. This can be tested against a local Valkey cluster
    resharded with `valkey-cli --cluster reshard` during a run.
 
+## Step 2, as built
+
+Built on branch `routed-open-loop` as `[workload] routing = "pinned" |
+"routed"`, default `pinned`. Where it differs from the design above:
+
+- The drop counter is `routed_queue_dropped`. The design called it
+  `requests_dropped`, which already names the rate limiter's shed count
+  (`src/metrics.rs`).
+- The queue wait reaches the recv loop through `InFlight`, which keeps a
+  queue wait per request parallel to its fire times, not through
+  `user_data`. Replies on a connection are FIFO, so the front entry belongs
+  to the reply just received.
+- A node whose connections on a worker are all reconnecting is not dropped
+  at once: its requests queue until the queue fills, and the reconnect time
+  counts as latency.
+- Each node queue holds 16 × (this worker's connections to the node ×
+  `pipeline_depth`) requests. The multiple is a guess; nothing has measured
+  how often it fills on a healthy node.
+
+What review found that the design did not anticipate:
+
+- A connection that is waiting for a reply cannot send. The ringline-redis
+  and ringline-memcache clients take `&mut self` for both `fire_*` and
+  `recv`, and `recv_meta` pops the pending operation before awaiting
+  (ringline `dfff2e5`, `ringline-redis/src/lib.rs:1731`), so dropping a
+  `recv` to send something else loses the reply's bookkeeping. A request
+  queued while every connection to its node waits on a reply therefore waits
+  for a reply even with free pipeline slots. Measured by the reviewer on mio
+  against a fixed 2 ms server, one connection, pipeline 32, 2000 req/s:
+  pinned response p50 2.70 ms; routed p50 3.75 ms, p99 5.24 ms, with
+  `routed_queue_wait` p50 1.20 ms. Eight connections with pipeline 1 brought
+  the wait to 15 µs. Pinned connections have the same constraint, but a
+  pinned request's clock starts at send, so the wait is not reported.
+- The first waiter list was LIFO. With 8 connections, pipeline 1 and 500
+  req/s, two connections carried every request (`[0, 0, 0, 754, 754, 0, 0,
+  0]` GETs per server-side connection, against 192-195 each pinned). It is
+  now FIFO with one entry per task.
+
+Not measured: client CPU per request against pinned on io_uring. That needs
+a Linux host.
+
 ## Open questions for the owner
+
+- Routed latency includes the wait above. Options: document it and size
+  connections per node so the wait stays small (what step 2 does now), or
+  change the ringline clients so a connection can wait on a reply and on its
+  node queue at once (a `recv` that does not pop the pending operation until
+  the reply is complete, or a split send and receive half).
 
 - When a node is added, should total connections grow with the node count or
   stay fixed? In the routed model a fixed total stops meeting threads × nodes
