@@ -782,9 +782,11 @@ How a routed run works:
    to the node waiting on a reply. The waiting part alone is in
    `routed_queue_wait`, recorded when the request is sent (including requests
    a failed send then discards). With few connections per node, that wait is
-   mostly the generator's: pipelining does not shorten it, more connections
-   per node do. Keep `routed_queue_wait` small next to the latency you are
-   measuring, or the result describes the generator as much as the server.
+   mostly the generator's. Once this worker's connections to the node can
+   carry the rate, a deeper pipeline does not bring the wait below about one
+   reply time; more connections per node do. Keep `routed_queue_wait` small
+   next to the latency you are measuring, or the result describes the
+   generator as much as the server.
 4. Requests routed to a node whose connections on a worker are all
    reconnecting stay in the queue until it fills, and count the reconnect time
    as latency.

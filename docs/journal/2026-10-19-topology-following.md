@@ -471,14 +471,23 @@ What review found that the design did not anticipate:
   pinned response p50 2.70 ms; routed p50 3.75 ms, p99 5.24 ms, with
   `routed_queue_wait` p50 1.20 ms. Eight connections with pipeline 1 brought
   the wait to 15 µs. Pinned connections have the same constraint, but a
-  pinned request's clock starts at send, so the wait is not reported.
+  pinned request's clock starts at send, so the wait is not in the response
+  latency; it reaches `schedule_slip` and `perceived_latency` only when the
+  limiter holds more than one claim. Pipelining shortens the wait while the
+  connections are short of capacity for the rate (one connection at 2000
+  req/s: `routed_queue_wait` p50 39.8 ms at depth 1 and 4, 1.16 ms at depth
+  32), but not below about one reply time.
 - The first waiter list was LIFO. With 8 connections, pipeline 1 and 500
   req/s, two connections carried every request (`[0, 0, 0, 754, 754, 0, 0,
   0]` GETs per server-side connection, against 192-195 each pinned). It is
   now FIFO with one entry per task.
 
-Not measured: client CPU per request against pinned on io_uring. That needs
-a Linux host.
+Not measured: client CPU per request against pinned on io_uring, which needs
+a Linux host; and the cost of `RoutedQueues::wait`, which scans the node's
+waiter list on every poll (`will_wake` for the one-entry rule, `retain` on
+return). With hundreds of idle connections to one node per worker that scan
+is a per-request cost that grows with the connection count. If it measures
+badly, a per-task registered flag makes both checks O(1).
 
 ## Open questions for the owner
 
