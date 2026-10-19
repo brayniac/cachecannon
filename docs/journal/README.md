@@ -19,6 +19,7 @@ Conventions:
 
 | Date | Effort | Status |
 |------|--------|--------|
+| 2026-10-19 | [Following cluster topology changes mid-run](2026-10-19-topology-following.md) | OPEN — design, pre-build. Both cluster modes read the node list once at startup (#239); proposes a shared topology with stable node ids, a watcher thread, and draw-then-route key selection with open-loop, closed-loop global and closed-loop partitioned modes |
 | 2026-10-12 | [KV-cache prefix replay (`[workload.kv_replay]`)](2026-10-12-kv-replay.md) | OPEN — built and tested on mio locally against an in-process RESP server; not yet run against a real server, on io_uring, or at scale |
 | 2026-10-12 | [Reading received values (`workload.read_values`)](2026-10-12-read-values.md) | OPEN — built and tested on mio locally; client CPU per request with the option on vs off not yet measured (needs Linux, io_uring) |
 | 2026-10-08 | [Recording cachecannon into `.dendro`](2026-10-08-dendro-recording.md) | OPEN — steps 2 and 3 built 2026-10-11 (metriken 0.11 / exposition 0.22 / query 0.36; `/metrics/stream` through metriken's stream route), against ringline main `dfff2e5` through `[patch.crates-io]`. Remaining: step 1 (guide), in-process recording with `metriken-recorder` (#176 with a published crate), `cachecannon view` reads `.dendro`, and the dashboard template moves here and travels in the archive |
