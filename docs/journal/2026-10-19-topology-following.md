@@ -135,9 +135,9 @@ only accepts it with zipf. It reproduces the per-node load correctly only when
 the run is rate-limited; in closed loop, more connections to a node is not the
 same as more requests waiting on it.
 
-### Proposed: two load models
+### Proposed: separate load models
 
-The two load models answer different questions, so they are separate settings.
+The load models answer different questions, so they are separate settings.
 Their names are placeholders; "cluster" is already taken by `target.cluster`.
 
 **Per-node** loads each node as if it were a single-node benchmark. Each
@@ -174,6 +174,22 @@ open loop can use the same queues, with the dispatcher funding requests
 instead of connections. This is the part of the design with the most risk to
 the hot path, and it should be built and measured before the topology work
 depends on it.
+
+**Mirrored** (a third model, raised after the first two) sends every node the
+whole keyspace with the same distribution: N copies of a single-node
+benchmark, run in parallel. It differs from per-node in two ways:
+
+- It only works where a node accepts any key. Memcached nodes, including
+  ElastiCache nodes found by auto discovery, and standalone Valkey servers do.
+  A Valkey cluster node answers `MOVED` for every key outside its slots, so
+  config validation would reject mirrored with `target.cluster`.
+- Each node holds the whole keyspace, not its 1/N share. Prefill writes every
+  key to every node, and a node's working set is N times what it would be in
+  the routed or per-node models. Hit rate and memory results are for a node
+  holding the full keyspace.
+
+A topology change in mirrored needs no key re-partitioning: a new node gets
+the same workload and is prefilled, and a removed node's load stops.
 
 Per-node stays the default. Existing multi-endpoint results keep their meaning,
 and choosing routed is a deliberate change of question, so it does not need a
@@ -279,7 +295,8 @@ many nodes a run can have, and that has not been decided.
 
 - When a node is added, should total connections grow with the node count or
   stay fixed?
-- Names for the two load models, and whether the setting belongs under
+- Names for the load models (routed, per-node and mirrored are working names;
+  "pinned" is a candidate for per-node), and whether the setting belongs under
   `[target]` or `[workload]`.
 - In per-node open loop, should a node change hold the per-node rate or the
   total rate?
