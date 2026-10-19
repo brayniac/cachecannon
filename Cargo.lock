@@ -2349,7 +2349,7 @@ dependencies = [
 [[package]]
 name = "ringline"
 version = "0.7.0-alpha.0"
-source = "git+https://github.com/brayniac/ringline?rev=ef7cc842f8e26ba45ad1ce02d50f9f73dd142db1#ef7cc842f8e26ba45ad1ce02d50f9f73dd142db1"
+source = "git+https://github.com/brayniac/ringline?rev=715b3a4c1c41acb5461ff0826cd13e0099f346de#715b3a4c1c41acb5461ff0826cd13e0099f346de"
 dependencies = [
  "bytes",
  "crossbeam-channel",
@@ -2366,7 +2366,7 @@ dependencies = [
 [[package]]
 name = "ringline-memcache"
 version = "0.7.2"
-source = "git+https://github.com/brayniac/ringline?rev=ef7cc842f8e26ba45ad1ce02d50f9f73dd142db1#ef7cc842f8e26ba45ad1ce02d50f9f73dd142db1"
+source = "git+https://github.com/brayniac/ringline?rev=715b3a4c1c41acb5461ff0826cd13e0099f346de#715b3a4c1c41acb5461ff0826cd13e0099f346de"
 dependencies = [
  "bytes",
  "histogram 0.11.5",
@@ -2380,7 +2380,7 @@ dependencies = [
 [[package]]
 name = "ringline-ping"
 version = "0.6.0"
-source = "git+https://github.com/brayniac/ringline?rev=ef7cc842f8e26ba45ad1ce02d50f9f73dd142db1#ef7cc842f8e26ba45ad1ce02d50f9f73dd142db1"
+source = "git+https://github.com/brayniac/ringline?rev=715b3a4c1c41acb5461ff0826cd13e0099f346de#715b3a4c1c41acb5461ff0826cd13e0099f346de"
 dependencies = [
  "histogram 0.11.5",
  "ping-proto",
@@ -2391,7 +2391,7 @@ dependencies = [
 [[package]]
 name = "ringline-redis"
 version = "0.7.0"
-source = "git+https://github.com/brayniac/ringline?rev=ef7cc842f8e26ba45ad1ce02d50f9f73dd142db1#ef7cc842f8e26ba45ad1ce02d50f9f73dd142db1"
+source = "git+https://github.com/brayniac/ringline?rev=715b3a4c1c41acb5461ff0826cd13e0099f346de#715b3a4c1c41acb5461ff0826cd13e0099f346de"
 dependencies = [
  "bytes",
  "histogram 0.11.5",
