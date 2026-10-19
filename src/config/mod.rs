@@ -61,6 +61,14 @@ pub struct General {
     /// sizing the buffer to the response moves ~0.5% of the CQE budget.
     #[serde(default)]
     pub recv_buffer_size: Option<u32>,
+    /// Ask ringline for an incremental receive ring (`IOU_PBUF_RING_INC`),
+    /// where successive receives share a buffer at increasing offsets. Off by
+    /// default. The ring geometry is still `recv_ring_size` x
+    /// `recv_buffer_size`; set those too (ringline suggests 64 x 1 MiB for an
+    /// incremental ring). ringline falls back to a plain ring on a kernel
+    /// without incremental rings.
+    #[serde(default)]
+    pub recv_incremental: bool,
     /// Seed for the per-connection RNGs that choose keys and commands. Unset
     /// draws one from OS entropy; either way the runner logs the seed in use,
     /// so a run can be repeated exactly by setting it here.
@@ -86,6 +94,7 @@ impl Default for General {
             ringline_diag: false,
             recv_ring_size: None,
             recv_buffer_size: None,
+            recv_incremental: false,
             seed: None,
         }
     }
