@@ -619,14 +619,18 @@ pub fn assert_routed_key_share(protocol: &str) {
             (spread(&expected) > 0.1).then_some((servers, endpoints, expected))
         })
         .expect("no uneven placement in 100 tries");
+    // The hot node takes up to about 60% of the rate. Four connections per
+    // node per worker, each with a pipeline of 8, keep it well within what
+    // the thread-per-connection test servers serve on a loaded CI host, so
+    // the shares measure routing and not the hot node's capacity.
     run_routed(&Routed {
         protocol,
         endpoints: &endpoints,
         threads: 2,
-        connections: 6,
-        pipeline: 4,
-        rate: 5000,
-        duration: "2s",
+        connections: 24,
+        pipeline: 8,
+        rate: 2000,
+        duration: "3s",
         routing: "routed",
         keyspace: "count = 1000\ndistribution = \"zipf\"\nzipf_theta = 0.99",
     });
@@ -635,6 +639,12 @@ pub fn assert_routed_key_share(protocol: &str) {
         .iter()
         .map(|(_, g)| g.load(std::sync::atomic::Ordering::Relaxed))
         .collect();
+    let dropped = cachecannon::metrics::ROUTED_QUEUE_DROPPED.value();
+    assert_eq!(
+        dropped, 0,
+        "a node's queue filled, so the shares reflect its capacity, not routing \
+         (counts {counts:?}, shares {expected:?})"
+    );
     let total: u64 = counts.iter().sum();
     assert!(total > 5000, "too few GETs to compare shares: {counts:?}");
     for (i, (&c, &want)) in counts.iter().zip(&expected).enumerate() {
