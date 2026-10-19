@@ -26,7 +26,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
@@ -1151,6 +1151,9 @@ pub fn key_share_endpoints(shares: &[f64], total: usize) -> Vec<usize> {
 
 // ── Connection establishment helper ──────────────────────────────────────
 
+/// `general.recv_direct`, set by the runner before the workers start.
+pub(crate) static RECV_DIRECT: AtomicBool = AtomicBool::new(false);
+
 /// Try to connect to an endpoint, returning Ok(conn) or Err with retry sleep.
 /// When `tls_server_name` is Some, the connection terminates TLS with that
 /// SNI name.
@@ -1174,7 +1177,7 @@ pub(crate) async fn establish_connection(
     tls_server_name: Option<&str>,
     connect_timeout: Duration,
 ) -> Result<Connection, DisconnectReason> {
-    let mut connect = ringline::connect(endpoint);
+    let mut connect = ringline::connect(endpoint).recv_direct(RECV_DIRECT.load(Ordering::Relaxed));
     if let Some(server_name) = tls_server_name {
         connect = connect.tls(server_name);
     }

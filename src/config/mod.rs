@@ -69,6 +69,19 @@ pub struct General {
     /// without incremental rings.
     #[serde(default)]
     pub recv_incremental: bool,
+    /// Receive with one-shot receives into each connection's own accumulator
+    /// (ringline `TcpConnect::recv_direct`) instead of the provided ring.
+    /// Off by default. Ignored on TLS connections and on mio.
+    #[serde(default)]
+    pub recv_direct: bool,
+    /// Bytes a direct receive asks for when the parser has not announced a
+    /// length (ringline `recv_direct_region`). Unset keeps ringline's default.
+    #[serde(default)]
+    pub recv_direct_region: Option<usize>,
+    /// Arm multishot ring receives (the default). `false` arms one-shot ring
+    /// receives, ringline's own default.
+    #[serde(default = "default_true")]
+    pub recv_multishot: bool,
     /// Seed for the per-connection RNGs that choose keys and commands. Unset
     /// draws one from OS entropy; either way the runner logs the seed in use,
     /// so a run can be repeated exactly by setting it here.
@@ -95,6 +108,9 @@ impl Default for General {
             recv_ring_size: None,
             recv_buffer_size: None,
             recv_incremental: false,
+            recv_direct: false,
+            recv_direct_region: None,
+            recv_multishot: true,
             seed: None,
         }
     }
@@ -2470,4 +2486,8 @@ mod append_config_tests {
         let error = dma_config("buffer_capacity = 4095").unwrap_err();
         assert!(error.to_string().contains("buffer_capacity"), "{error}");
     }
+}
+
+fn default_true() -> bool {
+    true
 }

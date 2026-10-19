@@ -355,12 +355,16 @@ pub fn run_benchmark_full(
         // connections hold the ring while others get no buffers. With
         // `[timestamps] mode = "software"` (Linux), every receive is multishot
         // `recvmsg` either way, and mio ignores the setting.
-        .recv_multishot(true)
+        .recv_multishot(config.general.recv_multishot)
         .recv_incremental(config.general.recv_incremental)
         .loop_diag(config.general.ringline_diag);
     if let Some(tls_client) = tls_client {
         ringline_builder = ringline_builder.tls_client(tls_client);
     }
+    if let Some(region) = config.general.recv_direct_region {
+        ringline_builder = ringline_builder.recv_direct_region(region);
+    }
+    crate::worker::RECV_DIRECT.store(config.general.recv_direct, Ordering::Relaxed);
     let ringline_config = ringline_builder.build()?;
 
     // Enter the precheck phase BEFORE launching workers. `launch()` starts the
