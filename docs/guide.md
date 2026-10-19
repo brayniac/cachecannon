@@ -695,7 +695,7 @@ See `config/saturation.toml` for a ready-to-use configuration.
 
 ## Cluster Mode
 
-Cluster mode supports **Valkey/Redis Cluster** by discovering topology via `CLUSTER SLOTS` and routing keys to the correct shard by hash slot.
+Cluster mode supports **Valkey/Redis Cluster** by discovering topology via `CLUSTER SLOTS` at startup and routing keys by hash slot.
 
 ### Enabling Cluster Mode
 
@@ -709,23 +709,26 @@ cluster = true
 ### How It Works
 
 **Topology Discovery:**
-1. Before launching worker threads, the benchmark connects to seed nodes and sends `CLUSTER SLOTS`
-2. The response maps hash slot ranges (0-16383) to primary node endpoints
-3. A 16384-entry slot table is built: `slot -> endpoint`
+1. Before launching worker threads, the benchmark connects to a seed node over plain TCP and sends `CLUSTER SLOTS`. Discovery does not use TLS, and node addresses in the reply must be IPv4 addresses.
+2. The response maps hash slot ranges (0-16383) to primary node endpoints.
+3. A 16384-entry slot table is built: `slot -> endpoint`.
+
+The node list is read once. Nodes added to the cluster during a run receive no traffic, and connections to a removed node keep reconnecting to its address.
 
 **Request Routing:**
-1. Each key is hashed via CRC16 to determine its hash slot (0-16383)
-2. The slot table maps to the responsible endpoint
-3. The request is sent to a connection for that endpoint
+1. Each connection serves one node and sends keys whose CRC16 hash slot that node owns: by the startup slot table for `uniform` and `zipf` keys, and by the worker's current slot table for `recency` keys.
+2. Prefill and append SETs are checked against the worker's current slot table before they are sent.
 
-**MOVED Redirect Handling:**
-1. If the server responds with `MOVED <slot> <host>:<port>`, the benchmark extracts the new endpoint
-2. If the endpoint is unknown, a new connection is established dynamically
-3. The slot table is updated so future requests for that slot route directly to the new node
-4. The request is retried on the correct node
+**MOVED Redirects:**
+1. On a main-workload connection, a `MOVED <slot> <host>:<port>` reply is counted in `cluster_redirects` and as a response, not as an error, and its latency is recorded in the GET/SET/DEL and response latency histograms. On an append writer it is counted in `append_set_errors` and its latency in `append_set_latency`.
+2. If the named node is one of the startup nodes, the worker's slot table is updated for that slot. Each worker keeps its own slot table, so each one learns the move separately.
+3. If the named node was not found at startup, the redirect is logged as a warning (when the address is an IPv4 `ip:port`) and the slot table is not changed.
+4. A GET, SET or DEL in the main workload is not retried. A prefill or append SET that gets `MOVED` is queued again and resent: to the new node if the worker's slot table now names it, otherwise to the same node, which answers `MOVED` again. A slot moved to a node not found at startup therefore stops prefill from finishing: the run aborts when prefill stalls (30 s without a newly confirmed key) or at `prefill_timeout`, whichever comes first. It also stops the append batch from committing.
+
+Because `uniform` and `zipf` keys follow the startup slot ownership, after a slot moves those keys keep going to the old node, and every request for them returns `MOVED`. A rising `cluster_redirects` count means part of the reported throughput and latency is redirect replies.
 
 **ASK Redirects:**
-ASK redirects (indicating a slot migration in progress) are counted in the `cluster_redirects` metric but do not update the slot table, since the migration is transient.
+ASK redirects (indicating a slot migration in progress) are counted in `cluster_redirects` but do not update the slot table, since the migration is transient. A main-workload request is not retried. A prefill or append SET is queued again and resent to the same node until the migration finishes, after which it gets `MOVED` and follows item 4 above.
 
 ### Cluster Mode with Prefill
 
@@ -829,7 +832,7 @@ handshake:
 - **Only TLS 1.2/1.3 with modern cipher suites** — no RSA key exchange, no
   3DES or CBC-SHA1. An older server may have nothing to negotiate.
 
-TLS works with all protocols (RESP, Memcache, Ping), with cluster mode and with memcached auto discovery. It adds some latency overhead from the TLS handshake and encryption, so enable it when your server requires it rather than for local benchmarking. On memcache SET, TLS also costs the zero-copy value path: encryption has to copy, so `SendGuard` no longer avoids a copy.
+TLS works with all protocols (RESP, Memcache, Ping) and with memcached auto discovery. Cluster mode does not work with TLS: discovery sends `CLUSTER SLOTS` over plain TCP. TLS adds some latency overhead from the TLS handshake and encryption, so enable it when your server requires it rather than for local benchmarking. On memcache SET, TLS also costs the zero-copy value path: encryption has to copy, so `SendGuard` no longer avoids a copy.
 
 ## Memcache Protocol Selection
 

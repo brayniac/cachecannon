@@ -75,7 +75,7 @@ cachecannon view results.parquet
 - **[Prefill and backfill](docs/guide.md#prefill)** — Pre-populate the cache or auto-SET on miss (cache-aside)
 - **[Append stream](docs/guide.md#append-stream)** — Grow the keyspace in batches on a cadence, with newest-is-hottest reads
 - **[Saturation search](docs/guide.md#saturation-search)** — Automatically find max throughput that meets your latency SLO
-- **[Valkey/Redis Cluster](docs/guide.md#cluster-mode)** — Topology discovery, hash slot routing, MOVED redirect handling
+- **[Valkey/Redis Cluster](docs/guide.md#cluster-mode)** — Topology discovery at startup and hash slot routing
 - **[Parquet output](docs/reference.md#parquet-output)** — Record all metrics for post-hoc analysis
 - **[Web dashboard](docs/reference.md#results-viewer)** — Interactive viewer with throughput, latency, cache, and connection charts
 - **[Rezolus correlation](docs/guide.md#correlating-with-rezolus)** — Overlay system telemetry (CPU, network, scheduler) on benchmark results

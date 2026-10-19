@@ -1,7 +1,7 @@
 # Benchmark configuration for Valkey/Redis Cluster.
 #
-# Uses CLUSTER SLOTS to discover topology and routes keys by CRC16 hash slot.
-# Adapts to MOVED redirects during topology changes (failover, rebalance).
+# Uses CLUSTER SLOTS to discover topology at startup and routes keys by CRC16
+# hash slot. See docs/guide.md#cluster-mode for what MOVED and ASK do.
 
 [general]
 duration = "60s"
