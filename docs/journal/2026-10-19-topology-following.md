@@ -49,7 +49,8 @@ index into `endpoints`:
   endpoint index at startup, round-robin or by `key_share`.
 - Each connection task reads `state.task_state.endpoints[endpoint_idx]` once
   (`src/worker.rs:1330` for RESP, at 2275, 2841, 3246 and 3462 for the
-  other task kinds, and `src/dma/connection.rs:153`) and reconnects to that address for the life of the run.
+  other task kinds, and `src/dma/connection.rs:153`) and reconnects to that
+  address for the life of the run.
 - `prefill_queues` and `append_queues` are one queue per endpoint index, shared
   across workers. The runner thread routes each append batch into
   `append_queues` with the startup endpoints and slot table
@@ -80,7 +81,10 @@ apply:
   the `on_result` callback, so the reply's latency is recorded in the GET, SET
   or DELETE histogram, `RESPONSE_LATENCY` and `PERCEIVED_LATENCY` (statics in
   `src/metrics.rs`). Prefill and append SETs that get `MOVED` are queued again
-  and resent.
+  and re-routed when popped (`src/worker.rs:1564-1569`, `3376-3381`), so they
+  reach the new owner if it is a known node. For an unknown node the slot
+  table is unchanged, the key returns to the old node indefinitely, and
+  prefill never completes.
 - The uniform and zipf key-selection paths (`src/worker.rs:1715-1729`) pick a
   key from the connection's own endpoint bucket and send it without routing it.
   After a slot moves, those paths keep sending its keys to the old node, which
@@ -168,7 +172,8 @@ In the routed model, open and closed loop have to be implemented differently:
 
 - **Open loop.** The dispatcher funds a request, draws its key and routes it,
   and the node receives `share × rate`. A hot node receives more requests than
-  it can serve and its latency rises. The offered load does not depend on how
+  it can serve; its latency rises until its queue is full, and further
+  requests are dropped and counted. The offered load does not depend on how
   fast any node answers.
 - **Closed loop.** A fixed number of outstanding requests, each of which draws
   a key, routes, waits for the reply, and draws again. Requests accumulate on
@@ -190,8 +195,9 @@ requirements follow:
 
 - The queues are per worker, because a queue shared across workers would put a
   cross-thread handoff on the hot path. Every worker therefore needs at least
-  one connection to every node (connections ≥ threads × nodes), and config
-  validation enforces that for the routed model. Today a worker with fewer
+  one connection to every node (connections ≥ threads × nodes).
+  `check_node_counts` enforces that for the routed model after discovery, and
+  reconciliation re-checks it when a node is added. Today a worker with fewer
   connections than nodes has no connection to some of them, because
   connections are assigned by global index (`src/worker.rs:1004-1029`).
 - A request's latency starts when the dispatcher funds it, not when it is
@@ -200,12 +206,20 @@ requirements follow:
   hot node's queue would otherwise reach neither the latency histograms nor
   `PERCEIVED_LATENCY`. Saturation search reads those histograms
   (`src/saturation.rs:318-339`) and would not see the hot node break the SLO.
+  Today every latency histogram is written in the `on_result` callback
+  (`src/worker.rs:1259-1309`), and `CommandResult` in ringline-redis and
+  ringline-memcache has no `user_data`, so the callback cannot find a
+  request's funding time. Latency recording for RESP and memcache moves into
+  the recv loop, which has `user_data`.
 - The per-node queue is bounded. A request that finds it full, or whose node
   has no live connection, is dropped and counted in a new `requests_dropped`
-  counter.
+  counter. Saturation search already fails a step when responses fall below
+  `min_throughput_ratio` of the rate (`src/saturation.rs:340-390`), so drops
+  end the search the same way.
 
 Closed loop adds one cap on top of the same queues: a per-worker limit on
-outstanding requests, sized `connections × pipeline_depth`. memtier_benchmark
+outstanding requests, sized `connections × pipeline_depth`. Closed loop has no
+dispatcher, so its latency starts when the key is drawn. memtier_benchmark
 uses a similar cap, per cluster client (`hold_pipeline()` in
 `cluster_client.cpp`). The per-node handoff is the part of the design with the
 most risk to the hot path, and it should be built and measured before the
@@ -235,8 +249,8 @@ Reasons for building it second:
 
 Until routed closed loop exists, config validation rejects the routed model
 unless `workload.rate_limit > 0` or `[workload.saturation_search]` is set, the
-same condition that creates the ratelimiter (`src/runner.rs:125`), so a closed-loop run cannot fall
-back to per-node behaviour without saying so.
+same condition that creates the ratelimiter (`src/runner.rs:125`), so a
+closed-loop run cannot fall back to per-node behaviour without saying so.
 
 **Mirrored** (a third model, raised after the first two) sends every node the
 whole keyspace with the same distribution: N copies of a single-node
@@ -290,10 +304,10 @@ memory and was not checked. None offers more than one of these models.
   client draws keys from its own generator (`client.cpp`) and queues each key
   on its connection to the owning shard (`m_key_index_pools`). Each client caps
   its outstanding requests at `pipeline × its connection count`
-  (`hold_pipeline()`). A `MOVED` reply
-  triggers a `CLUSTER SLOTS` re-read. `handle_cluster_slots()` builds the new
-  map before swapping it in, keeps connections whose address is unchanged,
-  opens connections to new nodes, and retires the rest. A redirected request
+  (`hold_pipeline()`). A `MOVED` reply triggers a `CLUSTER SLOTS` re-read.
+  `handle_cluster_slots()` builds the new map before swapping it in, keeps
+  connections whose address is unchanged, opens connections to new nodes, and
+  retires the rest. A redirected request
   is retried only with `--retry-on-error`. `--rate-limiting` applies per
   connection, so in cluster mode every node gets the same rate rather than its
   key share.
@@ -302,7 +316,8 @@ memory and was not checked. None offers more than one of these models.
   rewrites a `{tag}` in the key to hash to a slot that node owns. `MOVED` or
   `ASK` triggers a `CLUSTER SLOTS` re-read that updates slot ranges of known
   nodes only; an unknown node fails with "could not find node with ID ... in
-  current configuration" and the benchmark exits. A redirected request is counted as finished.
+  current configuration" and the benchmark exits. A redirected request is
+  counted as finished.
 - mutilate (`mutilate.cc`, `Connection.cc`) is mirrored with a smaller
   keyspace: `--records` is divided by the server count, and every connection
   to every server draws from `lrand48() % options.records`. Each server gets
@@ -356,10 +371,12 @@ startup slot table it uses today (`src/runner.rs:823`).
   connection count per node, set at startup as `connections / initial nodes`,
   so total connections grow with the cluster. That matches a client with one
   pool per node. The alternative is to hold the total fixed and spread it more
-  thinly. The new node's connections are assigned to workers by the same
-  global-index rule as at startup, and the per-worker limiter weights, fixed
-  at startup today (`src/limiters.rs:280-333`), are rebuilt from the new
-  per-worker connection counts. An append writer is spawned for the node
+  thinly. The new node's connections are spread round-robin across workers, so
+  every worker gets at least one. In the routed model that needs
+  `connections / initial nodes ≥ threads`, which the startup check already
+  implies. The per-worker limiter weights, fixed at startup today
+  (`src/limiters.rs:280-333`), are rebuilt from the new per-worker connection
+  counts. An append writer is spawned for the node
   before any append key is routed to it, because a node with no writer never
   drains its append queue and the batch never commits.
 - **Removed node:** its connection tasks stop taking new work and exit after
@@ -384,8 +401,8 @@ to the final reply. An `ASK` reply needs `ASKING` sent on the target connection
 first. Both change what the response count and the latency histograms contain
 during a reshard, so they belong in the same CHANGELOG entry. `CommandResult`
 carries `success` but not the error text, so `on_result` cannot tell a
-redirect from another error; latency recording for RESP has to move from the
-callback into the recv loop, which has `RespMeta.error`.
+redirect from another error; step 2 has already moved latency recording into
+the recv loop, which has `RespMeta.error`.
 
 ### Metrics
 
@@ -400,7 +417,9 @@ many nodes a run can have, and that has not been decided.
    everything else.
 2. Routed open loop with the per-node queues, on a fixed node list. Config
    validation rejects routed unless a ratelimiter is created, and requires
-   connections ≥ threads × nodes. Latency starts at funding time.
+   connections ≥ threads × nodes. Latency recording for RESP and memcache
+   moves from the `on_result` callback into the recv loop, which has
+   `user_data` to look up the funding time. Step 6 reuses this for redirects.
    Measure client CPU per request against the per-node path at the highest
    pipeline depth and connection count in CI, on io_uring.
 3. Routed closed loop: the outstanding-request cap over the same queues, and
@@ -416,7 +435,12 @@ many nodes a run can have, and that has not been decided.
 ## Open questions for the owner
 
 - When a node is added, should total connections grow with the node count or
-  stay fixed?
+  stay fixed? In the routed model a fixed total stops meeting threads × nodes
+  once nodes are added, so the fixed-total option needs a rule for that case:
+  refuse the change, or drop below one connection per worker per node and
+  route across workers.
+- In mirrored, does a node added mid-run wait for its own prefill before
+  taking load, or start cold with its hit rate reported separately?
 - Names for the load models (routed, per-node and mirrored are working names;
   "pinned" is a candidate for per-node), and whether the setting belongs under
   `[target]` or `[workload]`.
