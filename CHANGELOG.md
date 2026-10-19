@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `target.auto_discovery` supports ElastiCache for Memcached auto discovery.
+  Before the run, cachecannon sends `config get cluster` to the configured
+  endpoints (falling back to `get AmazonElastiCache:cluster` on engines that
+  answer `ERROR`), over TLS when `target.tls` is set, and runs against the
+  nodes listed. Requires protocol `memcache` or `memcache-binary`. Discovery
+  runs once; node changes during the run are not followed.
 - cachecannon carries its own KPI template (`templates/cachecannon.json`, a
   Rezolus `ServiceExtension`) in its recordings: the `/metrics/stream`
   handshake sends it as `service_queries` metadata, which `rezolus record`

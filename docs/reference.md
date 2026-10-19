@@ -92,6 +92,11 @@ tls = false
 
 # Enable Valkey/Redis Cluster mode (see guide.md for details)
 cluster = false
+
+# ElastiCache for Memcached auto discovery: query the endpoints (a
+# configuration endpoint) with `config get cluster` and run against the nodes
+# it lists. Requires protocol memcache or memcache-binary; not with cluster.
+auto_discovery = false
 ```
 
 ### Connection Settings
@@ -131,8 +136,8 @@ request_distribution = "roundrobin"
 #               probability its keys carry: at least one if it owns keys,
 #               none if it owns none. Requires keyspace.distribution = "zipf"
 #               and connections >= endpoints, counting the endpoints listed in
-#               [target] (in cluster mode, the seed endpoints, not the nodes
-#               discovered later).
+#               [target] (in cluster and auto discovery modes, the seed
+#               endpoints, not the nodes discovered later).
 endpoint_allocation = "even"
 ```
 

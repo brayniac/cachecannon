@@ -116,6 +116,12 @@ pub fn run_benchmark_full(
         None
     };
 
+    // Memcached auto discovery: replace the configuration endpoint with the
+    // nodes it lists. Must run before anything is sized from the endpoint count.
+    if config.target.auto_discovery {
+        config.target.endpoints = crate::autodiscovery::discover_nodes(&config.target)?.nodes;
+    }
+
     let num_threads = config.general.threads;
     let warmup = effective_warmup(&config);
     let duration = config.general.duration;
@@ -1225,7 +1231,7 @@ fn max_from_histogram(hist: &Histogram) -> f64 {
 /// * **Client identity** (`tls_cert_file` + `tls_key_file`) — the certificate
 ///   presented for mutual TLS. Applied on both verification paths, so a
 ///   self-signed server and client auth can be used together.
-fn build_tls_client_config(
+pub(crate) fn build_tls_client_config(
     target: &crate::config::Target,
 ) -> Result<rustls::ClientConfig, Box<dyn std::error::Error>> {
     use rustls::pki_types::pem::PemObject;
@@ -1976,6 +1982,7 @@ mod tls_tests {
             tls_cert_file: None,
             tls_key_file: None,
             cluster: false,
+            auto_discovery: false,
         }
     }
 
