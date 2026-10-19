@@ -80,9 +80,8 @@ This lets you correlate cache performance with CPU utilization, network statisti
 #### One archive per run
 
 Rezolus can also record the benchmark itself. With `[admin] listen` set, the
-benchmark serves a msgpack snapshot on `/metrics/binary` — the path
-`rezolus record` probes — so a single invocation captures all three sources as
-labelled recordings inside one `.rez` archive:
+benchmark serves its metrics endpoint, so a single invocation captures all
+three sources as labelled recordings inside one `.dendro` archive:
 
 ```bash
 # Terminal 1: one recorder, three endpoints
@@ -90,25 +89,27 @@ rezolus record \
     --endpoint http://localhost:9090,source=cachecannon,role=loadgen \
     --endpoint http://server:4241,role=service \
     --endpoint http://client:4241 \
-    -o run.rez
+    -o run.dendro
 
 # Terminal 2: run the benchmark with its metrics endpoint enabled
 ./target/release/cachecannon config/valkey.toml
 ```
 
-A `.dendro` archive is recorded from `/metrics/stream` instead, which the
-benchmark also serves: rows stamped by the benchmark when it read them, with the
-latency histograms as histograms. Name `-o run.dendro` (or no `-o`; `.dendro`
-is rezolus 6.0's default) with the same endpoints. This needs a rezolus recorder
-that accepts the `application/vnd.metriken.replication.v1+dendro` content type,
-which no rezolus release does as of 2026-10-11; an older 6.0 recorder refuses
-the stream and the whole run at startup. Keep the `source=cachecannon` label: a
-recorder that reached the benchmark through `/metrics/binary` names the
-recording `rezolus` otherwise.
+rezolus 6 records the benchmark from `/metrics/stream`: rows stamped by the
+benchmark when it read them, with the latency histograms as histograms, and
+cachecannon's KPI template in the recording's metadata. It writes `.dendro`
+only (the default with no `-o`) and refuses `-o run.rez`. This needs a recorder
+that accepts the `application/vnd.metriken.replication.v1+dendro` content type
+(a rezolus built from main at 6.0.0-alpha.45 or later; no 6.0 release is
+published yet); an older 6.0 recorder refuses the stream and
+the whole run at startup. A rezolus 5.x recorder writes `.rez` instead, from
+the msgpack snapshot on `/metrics/binary`. Keep the `source=cachecannon` label:
+the KPI template selects it, and a 5.x recorder that reached the benchmark
+through `/metrics/binary` names the recording `rezolus` otherwise.
 
 Every recording shares one timeline, so benchmark and system metrics line up
 without matching timestamps across files by hand. Analysis happens in Rezolus
-(`rezolus view run.rez`); `cachecannon view` reads Parquet, so keep
+(`rezolus view run.dendro`); `cachecannon view` reads Parquet, so keep
 `--parquet results.parquet` if you also want the built-in dashboards.
 
 ## Workload Patterns

@@ -16,6 +16,7 @@ use tokio::sync::Notify;
 use crate::SharedState;
 
 mod stream;
+mod template;
 
 /// Admin server that exposes Prometheus metrics and optionally records Parquet.
 pub struct AdminServer {
@@ -635,15 +636,7 @@ async fn run_parquet_recorder(
     }
 
     // Convert msgpack stream → parquet (two passes over the temp file).
-    let converter = MsgpackToParquet::with_options(ParquetOptions::new())
-        .metadata(
-            "sampling_interval_ms".to_string(),
-            interval.as_millis().to_string(),
-        )
-        .metadata("source".to_string(), "cachecannon".to_string())
-        .metadata("version".to_string(), env!("CARGO_PKG_VERSION").to_string());
-
-    match converter.convert_file_path(&temp_path, &path) {
+    match parquet_converter(interval).convert_file_path(&temp_path, &path) {
         Ok(rows) => {
             tracing::info!("parquet recorder stopped, wrote {:?} ({} rows)", path, rows);
         }
@@ -655,6 +648,24 @@ async fn run_parquet_recorder(
     let _ = std::fs::remove_file(&temp_path);
 
     Ok(())
+}
+
+/// The converter that turns the staged snapshots into the parquet file, with
+/// the file metadata: the interval, the source, the version and cachecannon's
+/// KPI template (`service_queries`, [`template`]), which the Rezolus viewer
+/// renders as the KPI section.
+fn parquet_converter(interval: Duration) -> MsgpackToParquet {
+    MsgpackToParquet::with_options(ParquetOptions::new())
+        .metadata(
+            "sampling_interval_ms".to_string(),
+            interval.as_millis().to_string(),
+        )
+        .metadata("source".to_string(), "cachecannon".to_string())
+        .metadata("version".to_string(), env!("CARGO_PKG_VERSION").to_string())
+        .metadata(
+            template::KEY_SERVICE_QUERIES.to_string(),
+            template::SERVICE_QUERIES.to_string(),
+        )
 }
 
 /// Path used for the on-disk msgpack staging file alongside the final
@@ -964,15 +975,21 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         drop(writer);
-        let rows = MsgpackToParquet::with_options(ParquetOptions::new())
-            .metadata("sampling_interval_ms".to_string(), "5".to_string())
-            .metadata("source".to_string(), "cachecannon".to_string())
+        let rows = parquet_converter(Duration::from_millis(5))
             .convert_file_path(&staged, &parquet)
             .unwrap();
         assert_eq!(rows, 3);
 
         let reader = metriken_query::ParquetReader::open(&parquet).unwrap();
         assert_eq!(reader.source(), "cachecannon");
+        // The KPI template travels in the file, for the Rezolus viewer.
+        assert_eq!(
+            reader
+                .file_metadata()
+                .get(template::KEY_SERVICE_QUERIES)
+                .map(String::as_str),
+            Some(template::SERVICE_QUERIES)
+        );
         assert!(reader.has_histogram("response_latency"));
         let (start, end) = reader.time_range().unwrap();
         let result = reader
@@ -1116,6 +1133,14 @@ mod tests {
                 assert_eq!(
                     metadata.get("version").map(String::as_str),
                     Some(env!("CARGO_PKG_VERSION"))
+                );
+                // The KPI template, which a recorder keeps in the source's
+                // metadata for the viewer.
+                assert_eq!(
+                    metadata
+                        .get(template::KEY_SERVICE_QUERIES)
+                        .map(String::as_str),
+                    Some(template::SERVICE_QUERIES)
                 );
             }
             other => panic!("first frame is not a handshake: {other:?}"),

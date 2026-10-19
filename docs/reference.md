@@ -550,12 +550,53 @@ frame interval and layout, `/metrics/stream?interval=500ms&layout=long`
 is refused with 400. An interval below the 10 ms update floor is served at the
 floor, and `x-metriken-frame-interval` names the interval served. The response
 has no `Content-Length`: it is dendro's preamble and a handshake
-(`source=cachecannon`, the version in its metadata), then one frame per
+(`source=cachecannon`; the version and the KPI template in its metadata, see
+[KPI template](#kpi-template)), then one frame per
 interval, aligned to the Unix epoch, until the client disconnects. The
 `x-metriken-frame-interval`, `x-metriken-update-floor` (10 ms) and
 `x-metriken-layout` headers describe it. Every metric is in one group,
 `cachecannon/main`, stamped when it is read, with no acquisition window;
 histograms are sent as histograms, not as summaries.
+
+### KPI Template
+
+cachecannon's KPI template is `templates/cachecannon.json`, a Rezolus
+`ServiceExtension`: the throughput, latency, error and cache-hit charts the
+Rezolus viewer shows as cachecannon's section. It is sent as the
+`service_queries` key of the `/metrics/stream` handshake's metadata, which
+`rezolus record` keeps in the recording's metadata, and written under the same
+key into the `[admin] parquet` file's metadata. The viewer renders the template
+a `.dendro` recording carries, so a template change reaches the viewer with a
+cachecannon release.
+
+Every query selects `source="cachecannon"`. Where that label is missing, the
+section renders with empty charts:
+
+- The `[admin] parquet` file on its own: its columns carry no `source` label
+  (the source is in the file metadata only), so the charts are empty until
+  rezolus attaches a single-source parquet's source to its series as a label.
+- `rezolus recording combine … -o out.parquet` drops the template in rezolus
+  up to 6.0.0-alpha.62. `rezolus recording combine … -o out.rez` keeps it,
+  and its charts have data.
+- A recording relabelled with another source, such as
+  `rezolus record --endpoint http://host:9090,source=cc-a`: the carried
+  template still selects `source="cachecannon"`, so its charts are empty.
+  Keep the source `cachecannon`, and tell two runs apart with another label
+  (`--label arm=a`).
+
+Rezolus's built-in copy of the template renders instead of the carried one:
+
+- for a recording that carries none: made by an older cachecannon, scraped
+  from `/metrics` (which carries no metadata), or recorded by rezolus 5.x
+  from `/metrics/binary`;
+- when the carried JSON does not parse;
+- for a parquet combined by a rezolus that drops the template (above);
+- with `rezolus view --registry-templates`, which prefers the built-in copy.
+
+Tests in `src/admin/template.rs` check that each query selects
+`source="cachecannon"` and only metrics cachecannon registers, that each KPI's
+`type` is one the viewer charts and its `role` a lowercase word, and that every
+`unit_system` is one the viewer knows.
 
 ## Output Formats
 
@@ -725,6 +766,8 @@ The benchmark can record all metrics to a Parquet file for post-hoc analysis wit
 - Snapshots are only recorded during the **Running** phase (not during Connect, Prefill, or Warmup)
 - One snapshot is captured per `parquet_interval`
 - A final snapshot is captured on shutdown
+- The file metadata carries `source`, `version`, `sampling_interval_ms` and the
+  [KPI template](#kpi-template) as `service_queries`
 
 ### Parquet Schema
 
