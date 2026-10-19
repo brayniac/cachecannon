@@ -118,8 +118,8 @@ pub fn run_benchmark_full(
 
     // Memcached auto discovery: replace the configuration endpoint with the
     // nodes it lists. Must run before anything is sized from the endpoint
-    // count. Config validation counted the seeds, so checks that depend on the
-    // node count are repeated below.
+    // count. Config validation counted the seeds; `check_node_counts` counts
+    // the nodes.
     if config.target.auto_discovery {
         config.target.endpoints = crate::autodiscovery::discover_nodes(&config.target)?.nodes;
     }
@@ -193,35 +193,7 @@ pub fn run_benchmark_full(
     let key_count = config.workload.keyspace.count;
     let num_endpoints = config.target.endpoints.len();
 
-    // Guardrail: prefill is drained from shared per-endpoint queues, so it can
-    // only complete if every node has at least one connection across all
-    // workers. Fewer connections than nodes leaves a node's queue with no
-    // draining task — fail loud at startup instead of stalling silently
-    // mid-prefill at conns/nodes progress.
-    if prefill_enabled && num_endpoints > 1 && total_connections < num_endpoints {
-        return Err(format!(
-            "cluster prefill needs at least one connection per node, but \
-             --connections={} < {} cluster nodes. Increase --connections to >= {} \
-             (ideally >= threads x nodes for an even spread).",
-            total_connections, num_endpoints, num_endpoints
-        )
-        .into());
-    }
-
-    // Same for the append stream: writers are assigned to nodes round-robin,
-    // so a node without one never drains its append queue and the first batch
-    // never commits.
-    if let Some(ref append) = config.workload.append
-        && num_endpoints > 1
-        && append.connections < num_endpoints
-    {
-        return Err(format!(
-            "append.connections ({}) must be >= the number of nodes ({num_endpoints}) so \
-             every node's append queue has a writer draining it",
-            append.connections
-        )
-        .into());
-    }
+    check_node_counts(&config, num_endpoints)?;
 
     // Build the shared per-endpoint prefill queues once: the full keyspace,
     // partitioned by owning endpoint. All workers share this `Arc` and drain
@@ -1234,6 +1206,49 @@ fn max_from_histogram(hist: &Histogram) -> f64 {
         Ok(None) => {}
     }
     0.0
+}
+
+/// Checks that need the node count, which in cluster and auto discovery modes
+/// is known only after discovery. Each one rejects a config that would
+/// otherwise stall: a node no task drains.
+pub(crate) fn check_node_counts(
+    config: &Config,
+    num_endpoints: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let prefill_enabled = config.workload.prefill;
+    let total_connections = config.connection.total_connections();
+
+    // Guardrail: prefill is drained from shared per-endpoint queues, so it can
+    // only complete if every node has at least one connection across all
+    // workers. Fewer connections than nodes leaves a node's queue with no
+    // draining task — fail loud at startup instead of stalling silently
+    // mid-prefill at conns/nodes progress.
+    if prefill_enabled && num_endpoints > 1 && total_connections < num_endpoints {
+        return Err(format!(
+            "cluster prefill needs at least one connection per node, but \
+             --connections={} < {} cluster nodes. Increase --connections to >= {} \
+             (ideally >= threads x nodes for an even spread).",
+            total_connections, num_endpoints, num_endpoints
+        )
+        .into());
+    }
+
+    // Same for the append stream: writers are assigned to nodes round-robin,
+    // so a node without one never drains its append queue and the first batch
+    // never commits.
+    if let Some(ref append) = config.workload.append
+        && num_endpoints > 1
+        && append.connections < num_endpoints
+    {
+        return Err(format!(
+            "append.connections ({}) must be >= the number of nodes ({num_endpoints}) so \
+             every node's append queue has a writer draining it",
+            append.connections
+        )
+        .into());
+    }
+
+    Ok(())
 }
 
 /// Build the rustls client config from the target's TLS settings.

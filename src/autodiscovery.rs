@@ -9,7 +9,7 @@
 //! Discovery runs once. Nodes added or removed during the run are not seen.
 
 use crate::config::Target;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,11 +20,11 @@ const CONFIG_GET_CLUSTER: &[u8] = b"config get cluster\r\n";
 const GET_CLUSTER_KEY: &[u8] = b"get AmazonElastiCache:cluster\r\n";
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Bound on one request's whole reply. `READ_TIMEOUT` applies per read, so a
-/// server trickling bytes would otherwise never be stopped.
-const REPLY_DEADLINE: Duration = Duration::from_secs(10);
+/// Bound on one seed's exchange after the TCP connect: the TLS handshake and
+/// both requests. Every socket read and write is limited to the time left, so
+/// a server sending a byte at a time is stopped at the deadline too.
+const SEED_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Upper bound on a response, so a server that never sends `END` cannot grow
 /// the buffer without limit.
@@ -41,6 +41,13 @@ pub struct ClusterConfig {
 /// Query each seed in turn and return the first cluster configuration
 /// obtained. Uses TLS when `target.tls` is set.
 pub fn discover_nodes(target: &Target) -> Result<ClusterConfig, Box<dyn std::error::Error>> {
+    discover(target, SEED_DEADLINE)
+}
+
+fn discover(
+    target: &Target,
+    deadline: Duration,
+) -> Result<ClusterConfig, Box<dyn std::error::Error>> {
     let tls = if target.tls {
         Some(Arc::new(crate::runner::build_tls_client_config(target)?))
     } else {
@@ -49,7 +56,12 @@ pub fn discover_nodes(target: &Target) -> Result<ClusterConfig, Box<dyn std::err
 
     let mut last_err: Option<Box<dyn std::error::Error>> = None;
     for seed in &target.endpoints {
-        match try_discover(*seed, tls.as_ref(), target.tls_hostname.as_deref()) {
+        match try_discover(
+            *seed,
+            tls.as_ref(),
+            target.tls_hostname.as_deref(),
+            deadline,
+        ) {
             Ok(config) => {
                 tracing::info!(
                     seed = %seed,
@@ -76,13 +88,16 @@ fn try_discover(
     seed: SocketAddr,
     tls: Option<&Arc<rustls::ClientConfig>>,
     tls_hostname: Option<&str>,
+    deadline: Duration,
 ) -> Result<ClusterConfig, Box<dyn std::error::Error>> {
     let stream = TcpStream::connect_timeout(&seed, CONNECT_TIMEOUT)?;
-    stream.set_read_timeout(Some(READ_TIMEOUT))?;
-    stream.set_write_timeout(Some(READ_TIMEOUT))?;
     stream.set_nodelay(true)?;
+    let stream = DeadlineStream {
+        stream,
+        at: Instant::now() + deadline,
+    };
 
-    match tls {
+    let result = match tls {
         Some(tls) => {
             // Same server name the workers use: tls_hostname, else the IP.
             let name = match tls_hostname {
@@ -96,7 +111,63 @@ fn try_discover(
             let mut stream = stream;
             query(&mut stream)
         }
+    };
+    // A timeout inside the TLS handshake or a write surfaces here unmapped.
+    result.map_err(|e| {
+        if e.downcast_ref::<io::Error>().is_some_and(is_timeout) {
+            format!("no reply within {deadline:?}").into()
+        } else {
+            e
+        }
+    })
+}
+
+/// A `TcpStream` whose reads and writes fail with `TimedOut` once `at` has
+/// passed. Each call sets the socket timeout to the time left, because the
+/// socket timeout alone applies per call and resets on every byte received.
+struct DeadlineStream {
+    stream: TcpStream,
+    at: Instant,
+}
+
+impl DeadlineStream {
+    fn arm(&self) -> io::Result<()> {
+        let left = self.at.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "discovery deadline passed",
+            ));
+        }
+        self.stream.set_read_timeout(Some(left))?;
+        self.stream.set_write_timeout(Some(left))
     }
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.arm()?;
+        self.stream.read(buf)
+    }
+}
+
+impl Write for DeadlineStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.arm()?;
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+/// A socket timeout reads as `WouldBlock` on Unix and `TimedOut` elsewhere.
+fn is_timeout(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
 }
 
 /// Run the discovery exchange on an open connection.
@@ -134,7 +205,6 @@ fn request<S: Read + Write>(
     stream.write_all(cmd)?;
     stream.flush()?;
 
-    let deadline = Instant::now() + REPLY_DEADLINE;
     let mut buf = Vec::with_capacity(1024);
     let mut tmp = [0u8; 4096];
     loop {
@@ -144,18 +214,14 @@ fn request<S: Read + Write>(
         if buf.len() > MAX_RESPONSE {
             return Err(format!("response exceeded {MAX_RESPONSE} bytes without END").into());
         }
-        if Instant::now() > deadline {
-            return Err(format!("no complete reply within {REPLY_DEADLINE:?}").into());
-        }
         let n = match stream.read(&mut tmp) {
             Ok(n) => n,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                return Err(format!("no reply within {READ_TIMEOUT:?}").into());
+            Err(e) if is_timeout(&e) && !buf.is_empty() => {
+                return Err(format!(
+                    "reply incomplete at the deadline ({} bytes received)",
+                    buf.len()
+                )
+                .into());
             }
             Err(e) => return Err(e.into()),
         };
@@ -429,17 +495,52 @@ mod tests {
         );
     }
 
-    #[test]
-    fn silent_seed_times_out() {
+    /// A deadline short enough to keep the timeout tests fast.
+    const TEST_DEADLINE: Duration = Duration::from_millis(300);
+
+    /// Accept one connection and hold it open, sending nothing.
+    fn silent_server() -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let seed = listener.local_addr().unwrap();
-        // Accept and hold the connection open without replying.
+        let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             let (_sock, _) = listener.accept().unwrap();
-            std::thread::sleep(READ_TIMEOUT * 2);
+            std::thread::sleep(TEST_DEADLINE * 4);
         });
-        let err = discover_nodes(&target(vec![seed])).unwrap_err().to_string();
+        addr
+    }
+
+    #[test]
+    fn silent_seed_times_out() {
+        let err = discover(&target(vec![silent_server()]), TEST_DEADLINE)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no reply within"), "{err}");
+    }
+
+    #[test]
+    fn trickling_seed_is_stopped_at_the_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let seed = listener.local_addr().unwrap();
+        // A valid header, then one byte of the data block every 50 ms: each
+        // read returns well inside any per-read timeout.
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = vec![0u8; CONFIG_GET_CLUSTER.len()];
+            sock.read_exact(&mut req).unwrap();
+            let _ = sock.write_all(b"CONFIG cluster 0 1000\r\n");
+            for _ in 0..1000 {
+                if sock.write_all(b"x").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let start = Instant::now();
+        let err = discover(&target(vec![seed]), TEST_DEADLINE)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("incomplete at the deadline"), "{err}");
+        assert!(start.elapsed() < TEST_DEADLINE * 3, "{:?}", start.elapsed());
     }
 
     #[test]
@@ -459,10 +560,12 @@ mod tests {
         ))
         .unwrap();
         config.validate().expect("one seed passes validation");
-        let err = crate::runner::run_benchmark(config)
+        let nodes = discover_nodes(&config.target).unwrap().nodes;
+        let err = crate::runner::check_node_counts(&config, nodes.len())
             .unwrap_err()
             .to_string();
         assert!(err.contains("append.connections (1)"), "{err}");
+        crate::runner::check_node_counts(&config, 1).expect("one node needs one writer");
     }
 
     /// Generate a self-signed cert and key with openssl. Returns None when
@@ -482,30 +585,53 @@ mod tests {
         out.status.success().then_some((crt, key))
     }
 
-    #[test]
-    fn discovers_over_tls() {
+    /// A rustls server config with a fresh self-signed certificate, or None
+    /// when openssl is unavailable.
+    fn tls_server_config() -> Option<Arc<rustls::ServerConfig>> {
         use rustls::pki_types::pem::PemObject;
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-        let dir = std::env::temp_dir().join(format!("cc-autodiscovery-tls-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "cc-autodiscovery-tls-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let Some((crt, key)) = gen_cert(&dir) else {
-            return; // openssl unavailable
+        let generated = gen_cert(&dir).map(|(crt, key)| {
+            let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&crt)
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let key = PrivateKeyDer::from_pem_file(&key).unwrap();
+            Arc::new(
+                rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(certs, key)
+                    .unwrap(),
+            )
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        if generated.is_none() {
+            eprintln!("openssl unavailable; skipping TLS discovery test");
+        }
+        generated
+    }
+
+    /// The self-signed leaf is not a CA, so the client does not verify it; the
+    /// handshake and the framing over it are what the TLS tests cover.
+    fn tls_target(seed: SocketAddr) -> Target {
+        let mut t = target(vec![seed]);
+        t.tls = true;
+        t.tls_verify = false;
+        t
+    }
+
+    #[test]
+    fn discovers_over_tls() {
+        let Some(server_config) = tls_server_config() else {
+            return;
         };
-
-        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&crt)
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        let key = PrivateKeyDer::from_pem_file(&key).unwrap();
-        let server_config = Arc::new(
-            rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(certs, key)
-                .unwrap(),
-        );
-
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let seed = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -518,26 +644,15 @@ mod tests {
             tls.write_all(AWS_EXAMPLE).unwrap();
             tls.flush().unwrap();
         });
-
-        // The self-signed leaf is not a CA, so verify against nothing; the
-        // handshake and the framing over it are what this test covers.
-        let mut t = target(vec![seed]);
-        t.tls = true;
-        t.tls_verify = false;
-        assert_eq!(discover_nodes(&t).unwrap(), expected());
+        assert_eq!(discover_nodes(&tls_target(seed)).unwrap(), expected());
     }
 
     #[test]
-    fn tries_the_next_seed() {
-        // Bound then dropped, so connecting to it is refused.
-        let dead = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        let seed = fake_server(vec![(CONFIG_GET_CLUSTER, AWS_EXAMPLE)]);
-        assert_eq!(
-            discover_nodes(&target(vec![dead, seed])).unwrap(),
-            expected()
-        );
+    fn silent_tls_seed_times_out() {
+        // The client blocks in the handshake, inside the first write.
+        let err = discover(&tls_target(silent_server()), TEST_DEADLINE)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no reply within"), "{err}");
     }
 }
