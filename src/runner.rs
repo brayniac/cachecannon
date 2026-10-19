@@ -356,6 +356,7 @@ pub fn run_benchmark_full(
         // `[timestamps] mode = "software"` (Linux), every receive is multishot
         // `recvmsg` either way, and mio ignores the setting.
         .recv_multishot(true)
+        .recv_incremental(config.general.recv_incremental)
         .loop_diag(config.general.ringline_diag);
     if let Some(tls_client) = tls_client {
         ringline_builder = ringline_builder.tls_client(tls_client);
