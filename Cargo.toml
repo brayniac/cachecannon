@@ -208,12 +208,12 @@ dendro = { version = "0.4", default-features = false }
 # crates.io alongside the patched one the client crates use.
 [patch.crates-io]
 # Segment views step 5, build C: build A plus the direct-receive prototype
-# (feat/recv-direct), from brayniac/ringline exp/segviews-c3.
+# (feat/recv-direct), from brayniac/ringline feat/recv-direct.
 # metriken-core declares `links`, so ringline and cachecannon must agree on
 # one metriken-core (0.3, metriken 0.11.3).
-ringline = { git = "https://github.com/brayniac/ringline", rev = "715b3a4c1c41acb5461ff0826cd13e0099f346de" }
-ringline-redis = { git = "https://github.com/brayniac/ringline", rev = "715b3a4c1c41acb5461ff0826cd13e0099f346de" }
-ringline-memcache = { git = "https://github.com/brayniac/ringline", rev = "715b3a4c1c41acb5461ff0826cd13e0099f346de" }
-ringline-ping = { git = "https://github.com/brayniac/ringline", rev = "715b3a4c1c41acb5461ff0826cd13e0099f346de" }
+ringline = { git = "https://github.com/brayniac/ringline", rev = "8e4c3f945a7f5787c1c6e05ec132587dfd1cc03e" }
+ringline-redis = { git = "https://github.com/brayniac/ringline", rev = "8e4c3f945a7f5787c1c6e05ec132587dfd1cc03e" }
+ringline-memcache = { git = "https://github.com/brayniac/ringline", rev = "8e4c3f945a7f5787c1c6e05ec132587dfd1cc03e" }
+ringline-ping = { git = "https://github.com/brayniac/ringline", rev = "8e4c3f945a7f5787c1c6e05ec132587dfd1cc03e" }
 resp-proto = { git = "https://github.com/ringline-rs/resp-proto", rev = "d0054e338fa200a73b6b40692faa7094363779d3" }
 memcache-proto = { git = "https://github.com/ringline-rs/memcache-proto", rev = "aa93e3ca2528f431607b4a4bfbdfabfd63ba0bf3" }
