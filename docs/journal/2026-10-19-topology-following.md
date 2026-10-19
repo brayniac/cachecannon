@@ -135,43 +135,66 @@ only accepts it with zipf. It reproduces the per-node load correctly only when
 the run is rate-limited; in closed loop, more connections to a node is not the
 same as more requests waiting on it.
 
-### Proposed: draw the key, then route it
+### Proposed: two load models
 
-A request draws its key from the global distribution, routes it with the
-current topology, and is sent on a connection to the owning node. One route per
-request costs one CRC16 or one ketama lookup. The 40% figure above came from
-about one route per node per request under rejection sampling, so it does not
-apply, but the single route has not been measured.
+The two load models answer different questions, so they are separate settings.
+Their names are placeholders; "cluster" is already taken by `target.cluster`.
 
-This makes the two load regimes behave differently, which they should:
+**Per-node** loads each node as if it were a single-node benchmark. Each
+connection is bound to a node and draws only that node's keys, as every
+multi-endpoint run does today. Open and closed loop behave as they do against
+one server, applied to each node separately. The result is the sum of per-node
+capacities: a number for sizing nodes, not the throughput a client would see.
 
-1. **Open loop (rate-limited).** The dispatcher funds a request, the request
-   draws and routes, and the node receives `share × rate`. A hot node receives
-   more requests than it can serve and its latency rises. The offered load is
-   independent of how fast any node answers.
-2. **Closed loop, global keys (proposed default).** A fixed number of
-   outstanding requests, each of which draws a key, routes, waits for the reply,
-   and draws again. Requests accumulate on the slowest node, so the hot node
-   bounds total throughput. This is how an application with a fixed thread
-   pool behaves against a cluster.
-3. **Closed loop, partitioned keys (opt-in, today's behaviour).** Each
-   connection draws only its node's keys. Each node runs at its own capacity,
-   so the result is the sum of per-node capacities. That is a useful number for
-   node sizing, but it is not the throughput a client would see.
+**Routed** loads the cluster the way a client population does. A request draws
+its key from the global distribution, routes it with the current topology, and
+is sent on a connection to the owning node. One route per request costs one
+CRC16 or one ketama lookup. The 40% figure above came from about one route per
+node per request under rejection sampling, so it does not apply, but the single
+route has not been measured.
 
-Mode 2 changes the closed-loop numbers of every existing multi-endpoint zipf
-run: total throughput will fall by roughly the hot node's excess share. That
-needs a CHANGELOG entry that says so, and mode 3 needs to stay available so old
-results can be reproduced.
+In the routed model, open and closed loop have to be implemented differently:
 
-Mode 2 also changes how connections are used. Today a connection's pipeline is
-filled by the task that owns it. With global draws, a request is not tied to a
-connection until it is routed. The proposal is a per-worker set of
-outstanding-request slots, sized `connections × pipeline_depth`, feeding one
-queue per node. Each connection task drains its node's queue. In open loop
-the dispatcher funds slots instead of connections. This is the part of the
-design with the most risk to the hot path, and it should be built and measured
-before the topology work depends on it.
+- **Open loop.** The dispatcher funds a request, the request draws and routes,
+  and the node receives `share × rate`. A hot node receives more requests than
+  it can serve and its latency rises. The offered load does not depend on how
+  fast any node answers.
+- **Closed loop.** A fixed number of outstanding requests, each of which draws
+  a key, routes, waits for the reply, and draws again. Requests accumulate on
+  the slowest node, so the hot node bounds total throughput. This also holds
+  for uniform keys when one node is degraded. It is how an application with a
+  fixed thread pool behaves against a cluster.
+
+Routed closed loop changes how connections are used. Today a connection's
+pipeline is filled by the task that owns it. In the routed model a request is
+not tied to a connection until it is routed. The proposal is a per-worker set
+of outstanding-request slots, sized `connections × pipeline_depth`, feeding one
+queue per node, with each connection task draining its node's queue. Routed
+open loop can use the same queues, with the dispatcher funding requests
+instead of connections. This is the part of the design with the most risk to
+the hot path, and it should be built and measured before the topology work
+depends on it.
+
+Per-node stays the default. Existing multi-endpoint results keep their meaning,
+and choosing routed is a deliberate change of question, so it does not need a
+CHANGELOG warning about changed numbers.
+
+`endpoint_allocation = "key_share"` exists to make per-node open loop give each
+node its key share of the rate. Routed open loop gives that load exactly,
+without quantizing to whole connections, so `key_share` can be deprecated once
+routed open loop exists.
+
+### Topology changes in each model
+
+- **Routed:** a change replaces the ring or slot table. New requests route to
+  the new owner, connections are added for new nodes, and a removed node's
+  connections drain.
+- **Per-node:** a change adds or removes a node's load. When slots move between
+  nodes that both remain, each node's key set changes, so `endpoint_keys` and
+  `EndpointZipf` have to be rebuilt for the new partition. Per-node open loop
+  also needs a rule for the rate when the node count changes: hold the
+  per-node rate, so the total grows, or hold the total, so each node's share
+  shrinks.
 
 ## Proposed design for topology following
 
@@ -241,9 +264,9 @@ many nodes a run can have, and that has not been decided.
 ## Order of work
 
 1. Correct `docs/guide.md:721-726`. Docs only, independent of everything else.
-2. Draw-then-route key selection with the three modes, on a fixed node list.
-   Measure client CPU per request against the partitioned path at the highest
-   pipeline depth and connection count in CI, on io_uring.
+2. The routed model, open and closed loop, on a fixed node list. Measure client
+   CPU per request against the per-node path at the highest pipeline depth and
+   connection count in CI, on io_uring.
 3. The `Topology` type with stable ids, replacing positional `endpoints`.
 4. The watcher and worker reconciliation for auto discovery. A fake
    configuration endpoint whose version changes mid-run can test this; the
@@ -256,15 +279,17 @@ many nodes a run can have, and that has not been decided.
 
 - When a node is added, should total connections grow with the node count or
   stay fixed?
-- Should mode 2 become the closed-loop default, given that it changes existing
-  results?
+- Names for the two load models, and whether the setting belongs under
+  `[target]` or `[workload]`.
+- In per-node open loop, should a node change hold the per-node rate or the
+  total rate?
 - Should a redirected request be retried, or should only the redirect be
   recorded? Retrying matches a real client; not retrying keeps every request a
   single round trip.
 
 ## Not yet known
 
-- The per-request cost of draw-then-route against the partitioned path.
+- The per-request cost of draw-then-route against the per-node path.
 - The per-request cost of the outstanding-request slots and per-node queues
   against the current per-connection pipeline.
 - How ElastiCache behaves mid-change: whether `config get cluster` lists a node
