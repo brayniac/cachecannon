@@ -117,7 +117,9 @@ pub fn run_benchmark_full(
     };
 
     // Memcached auto discovery: replace the configuration endpoint with the
-    // nodes it lists. Must run before anything is sized from the endpoint count.
+    // nodes it lists. Must run before anything is sized from the endpoint
+    // count. Config validation counted the seeds, so checks that depend on the
+    // node count are repeated below.
     if config.target.auto_discovery {
         config.target.endpoints = crate::autodiscovery::discover_nodes(&config.target)?.nodes;
     }
@@ -202,6 +204,21 @@ pub fn run_benchmark_full(
              --connections={} < {} cluster nodes. Increase --connections to >= {} \
              (ideally >= threads x nodes for an even spread).",
             total_connections, num_endpoints, num_endpoints
+        )
+        .into());
+    }
+
+    // Same for the append stream: writers are assigned to nodes round-robin,
+    // so a node without one never drains its append queue and the first batch
+    // never commits.
+    if let Some(ref append) = config.workload.append
+        && num_endpoints > 1
+        && append.connections < num_endpoints
+    {
+        return Err(format!(
+            "append.connections ({}) must be >= the number of nodes ({num_endpoints}) so \
+             every node's append queue has a writer draining it",
+            append.connections
         )
         .into());
     }

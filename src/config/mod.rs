@@ -224,9 +224,10 @@ pub enum EndpointAllocation {
     /// transfer per connection, at MiB values). In a closed-loop run an
     /// endpoint's share also depends on its latency. Requires
     /// `keyspace.distribution = "zipf"`; validation counts the endpoints in
-    /// `[target]`, which in cluster and auto discovery modes are the seeds. The memcache protocols
-    /// still reject-route zipf keys rather than using the per-endpoint alias
-    /// tables; the allocation applies to them all the same.
+    /// `[target]`, which in cluster and auto discovery modes are the seeds.
+    /// The memcache protocols still reject-route zipf keys rather than using
+    /// the per-endpoint alias tables; the allocation applies to them all the
+    /// same.
     KeyShare,
 }
 

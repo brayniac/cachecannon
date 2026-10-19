@@ -759,16 +759,17 @@ auto_discovery = true
 Before the workers start, cachecannon sends `config get cluster` to the first
 endpoint over a separate blocking connection (TLS when `tls = true`), and
 replaces `endpoints` with the nodes in the reply. If an endpoint fails, the next
-one is tried. An engine older than memcached 1.4.14 answers `ERROR`, and the
-node list is then read from the `AmazonElastiCache:cluster` key. A plain
-memcached has neither and the run fails with an error naming the endpoint.
+one is tried. If the server answers `ERROR`, the node list is read from the
+`AmazonElastiCache:cluster` key, which AWS documents for engines before
+memcached 1.4.14. A plain memcached has neither, and the run fails with an
+error naming the endpoint.
 
 Keys are routed to the discovered nodes by ketama consistent hashing over their
 `ip:port`, as with any list of several endpoints. Discovery runs once: nodes
 added or removed during the run are not picked up.
 
 `endpoints` takes IP addresses, so resolve the configuration endpoint's DNS name
-first (`dig +short <name>.cfg.<region>.cache.amazonaws.com`). Each node is
+first, from inside the VPC (`dig +short <configuration endpoint>`). Each node is
 reached at the IP in the reply; a node listed with no IP is resolved from its
 hostname.
 

@@ -231,7 +231,8 @@ hot_fraction = 0.8
 # batch = 100000          # keys per batch
 # every = "60s"           # interval between batch starts, from the start of warmup
 # pace = "burst"          # "burst" (as fast as the writers allow) or "spread"
-# connections = 1         # writer connections; cluster mode needs >= nodes
+# connections = 1         # writer connections; needs >= nodes in cluster and
+#                          # auto discovery modes (counted after discovery)
 # pipeline_depth = 32     # in-flight SETs per writer connection
 
 [workload.commands]

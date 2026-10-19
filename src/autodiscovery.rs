@@ -1,9 +1,9 @@
 //! ElastiCache for Memcached auto discovery.
 //!
 //! Sends `config get cluster` to a configuration endpoint via blocking TCP
-//! (or TLS) before ringline launches and returns the node list. Engines older
-//! than memcached 1.4.14 answer that command with `ERROR`; for those the node
-//! list is read from the `AmazonElastiCache:cluster` key instead. See
+//! (or TLS) before ringline launches and returns the node list. If the server
+//! answers `ERROR`, the node list is read from the `AmazonElastiCache:cluster`
+//! key instead, which AWS documents for engines before memcached 1.4.14. See
 //! <https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/AutoDiscovery.AddingToYourClientLibrary.html>.
 //!
 //! Discovery runs once. Nodes added or removed during the run are not seen.
@@ -12,15 +12,19 @@ use crate::config::Target;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CONFIG_GET_CLUSTER: &[u8] = b"config get cluster\r\n";
 
-/// The pre-1.4.14 form of the same query.
+/// The form AWS documents for engines before memcached 1.4.14.
 const GET_CLUSTER_KEY: &[u8] = b"get AmazonElastiCache:cluster\r\n";
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bound on one request's whole reply. `READ_TIMEOUT` applies per read, so a
+/// server trickling bytes would otherwise never be stopped.
+const REPLY_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Upper bound on a response, so a server that never sends `END` cannot grow
 /// the buffer without limit.
@@ -60,7 +64,7 @@ pub fn discover_nodes(target: &Target) -> Result<ClusterConfig, Box<dyn std::err
             }
             Err(e) => {
                 tracing::warn!(seed = %seed, error = %e, "auto discovery failed for seed");
-                last_err = Some(e);
+                last_err = Some(format!("auto discovery via {seed}: {e}").into());
             }
         }
     }
@@ -103,7 +107,8 @@ fn query<S: Read + Write>(stream: &mut S) -> Result<ClusterConfig, Box<dyn std::
             Response::Config(body) => parse_config(&body),
             Response::Empty => Err("server has no cluster configuration (`config get cluster` \
                                     is unknown and `AmazonElastiCache:cluster` is missing); \
-                                    is the endpoint an ElastiCache configuration endpoint?"
+                                    the endpoint is probably not an ElastiCache \
+                                    configuration endpoint"
                 .into()),
             Response::Error(line) => Err(format!("get AmazonElastiCache:cluster: {line}").into()),
         },
@@ -129,6 +134,7 @@ fn request<S: Read + Write>(
     stream.write_all(cmd)?;
     stream.flush()?;
 
+    let deadline = Instant::now() + REPLY_DEADLINE;
     let mut buf = Vec::with_capacity(1024);
     let mut tmp = [0u8; 4096];
     loop {
@@ -138,7 +144,21 @@ fn request<S: Read + Write>(
         if buf.len() > MAX_RESPONSE {
             return Err(format!("response exceeded {MAX_RESPONSE} bytes without END").into());
         }
-        let n = stream.read(&mut tmp)?;
+        if Instant::now() > deadline {
+            return Err(format!("no complete reply within {REPLY_DEADLINE:?}").into());
+        }
+        let n = match stream.read(&mut tmp) {
+            Ok(n) => n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(format!("no reply within {READ_TIMEOUT:?}").into());
+            }
+            Err(e) => return Err(e.into()),
+        };
         if n == 0 {
             return Err("connection closed before complete response".into());
         }
@@ -173,6 +193,10 @@ fn parse_response(buf: &[u8]) -> Result<Option<Response>, Box<dyn std::error::Er
             .map_err(|e| format!("bad length in header {header:?}: {e}"))?,
         _ => return Err(format!("unexpected response header {header:?}").into()),
     };
+    // Also keeps `len + TRAILER.len()` below from overflowing.
+    if len > MAX_RESPONSE {
+        return Err(format!("data block length {len} exceeds {MAX_RESPONSE} bytes").into());
+    }
 
     const TRAILER: &[u8] = b"\r\nEND\r\n";
     if rest.len() < len + TRAILER.len() {
@@ -287,6 +311,12 @@ mod tests {
     }
 
     #[test]
+    fn rejects_oversized_length() {
+        let header = format!("CONFIG cluster 0 {}\r\n", usize::MAX);
+        assert!(parse_response(header.as_bytes()).is_err());
+    }
+
+    #[test]
     fn parses_legacy_value_form() {
         let legacy = String::from_utf8_lossy(AWS_EXAMPLE)
             .replace("CONFIG cluster", "VALUE AmazonElastiCache:cluster");
@@ -393,6 +423,108 @@ mod tests {
         ]);
         let err = discover_nodes(&target(vec![seed])).unwrap_err().to_string();
         assert!(err.contains("configuration endpoint"), "{err}");
+        assert!(
+            err.contains(&seed.to_string()),
+            "error should name the seed: {err}"
+        );
+    }
+
+    #[test]
+    fn silent_seed_times_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let seed = listener.local_addr().unwrap();
+        // Accept and hold the connection open without replying.
+        std::thread::spawn(move || {
+            let (_sock, _) = listener.accept().unwrap();
+            std::thread::sleep(READ_TIMEOUT * 2);
+        });
+        let err = discover_nodes(&target(vec![seed])).unwrap_err().to_string();
+        assert!(err.contains("no reply within"), "{err}");
+    }
+
+    #[test]
+    fn append_writers_are_checked_against_discovered_nodes() {
+        // One seed passes config validation with one writer; the three
+        // discovered nodes need three.
+        const THREE_NODES: &[u8] = b"CONFIG cluster 0 53\r\n\
+            1\na|10.0.0.1|11211 b|10.0.0.2|11211 c|10.0.0.3|11211\n\
+            \r\nEND\r\n";
+        let seed = fake_server(vec![(CONFIG_GET_CLUSTER, THREE_NODES)]);
+        let config: crate::config::Config = toml::from_str(&format!(
+            "[target]\nendpoints = [\"{seed}\"]\nprotocol = \"memcache\"\n\
+             auto_discovery = true\n\
+             [connection]\nconnections = 3\n\
+             [workload.keyspace]\ndistribution = \"recency\"\n\
+             [workload.append]\nbatch = 10\nevery = \"1s\"\nconnections = 1\n"
+        ))
+        .unwrap();
+        config.validate().expect("one seed passes validation");
+        let err = crate::runner::run_benchmark(config)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("append.connections (1)"), "{err}");
+    }
+
+    /// Generate a self-signed cert and key with openssl. Returns None when
+    /// openssl is unavailable, so the suite still runs without it.
+    fn gen_cert(dir: &std::path::Path) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let crt = dir.join("c.crt");
+        let key = dir.join("c.key");
+        let out = std::process::Command::new("openssl")
+            .args([
+                "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "3650", "-nodes",
+            ])
+            .args(["-keyout", key.to_str()?, "-out", crt.to_str()?])
+            .args(["-subj", "/CN=cachecannon-test"])
+            .args(["-addext", "subjectAltName=IP:127.0.0.1"])
+            .output()
+            .ok()?;
+        out.status.success().then_some((crt, key))
+    }
+
+    #[test]
+    fn discovers_over_tls() {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+        let dir = std::env::temp_dir().join(format!("cc-autodiscovery-tls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let Some((crt, key)) = gen_cert(&dir) else {
+            return; // openssl unavailable
+        };
+
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&crt)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let key = PrivateKeyDer::from_pem_file(&key).unwrap();
+        let server_config = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .unwrap(),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let seed = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let conn = rustls::ServerConnection::new(server_config).unwrap();
+            let mut tls = rustls::StreamOwned::new(conn, sock);
+            let mut got = vec![0u8; CONFIG_GET_CLUSTER.len()];
+            tls.read_exact(&mut got).unwrap();
+            assert_eq!(got, CONFIG_GET_CLUSTER);
+            tls.write_all(AWS_EXAMPLE).unwrap();
+            tls.flush().unwrap();
+        });
+
+        // The self-signed leaf is not a CA, so verify against nothing; the
+        // handshake and the framing over it are what this test covers.
+        let mut t = target(vec![seed]);
+        t.tls = true;
+        t.tls_verify = false;
+        assert_eq!(discover_nodes(&t).unwrap(), expected());
     }
 
     #[test]
