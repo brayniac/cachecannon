@@ -165,15 +165,43 @@ In the routed model, open and closed loop have to be implemented differently:
   for uniform keys when one node is degraded. It is how an application with a
   fixed thread pool behaves against a cluster.
 
-Routed closed loop changes how connections are used. Today a connection's
+Both routed regimes change how connections are used. Today a connection's
 pipeline is filled by the task that owns it. In the routed model a request is
-not tied to a connection until it is routed. The proposal is a per-worker set
-of outstanding-request slots, sized `connections × pipeline_depth`, feeding one
-queue per node, with each connection task draining its node's queue. Routed
-open loop can use the same queues, with the dispatcher funding requests
-instead of connections. This is the part of the design with the most risk to
-the hot path, and it should be built and measured before the topology work
-depends on it.
+not tied to a connection until it is routed, so both regimes need one queue
+per node, with each connection task draining its node's queue. In open loop
+the dispatcher draws the key, routes it, and funds the owning node's queue.
+Closed loop adds one cap on top of the same queues: a per-worker limit on
+outstanding requests, sized `connections × pipeline_depth`.
+memtier_benchmark's cluster mode uses that structure (`hold_pipeline()` in
+`cluster_client.cpp`). The per-node handoff is the part of the design with the
+most risk to the hot path, and it should be built and measured before the
+topology work depends on it.
+
+**Decision (2026-10-19): routed closed loop is a real mode, built after routed
+open loop.** Reasons for building it:
+
+- memtier_benchmark's cluster mode and YCSB both report routed closed-loop
+  throughput. Comparing cachecannon against either needs the same model.
+- An application with a fixed connection or thread pool behaves this way: a
+  slow or hot node accumulates requests while the other nodes idle. Open loop
+  does not show this, because it keeps sending to healthy nodes at their share
+  of the rate.
+
+Reasons for building it second:
+
+- For cluster capacity, routed open loop with `saturation_search` is the better
+  measurement. It raises the rate until the hot node breaks the SLO under the
+  real key skew, and its latency does not carry closed loop's coordinated
+  omission.
+- A routed closed-loop throughput number mostly measures the hot node, and it
+  depends on the outstanding-request limit the user picks: throughput is that
+  limit divided by latency, and at high limits most of it waits on the hot node.
+- The per-node queues are the expensive part and open loop needs them anyway.
+  Closed loop is then one added cap.
+
+Until routed closed loop exists, config validation rejects the routed model
+without a rate limit or `saturation_search`, so a closed-loop run cannot fall
+back to per-node behaviour without saying so.
 
 **Mirrored** (a third model, raised after the first two) sends every node the
 whole keyspace with the same distribution: N copies of a single-node
@@ -211,6 +239,37 @@ routed open loop exists.
   also needs a rule for the rate when the node count changes: hold the
   per-node rate, so the total grows, or hold the total, so each node's share
   shrinks.
+
+### Other load generators
+
+Read from source on 2026-10-19, except YCSB, which is from memory and was not
+checked. None offers more than one of these models.
+
+- memtier_benchmark (`--cluster-mode`, `cluster_client.cpp`) is routed. Keys
+  come from one shared generator and are queued on the owning node's
+  connection (`m_key_index_pools`). Closed loop caps all outstanding requests
+  at `pipeline × connection_count` (`hold_pipeline()`). A `MOVED` reply
+  triggers a `CLUSTER SLOTS` re-read. `handle_cluster_slots()` builds the new
+  map before swapping it in, keeps connections whose address is unchanged,
+  opens connections to new nodes, and retires the rest. A redirected request
+  is retried only with `--retry-on-error`. `--rate-limiting` applies per
+  connection, so in cluster mode every node gets the same rate rather than its
+  key share.
+- valkey-benchmark and redis-benchmark (`--cluster`, `valkey-benchmark.c`) are
+  per-node. Each client connects to one node, and `setClusterKeyHashTag()`
+  rewrites a `{tag}` in the key to hash to a slot that node owns. `MOVED` or
+  `ASK` triggers a `CLUSTER SLOTS` re-read that updates slot ranges of known
+  nodes only; an unknown node fails with "could not find node with ID ... in
+  current configuration". A redirected request is counted as finished.
+- mutilate (`mutilate.cc`, `Connection.cc`) is mirrored with a smaller
+  keyspace: `--records` is divided by the server count, and every connection
+  to every server draws from `lrand48() % options.records`. Each server gets
+  the same keys and holds 1/N of the requested records, which keeps its working
+  set at the size it would have in a sharded deployment. Mirrored here could
+  offer the same option.
+- YCSB routes through its client library (JedisCluster, spymemcached) and runs
+  closed-loop threads, optionally throttled with `-target`. It follows topology
+  changes as far as the client library does.
 
 ## Proposed design for topology following
 
@@ -280,14 +339,17 @@ many nodes a run can have, and that has not been decided.
 ## Order of work
 
 1. Correct `docs/guide.md:721-726`. Docs only, independent of everything else.
-2. The routed model, open and closed loop, on a fixed node list. Measure client
-   CPU per request against the per-node path at the highest pipeline depth and
-   connection count in CI, on io_uring.
-3. The `Topology` type with stable ids, replacing positional `endpoints`.
-4. The watcher and worker reconciliation for auto discovery. A fake
+2. Routed open loop with the per-node queues, on a fixed node list. Config
+   validation rejects routed without a rate limit or `saturation_search`.
+   Measure client CPU per request against the per-node path at the highest
+   pipeline depth and connection count in CI, on io_uring.
+3. Routed closed loop: the outstanding-request cap over the same queues, and
+   removal of the validation rule from step 2.
+4. The `Topology` type with stable ids, replacing positional `endpoints`.
+5. The watcher and worker reconciliation for auto discovery. A fake
    configuration endpoint whose version changes mid-run can test this; the
    test servers in `src/autodiscovery.rs` already serve the protocol.
-5. The same for cluster mode, with `MOVED`/`ASK` retry and TLS and hostname
+6. The same for cluster mode, with `MOVED`/`ASK` retry and TLS and hostname
    support in `cluster.rs`. This can be tested against a local Valkey cluster
    resharded with `valkey-cli --cluster reshard` during a run.
 
