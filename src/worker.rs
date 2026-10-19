@@ -604,8 +604,8 @@ struct NodeQueue {
     requests: VecDeque<RoutedRequest>,
     cap: usize,
     /// Connection tasks for this node with nothing in flight, waiting for a
-    /// request.
-    waiters: Vec<Waker>,
+    /// request, longest-waiting first. One entry per task.
+    waiters: VecDeque<Waker>,
 }
 
 /// One worker's routed requests, one queue per node. Worker-local, like
@@ -632,7 +632,7 @@ impl RoutedQueues {
                     cap: c
                         .saturating_mul(pipeline_depth)
                         .saturating_mul(ROUTED_QUEUE_PIPELINES),
-                    waiters: Vec::new(),
+                    waiters: VecDeque::new(),
                 })
             })
             .collect();
@@ -642,15 +642,16 @@ impl RoutedQueues {
         }
     }
 
-    /// Queue `request` for `node` and wake one idle connection to it. Returns
-    /// false, leaving the queue unchanged, when the queue is full.
+    /// Queue `request` for `node` and wake the idle connection to it that has
+    /// waited longest, so load spreads over every connection. Returns false,
+    /// leaving the queue unchanged, when the queue is full.
     fn push(&self, node: usize, request: RoutedRequest) -> bool {
         let mut q = self.nodes[node].borrow_mut();
         if q.requests.len() >= q.cap {
             return false;
         }
         q.requests.push_back(request);
-        if let Some(w) = q.waiters.pop() {
+        if let Some(w) = q.waiters.pop_front() {
             w.wake();
         }
         true
@@ -663,13 +664,21 @@ impl RoutedQueues {
     /// Wait until `node` has a request queued or the dispatcher has stopped.
     /// Untimed for the reason `TokenDispatcher::acquire` is: liveness comes
     /// from `close`, which the dispatcher calls when the run stops.
+    ///
+    /// A waiting task can be polled without a push, for example when its
+    /// request-timeout timer fires. It keeps a single entry in `waiters`, and
+    /// the entry is removed when the wait returns, so a push never spends its
+    /// wake on a task that is no longer waiting.
     fn wait(&self, node: usize) -> impl Future<Output = ()> + '_ {
         std::future::poll_fn(move |cx| {
             let mut q = self.nodes[node].borrow_mut();
             if self.closed.get() || !q.requests.is_empty() {
+                q.waiters.retain(|w| !w.will_wake(cx.waker()));
                 return Poll::Ready(());
             }
-            q.waiters.push(cx.waker().clone());
+            if !q.waiters.iter().any(|w| w.will_wake(cx.waker())) {
+                q.waiters.push_back(cx.waker().clone());
+            }
             Poll::Pending
         })
     }
@@ -4390,38 +4399,160 @@ mod routed_tests {
         assert!(q.pop(1).is_none());
     }
 
-    #[test]
-    fn push_wakes_a_waiter_and_close_wakes_them_all() {
-        let q = RoutedQueues::new(&[1, 1], 1);
+    /// A task's waker that counts its wakes. `will_wake` tells two tasks
+    /// apart by the `Arc`.
+    fn task() -> (Arc<CountWakes>, Waker) {
         let wakes = Arc::new(CountWakes(AtomicUsize::new(0)));
         let waker = Waker::from(Arc::clone(&wakes));
-        let mut cx = Context::from_waker(&waker);
+        (wakes, waker)
+    }
 
-        let mut w0 = Box::pin(q.wait(0));
-        assert!(w0.as_mut().poll(&mut cx).is_pending(), "node 0 is empty");
-        q.push(1, request(1));
-        assert_eq!(wakes.0.load(Ordering::Relaxed), 0, "node 1 has no waiter");
-        q.push(0, request(0));
-        assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
-        assert!(w0.as_mut().poll(&mut cx).is_ready());
-        drop(w0);
+    fn woken(w: &CountWakes) -> usize {
+        w.0.load(Ordering::Relaxed)
+    }
 
-        q.pop(0);
-        q.pop(1);
-        let mut a = Box::pin(q.wait(0));
-        let mut b = Box::pin(q.wait(1));
-        assert!(a.as_mut().poll(&mut cx).is_pending());
-        assert!(b.as_mut().poll(&mut cx).is_pending());
-        q.close();
-        assert_eq!(wakes.0.load(Ordering::Relaxed), 3);
-        assert_eq!(a.as_mut().poll(&mut cx), Poll::Ready(()));
-        assert_eq!(b.as_mut().poll(&mut cx), Poll::Ready(()));
-        drop((a, b));
-        let mut late = Box::pin(q.wait(0));
+    #[test]
+    fn push_wakes_the_longest_waiting_connection() {
+        let q = RoutedQueues::new(&[3, 1], 1);
+        let (a_wakes, a) = task();
+        let (b_wakes, b) = task();
+        let mut wait_a = Box::pin(q.wait(0));
+        let mut wait_b = Box::pin(q.wait(0));
         assert!(
-            late.as_mut().poll(&mut cx).is_ready(),
-            "a wait after close returns"
+            wait_a
+                .as_mut()
+                .poll(&mut Context::from_waker(&a))
+                .is_pending()
         );
+        assert!(
+            wait_b
+                .as_mut()
+                .poll(&mut Context::from_waker(&b))
+                .is_pending()
+        );
+
+        q.push(1, request(9));
+        assert_eq!((woken(&a_wakes), woken(&b_wakes)), (0, 0), "another node");
+        q.push(0, request(0));
+        assert_eq!(
+            (woken(&a_wakes), woken(&b_wakes)),
+            (1, 0),
+            "a waited longest"
+        );
+        q.push(0, request(1));
+        assert_eq!((woken(&a_wakes), woken(&b_wakes)), (1, 1));
+    }
+
+    #[test]
+    fn a_waiter_polled_again_keeps_one_entry_and_drops_it_on_return() {
+        let q = RoutedQueues::new(&[2], 1);
+        let (a_wakes, a) = task();
+        let (b_wakes, b) = task();
+        let mut wait_a = Box::pin(q.wait(0));
+        let mut cx_a = Context::from_waker(&a);
+        // Polled three times without a push, as when its timer fires.
+        for _ in 0..3 {
+            assert!(wait_a.as_mut().poll(&mut cx_a).is_pending());
+        }
+        let mut wait_b = Box::pin(q.wait(0));
+        assert!(
+            wait_b
+                .as_mut()
+                .poll(&mut Context::from_waker(&b))
+                .is_pending()
+        );
+
+        q.push(0, request(0));
+        assert_eq!((woken(&a_wakes), woken(&b_wakes)), (1, 0));
+        // `a` takes the request. The next push must reach `b`, not a second
+        // entry left by `a`.
+        assert!(wait_a.as_mut().poll(&mut cx_a).is_ready());
+        q.pop(0);
+        q.push(0, request(1));
+        assert_eq!((woken(&a_wakes), woken(&b_wakes)), (1, 1));
+    }
+
+    #[test]
+    fn a_waiter_that_returns_without_its_own_wake_leaves_no_entry() {
+        let q = RoutedQueues::new(&[2], 1);
+        let (a_wakes, a) = task();
+        let (b_wakes, b) = task();
+        let mut cx_a = Context::from_waker(&a);
+        let mut cx_b = Context::from_waker(&b);
+        let mut wait_b = Box::pin(q.wait(0));
+        let mut wait_a = Box::pin(q.wait(0));
+        assert!(wait_b.as_mut().poll(&mut cx_b).is_pending());
+        assert!(wait_a.as_mut().poll(&mut cx_a).is_pending());
+        // The push wakes `b`, which waited longest, but `a` is polled first
+        // (its timer fired) and takes the request.
+        q.push(0, request(0));
+        assert_eq!((woken(&a_wakes), woken(&b_wakes)), (0, 1));
+        assert!(wait_a.as_mut().poll(&mut cx_a).is_ready());
+        q.pop(0);
+        drop(wait_a);
+        // `b` finds nothing and waits again. The next push must reach it, not
+        // an entry `a` left behind.
+        assert!(wait_b.as_mut().poll(&mut cx_b).is_pending());
+        q.push(0, request(1));
+        assert_eq!((woken(&a_wakes), woken(&b_wakes)), (0, 2));
+    }
+
+    #[test]
+    fn two_pushes_wake_two_connections_even_after_a_repoll() {
+        let q = RoutedQueues::new(&[2], 1);
+        let (a_wakes, a) = task();
+        let (b_wakes, b) = task();
+        let mut cx_a = Context::from_waker(&a);
+        let mut wait_a = Box::pin(q.wait(0));
+        assert!(wait_a.as_mut().poll(&mut cx_a).is_pending());
+        // `a` is polled again without a push, as when its timer fires, before
+        // `b` starts waiting.
+        assert!(wait_a.as_mut().poll(&mut cx_a).is_pending());
+        let mut wait_b = Box::pin(q.wait(0));
+        assert!(
+            wait_b
+                .as_mut()
+                .poll(&mut Context::from_waker(&b))
+                .is_pending()
+        );
+        // Two requests arrive before either connection runs. Each connection
+        // has a pipeline of one, so both must be woken.
+        q.push(0, request(0));
+        q.push(0, request(1));
+        assert_eq!((woken(&a_wakes), woken(&b_wakes)), (1, 1));
+    }
+
+    #[test]
+    fn close_wakes_every_waiter_and_later_waits_return() {
+        let q = RoutedQueues::new(&[1, 1], 1);
+        let (a_wakes, a) = task();
+        let (b_wakes, b) = task();
+        let mut wait_a = Box::pin(q.wait(0));
+        let mut wait_b = Box::pin(q.wait(1));
+        assert!(
+            wait_a
+                .as_mut()
+                .poll(&mut Context::from_waker(&a))
+                .is_pending()
+        );
+        assert!(
+            wait_b
+                .as_mut()
+                .poll(&mut Context::from_waker(&b))
+                .is_pending()
+        );
+        q.close();
+        assert_eq!((woken(&a_wakes), woken(&b_wakes)), (1, 1));
+        assert_eq!(
+            wait_a.as_mut().poll(&mut Context::from_waker(&a)),
+            Poll::Ready(())
+        );
+        assert_eq!(
+            wait_b.as_mut().poll(&mut Context::from_waker(&b)),
+            Poll::Ready(())
+        );
+        let mut late = Box::pin(q.wait(0));
+        assert!(late.as_mut().poll(&mut Context::from_waker(&a)).is_ready());
     }
 }
 

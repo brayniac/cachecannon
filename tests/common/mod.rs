@@ -646,3 +646,52 @@ pub fn assert_routed_key_share(protocol: &str) {
         );
     }
 }
+
+fn p50_ns(h: &metriken::AtomicHistogram) -> u64 {
+    let h = h.load().expect("histogram has samples");
+    h.quantiles(&[0.5])
+        .unwrap()
+        .unwrap()
+        .entries()
+        .values()
+        .next()
+        .unwrap()
+        .end()
+}
+
+/// Run routed against one server slower than the offered rate and check that
+/// requests waited in the node's queue, that the wait is part of the reported
+/// response latency, and that requests finding the queue full were dropped.
+pub fn assert_routed_queue_wait(protocol: &str) {
+    use cachecannon::metrics::{RESPONSE_LATENCY, ROUTED_QUEUE_DROPPED, ROUTED_QUEUE_WAIT};
+
+    // One connection with a pipeline of one against a server that takes 2 ms
+    // per GET serves about 500 requests a second; 2000 are offered.
+    let (addr, _) = spawn_get_counter(protocol, Duration::from_millis(2));
+    run_routed(&Routed {
+        protocol,
+        endpoints: &[addr],
+        threads: 1,
+        connections: 1,
+        pipeline: 1,
+        rate: 2000,
+        duration: "2s",
+        routing: "routed",
+        keyspace: "count = 1000",
+    });
+
+    assert!(
+        ROUTED_QUEUE_DROPPED.value() > 0,
+        "the queue holds 16 requests and fills, so some are dropped"
+    );
+    let wait = p50_ns(&ROUTED_QUEUE_WAIT);
+    let latency = p50_ns(&RESPONSE_LATENCY);
+    assert!(
+        wait > 4_000_000,
+        "a full queue of 16 at 2 ms each waits well over 4 ms, got p50 {wait} ns"
+    );
+    assert!(
+        latency >= wait,
+        "response latency (p50 {latency} ns) includes the queue wait (p50 {wait} ns)"
+    );
+}

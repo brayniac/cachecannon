@@ -243,8 +243,8 @@ pub enum Routing {
     /// Each request draws its key from the whole keyspace and is sent to the
     /// node that owns it, so a node receives its key share of the rate. Each
     /// worker's dispatcher draws and routes the key and queues the request for
-    /// that node; latency is measured from that moment, so time spent queued
-    /// behind a slow node is counted. Requires a rate limit
+    /// that node; latency is measured from that moment, so the time a request
+    /// waits for a free connection to its node is counted. Requires a rate limit
     /// (`workload.rate_limit > 0` or `[workload.saturation_search]`), a RESP or
     /// memcache protocol, and at least `threads x nodes` connections.
     Routed,
@@ -1339,9 +1339,6 @@ impl Config {
 }
 
 impl Config {
-    /// `[workload.kv_replay]` checks that need no file access. The trace and
-    /// the model config are read when the run starts
-    /// (`crate::kvreplay::KvReplay::load`).
     /// `workload.routing = "routed"`. The node-count requirement (`threads x
     /// nodes` connections) is checked after discovery, in
     /// `runner::check_node_counts`, because validation sees only the seeds.
@@ -1378,6 +1375,9 @@ impl Config {
         Ok(())
     }
 
+    /// `[workload.kv_replay]` checks that need no file access. The trace and
+    /// the model config are read when the run starts
+    /// (`crate::kvreplay::KvReplay::load`).
     fn validate_kv_replay(&self, kv: &KvReplay) -> Result<(), ConfigError> {
         let bad = |msg: &str| {
             Err(ConfigError::Validation(format!(

@@ -12,9 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   population does: each worker's dispatcher draws every request's key from
   the whole keyspace, routes it, and queues it for the owning node, so a node
   receives its key share of the rate. Latency is measured from when the
-  dispatcher funds a request, so time queued behind a slow node is counted
-  (`routed_queue_wait` holds that part alone), and a request that finds the
-  node's queue full is dropped and counted in `routed_queue_dropped`. Needs a
+  dispatcher funds a request, so the time a request waits for a connection to
+  its node is counted (`routed_queue_wait` holds that part alone), and a
+  request that finds the node's queue full is dropped and counted in
+  `routed_queue_dropped`. A connection waiting for a reply does not send
+  queued requests, so with few connections per node that wait is mostly the
+  generator's. Needs a
   rate limit, a RESP or memcache protocol, and at least `threads x nodes`
   connections. The default, `"pinned"`, is the existing behaviour.
 - `target.auto_discovery` supports ElastiCache for Memcached auto discovery.

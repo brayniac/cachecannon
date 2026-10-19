@@ -772,19 +772,30 @@ How a routed run works:
 
 1. Each worker runs a dispatcher. For each token the rate limiter grants, it
    draws a key, routes it, and queues the request for the owning node.
-2. A connection to that node takes the request from the queue and sends it.
-3. Latency is measured from the moment the dispatcher funded the request, so
-   time spent queued behind a slow node is part of `response_latency`, the
-   per-command latencies and `perceived_latency`. The queueing part alone is
-   in `routed_queue_wait`.
-4. Each node's queue on a worker holds 16 times what that worker's
+2. A connection to that node takes queued requests between replies, when its
+   pipeline has room for a full batch (`connection.batch_size`, which defaults
+   to `pipeline_depth`, so by default only when nothing is in flight). While
+   it waits for a reply it sends nothing, even with free pipeline slots.
+3. Latency is measured from the moment the dispatcher funded the request. It
+   includes the time the request waited for a connection to its node to take
+   it: the node answering slowly, and every one of this worker's connections
+   to the node waiting on a reply. The waiting part alone is in
+   `routed_queue_wait`, recorded when the request is sent (including requests
+   a failed send then discards). With few connections per node, that wait is
+   mostly the generator's: pipelining does not shorten it, more connections
+   per node do. Keep `routed_queue_wait` small next to the latency you are
+   measuring, or the result describes the generator as much as the server.
+4. Requests routed to a node whose connections on a worker are all
+   reconnecting stay in the queue until it fills, and count the reconnect time
+   as latency.
+5. Each node's queue on a worker holds 16 times what that worker's
    connections to the node can have in flight (`connections x
    pipeline_depth`). A request funded while the queue is full is dropped and
    counted in `routed_queue_dropped`, and the run summary reports it as part
    of the offered load. A saturation search counts responses, so drops lower
    the achieved rate and fail the step when it falls below
    `min_throughput_ratio`.
-5. Backfill SETs (`backfill_on_miss`) are sent on the connection that saw the
+6. Backfill SETs (`backfill_on_miss`) are sent on the connection that saw the
    miss and take their own token from the limiter.
 
 Requirements, checked at startup:
@@ -798,7 +809,7 @@ Requirements, checked at startup:
 - Not with `connection.endpoint_allocation = "key_share"`, which approximates
   the same per-node load by giving hot nodes more connections.
 
-The node list is still read once at startup, in both models.
+The node list is read once at startup in both modes.
 
 ## Memcached Auto Discovery
 
