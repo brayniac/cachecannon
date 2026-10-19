@@ -83,8 +83,10 @@ apply:
   `src/metrics.rs`). Prefill and append SETs that get `MOVED` are queued again
   and re-routed when popped (`src/worker.rs:1564-1569`, `3376-3381`), so they
   reach the new owner if it is a known node. For an unknown node the slot
-  table is unchanged, the key returns to the old node indefinitely, and
-  prefill never completes.
+  table is unchanged and the key returns to the old node indefinitely: the
+  runner's stall check or `prefill_timeout` (`src/runner.rs:645-660`) fails
+  the run with "prefill failed: timed out or stalled" (`src/runner.rs:980`),
+  and an append batch never commits.
 - The uniform and zipf key-selection paths (`src/worker.rs:1715-1729`) pick a
   key from the connection's own endpoint bucket and send it without routing it.
   After a slot moves, those paths keep sending its keys to the old node, which
@@ -206,16 +208,18 @@ requirements follow:
   hot node's queue would otherwise reach neither the latency histograms nor
   `PERCEIVED_LATENCY`. Saturation search reads those histograms
   (`src/saturation.rs:318-339`) and would not see the hot node break the SLO.
-  Today every latency histogram is written in the `on_result` callback
+  Today the GET, SET, DELETE, `RESPONSE_LATENCY` and `PERCEIVED_LATENCY`
+  histograms for RESP and memcache are written in the `on_result` callbacks
   (`src/worker.rs:1259-1309`), and `CommandResult` in ringline-redis and
   ringline-memcache has no `user_data`, so the callback cannot find a
   request's funding time. Latency recording for RESP and memcache moves into
   the recv loop, which has `user_data`.
 - The per-node queue is bounded. A request that finds it full, or whose node
   has no live connection, is dropped and counted in a new `requests_dropped`
-  counter. Saturation search already fails a step when responses fall below
-  `min_throughput_ratio` of the rate (`src/saturation.rs:340-390`), so drops
-  end the search the same way.
+  counter. Saturation search counts responses, not requests sent, so when
+  drops push the achieved rate below `min_throughput_ratio` of the target
+  (`src/saturation.rs:389-394`), the step fails the same way a throughput
+  shortfall does.
 
 Closed loop adds one cap on top of the same queues: a per-worker limit on
 outstanding requests, sized `connections × pipeline_depth`. Closed loop has no
@@ -307,10 +311,9 @@ memory and was not checked. None offers more than one of these models.
   (`hold_pipeline()`). A `MOVED` reply triggers a `CLUSTER SLOTS` re-read.
   `handle_cluster_slots()` builds the new map before swapping it in, keeps
   connections whose address is unchanged, opens connections to new nodes, and
-  retires the rest. A redirected request
-  is retried only with `--retry-on-error`. `--rate-limiting` applies per
-  connection, so in cluster mode every node gets the same rate rather than its
-  key share.
+  retires the rest. A redirected request is retried only with
+  `--retry-on-error`. `--rate-limiting` applies per connection, so in cluster
+  mode every node gets the same rate rather than its key share.
 - valkey-benchmark and redis-benchmark (`--cluster`, `valkey-benchmark.c`) are
   per-node. Each client connects to one node, and `setClusterKeyHashTag()`
   rewrites a `{tag}` in the key to hash to a slot that node owns. `MOVED` or
@@ -372,11 +375,11 @@ startup slot table it uses today (`src/runner.rs:823`).
   so total connections grow with the cluster. That matches a client with one
   pool per node. The alternative is to hold the total fixed and spread it more
   thinly. The new node's connections are spread round-robin across workers, so
-  every worker gets at least one. In the routed model that needs
-  `connections / initial nodes ≥ threads`, which the startup check already
-  implies. The per-worker limiter weights, fixed at startup today
-  (`src/limiters.rs:280-333`), are rebuilt from the new per-worker connection
-  counts. An append writer is spawned for the node
+  every worker gets one when the count is at least `threads`. In the routed
+  model it always is, because the startup check implies
+  `connections / initial nodes ≥ threads`. The per-worker limiter weights,
+  fixed at startup today (`src/limiters.rs:280-333`), are rebuilt from the new
+  per-worker connection counts. An append writer is spawned for the node
   before any append key is routed to it, because a node with no writer never
   drains its append queue and the batch never commits.
 - **Removed node:** its connection tasks stop taking new work and exit after
@@ -416,14 +419,15 @@ many nodes a run can have, and that has not been decided.
 1. Correct `docs/guide.md:721-726` (#240). Docs only, independent of
    everything else.
 2. Routed open loop with the per-node queues, on a fixed node list. Config
-   validation rejects routed unless a ratelimiter is created, and requires
-   connections ≥ threads × nodes. Latency recording for RESP and memcache
-   moves from the `on_result` callback into the recv loop, which has
-   `user_data` to look up the funding time. Step 6 reuses this for redirects.
-   Measure client CPU per request against the per-node path at the highest
-   pipeline depth and connection count in CI, on io_uring.
+   validation rejects routed unless a ratelimiter is created;
+   `check_node_counts` requires connections ≥ threads × nodes. Latency
+   recording for RESP and memcache moves from the `on_result` callback into the
+   recv loop, which has `user_data` to look up the funding time. Step 6 reuses
+   this for redirects. Measure client CPU per request against the per-node path
+   at the highest pipeline depth and connection count in CI, on io_uring.
 3. Routed closed loop: the outstanding-request cap over the same queues, and
-   removal of the validation rule from step 2.
+   removal of the ratelimiter rule from step 2; the threads × nodes
+   requirement stays.
 4. The `Topology` type with stable ids, replacing positional `endpoints`.
 5. The watcher and worker reconciliation for auto discovery. A fake
    configuration endpoint whose version changes mid-run can test this; the
