@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `target.auto_discovery` supports ElastiCache for Memcached auto discovery.
+  Before the run, cachecannon sends `config get cluster` to the configured
+  endpoints (falling back to `get AmazonElastiCache:cluster` on engines that
+  answer `ERROR`), over TLS when `target.tls` is set, and runs against the
+  nodes listed. Requires protocol `memcache` or `memcache-binary`. Discovery
+  runs once; node changes during the run are not followed.
 - cachecannon carries its own KPI template (`templates/cachecannon.json`, a
   Rezolus `ServiceExtension`) in its recordings: the `/metrics/stream`
   handshake sends it as `service_queries` metadata, which `rezolus record`
@@ -184,6 +190,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     a `query worker:` error.
 
 ### Fixed
+- `[workload.append] connections` is checked against the node count after
+  cluster discovery. Validation counts the seed endpoints, so a cluster run
+  with fewer writers than nodes passed it and then stalled: a node with no
+  writer never drained its append queue and the first batch never
+  committed. The run now fails at startup.
 - Every connection task (RESP, RESP append, memcache, memcache append, ping
   and DMA) closes its connection before reconnecting and when it returns.
   After a failed `HELLO 3`, a failed DMA hello, a failed precheck or a failed
