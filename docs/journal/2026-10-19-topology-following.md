@@ -70,8 +70,11 @@ apply:
 
 - The slot table is per worker, so each worker learns a moved slot separately,
   one `MOVED` reply at a time.
-- The redirected request is not retried. `map_respmeta` records it with
-  `success = false` and `is_error_response = true` (`src/worker.rs:2130`).
+- The redirected request is not retried. `record_counters`
+  (`src/worker.rs:3944`) counts the redirect reply as a response and in
+  `cluster_redirects`, not in `REQUEST_ERRORS`. ringline-redis passes error
+  replies to the `on_result` callback, so the reply's latency is recorded in
+  the GET, SET or DELETE histogram and in `RESPONSE_LATENCY` (statics in `src/metrics.rs`).
 - The uniform and zipf key-selection paths (`src/worker.rs:1715-1729`) pick a
   key from the connection's own endpoint bucket and send it without routing it.
   After a slot moves, those paths keep sending its keys to the old node, which
@@ -324,10 +327,11 @@ After publishing, the watcher calls each worker's `WakeHandle`. The worker's
 ### Redirects in cluster mode
 
 With a shared slot table and global draws, a `MOVED` reply should re-route and
-resend the request once, counted in `cluster_redirects` and not as an error
-response. An `ASK` reply needs `ASKING` sent on the target connection first.
-Both change what the error count means during a reshard, so they belong in the
-same CHANGELOG entry.
+resend the request once. The redirect reply should then be counted only in
+`cluster_redirects`, and the latency recorded should run from the first send
+to the final reply. An `ASK` reply needs `ASKING` sent on the target connection
+first. Both change what the response count and the latency histograms contain
+during a reshard, so they belong in the same CHANGELOG entry.
 
 ### Metrics
 
