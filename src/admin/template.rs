@@ -92,9 +92,9 @@ mod tests {
         }
     }
 
-    /// Every metric a KPI query selects (a name followed by `{`) is one this
-    /// binary registers, so a renamed metric fails here rather than leaving
-    /// an empty chart.
+    /// Every metric a KPI query names, with or without a selector, is one
+    /// this binary registers, so a renamed metric fails here rather than
+    /// leaving an empty chart.
     #[test]
     fn template_queries_name_registered_metrics() {
         let registered: std::collections::HashSet<String> = metriken::metrics()
@@ -138,17 +138,20 @@ mod tests {
         }
     }
 
-    /// PromQL words that are not metric names and are not followed by `(`.
-    const KEYWORDS: [&str; 8] = [
+    /// PromQL keywords whose `(…)` that follows is a list of label names,
+    /// not an expression: `sum by (op) (…)`, `a / on (op) b`.
+    const LABEL_LIST_KEYWORDS: [&str; 6] = [
         "by",
         "without",
         "on",
         "ignoring",
         "group_left",
         "group_right",
-        "bool",
-        "offset",
     ];
+
+    /// PromQL keywords that are followed by an expression or a duration:
+    /// `x > bool (y)` compares against `y`, which is checked.
+    const OTHER_KEYWORDS: [&str; 2] = ["bool", "offset"];
 
     /// PromQL aggregations, which may be followed by `by`/`without` rather
     /// than `(`: `sum by (op) (…)`.
@@ -170,14 +173,29 @@ mod tests {
     /// The metric names `query` refers to, each with its matchers (the text
     /// inside its `{…}`) or `None` for a bare name: every identifier outside
     /// `{…}` and `[…]` that is not a function call (followed by `(`), a
-    /// keyword, an aggregation, a label list after a keyword, or a number.
+    /// keyword, an aggregation, a label list after `by` and its kin, or a
+    /// number; and the `__name__` of a selector with no name before it,
+    /// `{__name__="x",…}`.
     fn metric_references(query: &str) -> Vec<(&str, Option<&str>)> {
         let bytes = query.as_bytes();
         let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b':';
         let mut out = Vec::new();
+        // Where the last identifier ended: a `{` there is that name's
+        // selector, and one anywhere else names its metric in `__name__`.
+        let mut ident_end = None;
         let mut i = 0;
         while i < bytes.len() {
             match bytes[i] {
+                b'{' if ident_end != Some(i) => {
+                    let end = query[i..].find('}').map_or(query.len(), |e| i + e);
+                    let matchers = &query[i + 1..end];
+                    let name = matchers.split(',').find_map(|m| {
+                        let (key, value) = m.trim().split_once('=')?;
+                        (key.trim() == "__name__").then(|| value.trim().trim_matches('"'))
+                    });
+                    out.push((name.unwrap_or(""), Some(matchers)));
+                    i = end + 1;
+                }
                 b'{' | b'[' | b'"' => {
                     let close = match bytes[i] {
                         b'{' => '}',
@@ -191,9 +209,13 @@ mod tests {
                     while i < bytes.len() && ident(bytes[i]) {
                         i += 1;
                     }
+                    ident_end = Some(i);
                     let word = &query[start..i];
                     let next = query[i..].trim_start();
-                    if KEYWORDS.contains(&word) {
+                    if OTHER_KEYWORDS.contains(&word) {
+                        continue;
+                    }
+                    if LABEL_LIST_KEYWORDS.contains(&word) {
                         // `by (op)`: the list holds label names; skip it.
                         if next.starts_with('(') {
                             let open = query.len() - next.len();
@@ -241,6 +263,16 @@ mod tests {
                 ("requests_sent", Some("source=\"x\"")),
                 ("get_count", None),
                 ("set_latency", Some("")),
+            ]
+        );
+        // `bool` is followed by an expression, which is checked; a selector
+        // with no name names its metric in `__name__`.
+        assert_eq!(
+            metric_references("x{} > bool (bare) + {__name__=\"y\", source=\"s\"}"),
+            [
+                ("x", Some("")),
+                ("bare", None),
+                ("y", Some("__name__=\"y\", source=\"s\"")),
             ]
         );
     }

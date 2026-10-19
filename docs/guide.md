@@ -100,7 +100,8 @@ benchmark when it read them, with the latency histograms as histograms, and
 cachecannon's KPI template in the recording's metadata. It writes `.dendro`
 only (the default with no `-o`) and refuses `-o run.rez`. This needs a recorder
 that accepts the `application/vnd.metriken.replication.v1+dendro` content type
-(rezolus 6.0.0-alpha.45 or later); an older 6.0 recorder refuses the stream and
+(a rezolus built from main at 6.0.0-alpha.45 or later; no 6.0 release is
+published yet); an older 6.0 recorder refuses the stream and
 the whole run at startup. A rezolus 5.x recorder writes `.rez` instead, from
 the msgpack snapshot on `/metrics/binary`. Keep the `source=cachecannon` label:
 the KPI template selects it, and a 5.x recorder that reached the benchmark
