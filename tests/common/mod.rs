@@ -620,17 +620,20 @@ pub fn assert_routed_key_share(protocol: &str) {
         })
         .expect("no uneven placement in 100 tries");
     // The hot node takes up to about 60% of the rate. Four connections per
-    // node per worker, each with a pipeline of 8, keep it well within what
-    // the thread-per-connection test servers serve on a loaded CI host, so
-    // the shares measure routing and not the hot node's capacity.
+    // node per worker keep each connection's share of it to about 150 req/s,
+    // well within what the thread-per-connection test servers serve on a
+    // loaded CI host, so the shares measure routing and not the hot node's
+    // capacity.
+    const RATE: u64 = 2000;
+    const SECONDS: u64 = 3;
     run_routed(&Routed {
         protocol,
         endpoints: &endpoints,
         threads: 2,
         connections: 24,
         pipeline: 8,
-        rate: 2000,
-        duration: "3s",
+        rate: RATE,
+        duration: &format!("{SECONDS}s"),
         routing: "routed",
         keyspace: "count = 1000\ndistribution = \"zipf\"\nzipf_theta = 0.99",
     });
@@ -646,7 +649,10 @@ pub fn assert_routed_key_share(protocol: &str) {
          (counts {counts:?}, shares {expected:?})"
     );
     let total: u64 = counts.iter().sum();
-    assert!(total > 5000, "too few GETs to compare shares: {counts:?}");
+    assert!(
+        total * 10 > RATE * SECONDS * 8,
+        "fewer than 80% of the offered GETs were received: {counts:?}"
+    );
     for (i, (&c, &want)) in counts.iter().zip(&expected).enumerate() {
         let got = c as f64 / total as f64;
         assert!(
