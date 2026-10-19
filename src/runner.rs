@@ -101,28 +101,7 @@ pub fn run_benchmark_full(
         None => None,
     };
 
-    // Cluster mode: discover topology and replace endpoints with primaries
-    let slot_table = if config.target.cluster {
-        match config.target.protocol {
-            CacheProtocol::Resp | CacheProtocol::Resp3 => {}
-            other => {
-                return Err(format!("cluster mode requires resp protocol, got {:?}", other).into());
-            }
-        }
-        let (endpoints, table) = crate::cluster::discover_topology(&config.target.endpoints)?;
-        config.target.endpoints = endpoints;
-        Some(table)
-    } else {
-        None
-    };
-
-    // Memcached auto discovery: replace the configuration endpoint with the
-    // nodes it lists. Must run before anything is sized from the endpoint
-    // count. Config validation counted the seeds; `check_node_counts` counts
-    // the nodes.
-    if config.target.auto_discovery {
-        config.target.endpoints = crate::autodiscovery::discover_nodes(&config.target)?.nodes;
-    }
+    let slot_table = resolve_endpoints(&mut config)?;
 
     let num_threads = config.general.threads;
     let warmup = effective_warmup(&config);
@@ -191,9 +170,6 @@ pub fn run_benchmark_full(
     // using the same distribution formula as worker.rs create_for_worker().
     let prefill_enabled = config.workload.prefill;
     let key_count = config.workload.keyspace.count;
-    let num_endpoints = config.target.endpoints.len();
-
-    check_node_counts(&config, num_endpoints)?;
 
     // Build the shared per-endpoint prefill queues once: the full keyspace,
     // partitioned by owning endpoint. All workers share this `Arc` and drain
@@ -1206,6 +1182,36 @@ fn max_from_histogram(hist: &Histogram) -> f64 {
         Ok(None) => {}
     }
     0.0
+}
+
+/// Run cluster or auto discovery, replace `config.target.endpoints` with the
+/// nodes found, and check connection counts against them. Returns the slot
+/// table in cluster mode. Must run before anything is sized from the endpoint
+/// count. Config validation checked connection counts against the seeds;
+/// `check_node_counts` checks them against the nodes.
+pub(crate) fn resolve_endpoints(
+    config: &mut Config,
+) -> Result<Option<Vec<u16>>, Box<dyn std::error::Error>> {
+    let slot_table = if config.target.cluster {
+        match config.target.protocol {
+            CacheProtocol::Resp | CacheProtocol::Resp3 => {}
+            other => {
+                return Err(format!("cluster mode requires resp protocol, got {:?}", other).into());
+            }
+        }
+        let (endpoints, table) = crate::cluster::discover_topology(&config.target.endpoints)?;
+        config.target.endpoints = endpoints;
+        Some(table)
+    } else {
+        None
+    };
+
+    if config.target.auto_discovery {
+        config.target.endpoints = crate::autodiscovery::discover_nodes(&config.target)?.nodes;
+    }
+
+    check_node_counts(config, config.target.endpoints.len())?;
+    Ok(slot_table)
 }
 
 /// Checks that need the node count, which in cluster and auto discovery modes

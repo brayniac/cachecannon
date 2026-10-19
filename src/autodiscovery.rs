@@ -112,19 +112,23 @@ fn try_discover(
             query(&mut stream)
         }
     };
-    // A timeout inside the TLS handshake or a write surfaces here unmapped.
+    // Maps a timeout while the current request had no reply bytes buffered:
+    // in the TLS handshake, in a write, or before the first decrypted byte of
+    // either reply. `request` maps a timeout once part of a reply is buffered.
     result.map_err(|e| {
         if e.downcast_ref::<io::Error>().is_some_and(is_timeout) {
-            format!("no reply within {deadline:?}").into()
+            format!("discovery exchange did not finish within {deadline:?}").into()
         } else {
             e
         }
     })
 }
 
-/// A `TcpStream` whose reads and writes fail with `TimedOut` once `at` has
-/// passed. Each call sets the socket timeout to the time left, because the
-/// socket timeout alone applies per call and resets on every byte received.
+/// A `TcpStream` whose reads and writes return a timeout error (see
+/// `is_timeout`) once `at` has passed. A socket timeout bounds one call, and a
+/// read returns as soon as any byte arrives, so on its own it does not stop a
+/// server that sends a byte within each timeout. Each call therefore sets the timeout
+/// to the time left.
 struct DeadlineStream {
     stream: TcpStream,
     at: Instant,
@@ -162,7 +166,9 @@ impl Write for DeadlineStream {
     }
 }
 
-/// A socket timeout reads as `WouldBlock` on Unix and `TimedOut` elsewhere.
+/// A socket timeout is `WouldBlock` on Unix and may be `TimedOut` on Windows
+/// (see `TcpStream::set_read_timeout`). `DeadlineStream::arm` returns
+/// `TimedOut` once the deadline has passed.
 fn is_timeout(e: &io::Error) -> bool {
     matches!(
         e.kind(),
@@ -514,7 +520,7 @@ mod tests {
         let err = discover(&target(vec![silent_server()]), TEST_DEADLINE)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("no reply within"), "{err}");
+        assert!(err.contains("did not finish within"), "{err}");
     }
 
     #[test]
@@ -560,12 +566,12 @@ mod tests {
         ))
         .unwrap();
         config.validate().expect("one seed passes validation");
-        let nodes = discover_nodes(&config.target).unwrap().nodes;
-        let err = crate::runner::check_node_counts(&config, nodes.len())
+        let mut config = config;
+        let err = crate::runner::resolve_endpoints(&mut config)
             .unwrap_err()
             .to_string();
         assert!(err.contains("append.connections (1)"), "{err}");
-        crate::runner::check_node_counts(&config, 1).expect("one node needs one writer");
+        assert_eq!(config.target.endpoints.len(), 3, "endpoints are the nodes");
     }
 
     /// Generate a self-signed cert and key with openssl. Returns None when
@@ -648,11 +654,25 @@ mod tests {
     }
 
     #[test]
+    fn tries_the_next_seed() {
+        // Bound then dropped, so connecting to it is refused.
+        let dead = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let seed = fake_server(vec![(CONFIG_GET_CLUSTER, AWS_EXAMPLE)]);
+        assert_eq!(
+            discover_nodes(&target(vec![dead, seed])).unwrap(),
+            expected()
+        );
+    }
+
+    #[test]
     fn silent_tls_seed_times_out() {
         // The client blocks in the handshake, inside the first write.
         let err = discover(&tls_target(silent_server()), TEST_DEADLINE)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("no reply within"), "{err}");
+        assert!(err.contains("did not finish within"), "{err}");
     }
 }
