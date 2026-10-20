@@ -789,6 +789,7 @@ pub fn assert_routed_queue_wait(protocol: &str) {
 /// `batch` at the pipeline depth, the request waits for the replies.
 pub fn routed_queue_wait_with_a_reply_pending(protocol: &str, batch: Option<usize>) -> u64 {
     let (addr, _) = spawn_paced(protocol, Pace::FromArrival(Duration::from_millis(12)));
+    let started = Instant::now();
     run_routed(&Routed {
         protocol,
         endpoints: &[addr],
@@ -801,5 +802,30 @@ pub fn routed_queue_wait_with_a_reply_pending(protocol: &str, batch: Option<usiz
         routing: "routed",
         keyspace: "count = 1000",
     });
-    p50_ns(&cachecannon::metrics::ROUTED_QUEUE_WAIT)
+    let elapsed = started.elapsed();
+    use cachecannon::metrics as m;
+    let quantiles = |h: &metriken::AtomicHistogram| -> Vec<u64> {
+        let h = h.load().expect("histogram has samples");
+        h.quantiles(&[0.0, 0.1, 0.5, 0.9, 0.99, 1.0])
+            .unwrap()
+            .unwrap()
+            .entries()
+            .values()
+            .map(|b| b.end())
+            .collect()
+    };
+    eprintln!(
+        "run {elapsed:?}; queue wait min/p10/p50/p90/p99/max {:?} ns; \
+         response latency {:?} ns; sent {} received {} dropped {} timeouts {} \
+         connect failed {} send failed {}",
+        quantiles(&m::ROUTED_QUEUE_WAIT),
+        quantiles(&m::RESPONSE_LATENCY),
+        m::REQUESTS_SENT.value(),
+        m::RESPONSES_RECEIVED.value(),
+        m::ROUTED_QUEUE_DROPPED.value(),
+        m::REQUEST_TIMEOUTS.value(),
+        m::CONNECTIONS_FAILED.value(),
+        m::REQUESTS_SEND_FAILED.value(),
+    );
+    p50_ns(&m::ROUTED_QUEUE_WAIT)
 }
