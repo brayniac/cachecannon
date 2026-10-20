@@ -283,10 +283,8 @@ the server returns with each GET.
 
 Differences from the default path:
 
-- The CRC runs after the reply's latency is recorded. Under
-  `timestamps.mode = "userspace"` its cost appears in the latency of later
-  replies on the same worker; under `"software"` it appears only in client CPU
-  and achieved throughput.
+- The CRC runs after the reply's latency is recorded. Its cost appears in the
+  latency of later replies on the same worker.
 - Client memory. `recv` holds each whole reply until it is parsed, so peak
   accumulator memory is up to connections × `pipeline_depth` × value size.
   `recv_meta` holds about one read burst per connection.
@@ -502,26 +500,18 @@ SLO.
 
 ```toml
 [timestamps]
-# Enable latency measurement
 enabled = true
-
-# Timestamp source
-# "userspace" - Application-level timing (portable, ~1µs overhead)
-# "software" - Kernel SO_TIMESTAMPING (Linux only, lower overhead)
 mode = "userspace"
 ```
 
-The mode also decides what `response_latency` measures. Under `userspace` it is
-sampled after the response is parsed, so it includes time cachecannon spent
-getting to a reply that had already arrived. Under `software` it is
-`kernel_recv_timestamp - userspace_send_timestamp`, which excludes that.
-**The two are not comparable**, so pick one mode for a whole set of runs. See
+`enabled` is not read. `mode` accepts only `"userspace"`; `"software"` (kernel
+SO_TIMESTAMPING) is rejected at config load.
+
+`response_latency` is sampled after the response is parsed, so it includes time
+cachecannon spent getting to a reply that had already arrived. `get_ttfb` stops
+when the worker handled the receive that carried the reply's first byte. See
 [Separating server time from reaping delay](guide.md#separating-server-time-from-reaping-delay)
 in the guide.
-
-`mode = "software"` is also what populates `get_ttfb`, from the same kernel
-timestamp — so under `software` it equals `response_latency`, and under
-`userspace` it has no samples and does not appear in the snapshot.
 
 ### Output Settings
 
@@ -845,7 +835,7 @@ Each snapshot contains the full set of metrics. The file uses the metriken expos
 | `get_latency` | GET response latency |
 | `set_latency` | SET response latency |
 | `delete_latency` | DELETE response latency |
-| `get_ttfb` | GET time-to-first-byte. **Only populated with `[timestamps] mode = "software"`** (Linux), where it is computed from the same kernel timestamp as `get_latency` and equals it; absent from the snapshot otherwise |
+| `get_ttfb` | GET time-to-first-byte: from the send to the completion batch in which the worker handled the receive carrying the reply's first byte. Excludes routed queue wait |
 | `backfill_set_latency` | Backfill SET latency |
 | `schedule_slip` | Queueing the latency clock omits: rate-limiter tokens beyond one claim (one batch), divided by rate, per worker. Zero without a rate limit. With `workload.routing = "routed"`, recorded once per funded request, including dropped ones, and not for backfill SETs |
 | `perceived_latency` | `response_latency + schedule_slip`. What a client issuing at the target rate experienced |

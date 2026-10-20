@@ -2351,7 +2351,7 @@ dependencies = [
 [[package]]
 name = "ringline"
 version = "0.7.0-alpha.0"
-source = "git+https://github.com/ringline-rs/ringline?rev=dfff2e5#dfff2e567b9ea124ab1bfdf5d9dfac8c6add670c"
+source = "git+https://github.com/ringline-rs/ringline?rev=ab81ceb#ab81ceb6fe77f0be866fb51ec53ffcbc1b4354cc"
 dependencies = [
  "bytes",
  "crossbeam-channel",
@@ -2368,13 +2368,12 @@ dependencies = [
 [[package]]
 name = "ringline-memcache"
 version = "0.7.2"
-source = "git+https://github.com/ringline-rs/ringline?rev=dfff2e5#dfff2e567b9ea124ab1bfdf5d9dfac8c6add670c"
+source = "git+https://github.com/ringline-rs/ringline?rev=ab81ceb#ab81ceb6fe77f0be866fb51ec53ffcbc1b4354cc"
 dependencies = [
  "bytes",
  "histogram 0.11.5",
  "itoa",
  "ketama 0.0.2",
- "libc",
  "memcache-proto",
  "ringline",
  "thiserror",
@@ -2383,10 +2382,9 @@ dependencies = [
 [[package]]
 name = "ringline-ping"
 version = "0.6.0"
-source = "git+https://github.com/ringline-rs/ringline?rev=dfff2e5#dfff2e567b9ea124ab1bfdf5d9dfac8c6add670c"
+source = "git+https://github.com/ringline-rs/ringline?rev=ab81ceb#ab81ceb6fe77f0be866fb51ec53ffcbc1b4354cc"
 dependencies = [
  "histogram 0.11.5",
- "libc",
  "ping-proto",
  "ringline",
  "thiserror",
@@ -2395,13 +2393,12 @@ dependencies = [
 [[package]]
 name = "ringline-redis"
 version = "0.7.0"
-source = "git+https://github.com/ringline-rs/ringline?rev=dfff2e5#dfff2e567b9ea124ab1bfdf5d9dfac8c6add670c"
+source = "git+https://github.com/ringline-rs/ringline?rev=ab81ceb#ab81ceb6fe77f0be866fb51ec53ffcbc1b4354cc"
 dependencies = [
  "bytes",
  "histogram 0.11.5",
  "itoa",
  "ketama 0.0.2",
- "libc",
  "resp-proto",
  "ringline",
  "thiserror",

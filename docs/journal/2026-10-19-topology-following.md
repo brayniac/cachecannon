@@ -111,7 +111,13 @@ section, independently of this design.
   256. Connections added mid-run can exhaust them. When the task slab is full,
   `ringline::spawn` returns `Err`; startup logs it and counts the connection in
   `CONNECTIONS_FAILED` (`src/worker.rs:1033-1063`), and a mid-run spawn needs
-  the same handling. When the timer pool is exhausted the worker panics.
+  the same handling. When the timer pool is exhausted, `ringline::sleep` and
+  `ringline::timeout` panic, while the request deadline (`InFlight::arm`) and
+  the connect bound use `try_sleep`/`try_timeout` and get
+  `Err(TimerExhausted)`. The line numbers here are at f37e532. Since
+  cachecannon moved to ringline ab81ceb, the timer pool is ringline's fixed
+  65,536 slots per worker (`ringline::TIMER_SLOTS`) and cachecannon no longer
+  sizes it; `timer_slots` is gone.
 - `check_node_counts` (`src/runner.rs:1220`) checks prefill and append writer
   counts against the startup node count only.
 
@@ -393,10 +399,10 @@ startup slot table it uses today (`src/runner.rs:823`).
   backoff, since a replaced ElastiCache node stays listed for minutes. Requests
   routed to it are dropped and counted in `routed_queue_dropped`, and that is
   the correct result during a replacement.
-- **Pools:** `standalone_task_capacity` and `timer_slots` need a ceiling that
-  covers growth. The simplest option is a `target.max_nodes` setting that sizes
-  the pools for `max_nodes × per-node connections`, with a warning when a
-  topology change would exceed it.
+- **Pools:** `standalone_task_capacity` needs a ceiling that covers growth.
+  The simplest option is a `target.max_nodes` setting that sizes the pools for
+  `max_nodes × per-node connections`, with a warning when a topology change
+  would exceed it.
 
 ### Redirects in cluster mode
 

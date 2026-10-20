@@ -1018,9 +1018,6 @@ io_engine = "uring"
 [connection]
 connections = 4            # 1 per thread
 pipeline_depth = 1         # No pipelining
-
-[timestamps]
-mode = "software"          # Lower measurement overhead
 ```
 
 Pinning is the main reason to set `threads` by hand: the count has to match the
@@ -1149,62 +1146,30 @@ What to do about it:
 ### Separating server time from reaping delay
 
 `perceived` above `response` catches a generator that is behind on *issuing*
-requests. It does not catch one behind on *reading* replies, because where that
-delay lands depends on `[timestamps] mode`, which also decides whether it is
-measured at all.
+requests. It does not catch one behind on *reading* replies.
 
-**`mode = "userspace"` (the default) includes reaping delay in
-`response_latency`.** The measurement is `Instant::elapsed()` sampled after the
-response is parsed, and parsing happens in userspace after cachecannon notices
-the reply. A generator late to read a reply that already arrived charges the
-wait to the server, and nothing in cachecannon's own output separates the two.
-Use
-`tcp_packet_latency` from client-side Rezolus — see
+**`response_latency` includes reaping delay.** The measurement is
+`Instant::elapsed()` sampled after the response is parsed, and parsing happens
+in userspace after cachecannon notices the reply. A generator late to read a
+reply that already arrived charges the wait to the server.
+
+**`get_ttfb` stops earlier.** ringline logs, for each connection, the time of
+the completion batch in which the worker handled each receive (one clock read
+per batch), and the client reports the time from the send to the batch that
+carried the reply's first byte. Time between that batch and the client parsing
+the reply is in `get_latency` but not in `get_ttfb`, so a gap between the two
+at the same percentile is time between the worker handling that receive and
+the client finishing the reply: the connection task waiting to run, parsing,
+or the rest of a reply that spans several receives. Under
+`workload.routing = "routed"`, `get_latency` also includes the routed queue
+wait, which comes before the send.
+
+`get_ttfb` still includes time between the kernel queuing the data and the
+worker handling the receive. For that, use `tcp_packet_latency` from
+client-side Rezolus — see
 [Is the generator the bottleneck?](#is-the-generator-the-bottleneck).
 
-**`mode = "software"` excludes it.** Latency becomes
-`kernel_recv_timestamp - userspace_send_timestamp`, so the clock stops when the
-data arrived rather than when cachecannon got to it:
-
-```toml
-[timestamps]
-mode = "software"    # Linux only (SO_TIMESTAMPING)
-```
-
-A `software`-mode `response_latency` cannot be inflated by slow reaping, which
-makes it the better choice when the question is what the server did. It does not
-*measure* the reaping delay; it removes it.
-
-**The two modes are not comparable on latency.** Switching mid-comparison moves
-every latency figure by however much reaping delay there was, which looks like a
-server or configuration change and is neither. Pick one mode for a whole set of
-runs.
-
-**`get_ttfb` cannot be used to difference out reaping delay.** Under `software`
-it is computed from the same kernel timestamp as `response_latency`:
-
-```rust
-// ringline-memcache / ringline-redis, identical bodies
-fn finish_timing(&self, send_ts: u64, start: Instant) -> u64 {   // latency_ns
-    if self.use_kernel_ts {
-        let recv_ts = self.conn.recv_timestamp();
-        if recv_ts > 0 && recv_ts > send_ts { return recv_ts - send_ts; }
-    }
-    start.elapsed().as_nanos() as u64
-}
-fn compute_ttfb(&self, send_ts: u64) -> Option<u64> {            // ttfb_ns
-    if self.use_kernel_ts {
-        let recv_ts = self.conn.recv_timestamp();
-        if recv_ts > 0 && recv_ts > send_ts { return Some(recv_ts - send_ts); }
-    }
-    None
-}
-```
-
-So `get_ttfb` equals `get_latency` under `software` and has no samples under
-`userspace` — the difference is zero or unavailable, never informative. An empty
-metriken histogram does not reach the Parquet snapshot, so a missing `get_ttfb`
-column means `userspace` mode rather than a broken metric.
+`get_ttfb` is recorded for GETs only.
 
 ### Per-worker CPU, and why 1.00 is ambiguous
 

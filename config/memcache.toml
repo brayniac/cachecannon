@@ -34,7 +34,7 @@ length = 64  # Value length for SET commands
 
 [timestamps]
 enabled = true
-mode = "userspace"  # or "software" for SO_TIMESTAMPING (Linux only)
+mode = "userspace"  # the only mode
 
 [admin]
 # listen = "127.0.0.1:9090"  # Prometheus metrics endpoint
