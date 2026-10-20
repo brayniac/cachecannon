@@ -227,6 +227,13 @@ impl OutputFormatter for VerboseFormatter {
                 );
             }
         }
+        if results.routed_queue_dropped > 0 {
+            tracing::warn!(
+                "routed: {} of {} offered dropped at a full node queue (a node did not keep up)",
+                results.routed_queue_dropped,
+                results.offered()
+            );
+        }
         if results.requests_send_failed > 0 {
             tracing::warn!(
                 "{} requests not sent because a send failed (usually a full send pool \

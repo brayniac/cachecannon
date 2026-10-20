@@ -190,6 +190,18 @@ prefill_timeout = "300s"
 # See guide.md "Backfill on Miss" section for details
 backfill_on_miss = false
 
+# How a request reaches a node when there are several. See guide.md "Routing
+# across nodes".
+# "pinned" - each connection serves one node and draws only that node's keys
+#            (default)
+# "routed" - each request draws its key from the whole keyspace and goes to the
+#            node that owns it. Requires rate_limit > 0 or
+#            [workload.saturation_search], a RESP or memcache protocol, and
+#            connections >= threads x nodes (the nodes found by discovery in
+#            cluster and auto discovery modes). Not with
+#            connection.endpoint_allocation = "key_share".
+routing = "pinned"
+
 # Read every GET hit's value: CRC-32c over each value as the client returns it.
 # Off by default. See "Reading values" below.
 read_values = false
@@ -788,6 +800,7 @@ Each snapshot contains the full set of metrics. The file uses the metriken expos
 | `responses_received` | Total responses received |
 | `request_errors` | Total request errors |
 | `requests_send_failed` | RESP and memcache main-workload requests not sent because a send failed (usually a full send pool or zero-copy slab); not counted in `requests_sent` |
+| `routed_queue_dropped` | With `workload.routing = "routed"`: requests the dispatcher funded but dropped because the owning node's queue was full; not counted in `requests_sent` |
 | `cache_hits` | Total cache hits (GET responses with data) |
 | `cache_misses` | Total cache misses (GET responses without data) |
 | `get_count` | Total GET operations |
@@ -834,8 +847,9 @@ Each snapshot contains the full set of metrics. The file uses the metriken expos
 | `delete_latency` | DELETE response latency |
 | `get_ttfb` | GET time-to-first-byte. **Only populated with `[timestamps] mode = "software"`** (Linux), where it is computed from the same kernel timestamp as `get_latency` and equals it; absent from the snapshot otherwise |
 | `backfill_set_latency` | Backfill SET latency |
-| `schedule_slip` | Queueing the latency clock omits: rate-limiter tokens beyond one claim (one batch), divided by rate, per worker. Zero without a rate limit |
+| `schedule_slip` | Queueing the latency clock omits: rate-limiter tokens beyond one claim (one batch), divided by rate, per worker. Zero without a rate limit. With `workload.routing = "routed"`, recorded once per funded request, including dropped ones, and not for backfill SETs |
 | `perceived_latency` | `response_latency + schedule_slip`. What a client issuing at the target rate experienced |
+| `routed_queue_wait` | With `workload.routing = "routed"`: time from the dispatcher funding a request to a connection sending it, recorded at send (including requests a failed send then discards). Included in `response_latency` and the per-command latencies |
 | `kv_lookup_time`, `kv_load_time`, `kv_store_time` | KV replay, per trace request: first EXISTS, GET or SET sent to the last reply |
 | `kv_load_time_per_1k_tokens` | KV replay, per trace request with cached tokens: load time × 1000 / cached tokens |
 | `kv_schedule_lag` | KV replay, open loop, per trace request: start minus scheduled time |

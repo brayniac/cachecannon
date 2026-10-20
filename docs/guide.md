@@ -746,6 +746,73 @@ prefill = true
 
 See `config/valkey-cluster.toml` for a ready-to-use configuration.
 
+## Routing across nodes
+
+With several nodes (a list of endpoints, cluster mode, or auto discovery),
+`workload.routing` sets how a request reaches a node.
+
+```toml
+[workload]
+rate_limit = 100000
+routing = "routed"   # default "pinned"
+```
+
+**Pinned** (default): each connection serves one node and draws only keys that
+node owns. Each node is loaded as if it were a single-server benchmark: with
+`endpoint_allocation = "even"` every node gets the same share of the rate, or
+the same number of closed-loop connections, whatever share of the key
+distribution it owns. The result is the sum of per-node capacities.
+
+**Routed**: each request draws its key from the whole keyspace and is sent to
+the node that owns it, the way a client population loads a cluster. With zipf
+keys the node that owns the hottest keys receives more of the rate than the
+others.
+
+How a routed run works:
+
+1. Each worker runs a dispatcher. For each token the rate limiter grants, it
+   draws a key, routes it, and queues the request for the owning node.
+2. A connection to that node takes queued requests between replies, when its
+   pipeline has room for a full batch (`connection.batch_size`, which defaults
+   to `pipeline_depth`, so by default only when nothing is in flight). While
+   it waits for a reply it sends nothing, even with free pipeline slots.
+3. Latency is measured from the moment the dispatcher funded the request. It
+   includes the time the request waited for a connection to its node to take
+   it: the node answering slowly, and every one of this worker's connections
+   to the node waiting on a reply. The waiting part alone is in
+   `routed_queue_wait`, recorded when the request is sent (including requests
+   a failed send then discards). With few connections per node, that wait is
+   mostly the generator's. Once this worker's connections to the node can
+   carry the rate, a deeper pipeline does not bring the wait below about one
+   reply time; more connections per node do. Keep `routed_queue_wait` small
+   next to the latency you are measuring, or the result describes the
+   generator as much as the server.
+4. Requests routed to a node whose connections on a worker are all
+   reconnecting stay in the queue until it fills, and count the reconnect time
+   as latency.
+5. Each node's queue on a worker holds 16 times what that worker's
+   connections to the node can have in flight (`connections x
+   pipeline_depth`). A request funded while the queue is full is dropped and
+   counted in `routed_queue_dropped`, and the run summary reports it as part
+   of the offered load. A saturation search counts responses, so drops lower
+   the achieved rate and fail the step when it falls below
+   `min_throughput_ratio`.
+6. Backfill SETs (`backfill_on_miss`) are sent on the connection that saw the
+   miss and take their own token from the limiter.
+
+Requirements, checked at startup:
+
+- A rate limit: `workload.rate_limit > 0` or `[workload.saturation_search]`.
+  Closed-loop routing is not supported yet.
+- Protocol `resp`, `resp3`, `memcache` or `memcache-binary`.
+- At least `threads x nodes` connections, so every worker has a connection to
+  every node. In cluster and auto discovery modes the nodes are the ones found
+  by discovery.
+- Not with `connection.endpoint_allocation = "key_share"`, which approximates
+  the same per-node load by giving hot nodes more connections.
+
+The node list is read once at startup in both modes.
+
 ## Memcached Auto Discovery
 
 `auto_discovery` runs against every node of an ElastiCache for Memcached

@@ -440,3 +440,274 @@ pub fn prefill_span(protocol: &str, keys: usize, rate: usize) -> Duration {
     };
     prefill_span_shaped(protocol, shape, keys, rate)
 }
+
+/// A server for `protocol` (resp or memcache) that answers every GET as a
+/// miss, after `delay`, and counts the GETs it received.
+pub fn spawn_get_counter(
+    protocol: &str,
+    delay: Duration,
+) -> (SocketAddr, Arc<std::sync::atomic::AtomicU64>) {
+    let gets = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counted = Arc::clone(&gets);
+    let addr = match protocol {
+        "resp" => spawn(move |stream| count_resp(stream, &counted, delay)),
+        "memcache" => spawn(move |stream| count_memcache(stream, &counted, delay)),
+        _ => unreachable!(),
+    };
+    (addr, gets)
+}
+
+fn count_resp(stream: TcpStream, gets: &std::sync::atomic::AtomicU64, delay: Duration) {
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    while let Some(header) = read_line(&mut reader) {
+        let n: usize = std::str::from_utf8(&header[1..]).unwrap().parse().unwrap();
+        let mut command = Vec::new();
+        for i in 0..n {
+            let len_line = read_line(&mut reader).unwrap();
+            let len: usize = std::str::from_utf8(&len_line[1..])
+                .unwrap()
+                .parse()
+                .unwrap();
+            let mut arg = vec![0u8; len + 2];
+            reader.read_exact(&mut arg).unwrap();
+            if i == 0 {
+                arg.truncate(len);
+                command = arg.to_ascii_uppercase();
+            }
+        }
+        let reply: &[u8] = match command.as_slice() {
+            b"GET" => {
+                gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::thread::sleep(delay);
+                b"$-1\r\n"
+            }
+            b"PING" => b"+PONG\r\n",
+            _ => b"+OK\r\n",
+        };
+        if writer.write_all(reply).is_err() {
+            return;
+        }
+    }
+}
+
+fn count_memcache(stream: TcpStream, gets: &std::sync::atomic::AtomicU64, delay: Duration) {
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    while let Some(line) = read_line(&mut reader) {
+        let reply: &[u8] = match line.split(|b| *b == b' ').next().unwrap() {
+            b"get" => {
+                gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::thread::sleep(delay);
+                b"END\r\n"
+            }
+            b"version" => b"VERSION 1.0\r\n",
+            _ => b"ERROR\r\n",
+        };
+        if writer.write_all(reply).is_err() {
+            return;
+        }
+    }
+}
+
+/// The shape of a routed run.
+pub struct Routed<'a> {
+    pub protocol: &'a str,
+    pub endpoints: &'a [SocketAddr],
+    pub threads: usize,
+    pub connections: usize,
+    pub pipeline: usize,
+    pub rate: u64,
+    pub duration: &'a str,
+    /// `[workload] routing`.
+    pub routing: &'a str,
+    /// Lines for `[workload.keyspace]`.
+    pub keyspace: &'a str,
+}
+
+/// Run a GET-only, rate-limited benchmark of `shape`, with no warmup.
+pub fn run_routed(shape: &Routed) {
+    let endpoints = shape
+        .endpoints
+        .iter()
+        .map(|addr| format!("\"{addr}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let toml = format!(
+        r#"
+        [general]
+        duration = "{duration}"
+        warmup = "0s"
+        threads = {threads}
+
+        [target]
+        endpoints = [{endpoints}]
+        protocol = "{protocol}"
+
+        [connection]
+        connections = {connections}
+        pipeline_depth = {pipeline}
+
+        [workload]
+        rate_limit = {rate}
+        routing = "{routing}"
+
+        [workload.keyspace]
+        {keyspace}
+
+        [workload.commands]
+        get = 100
+        set = 0
+
+        [admin]
+        format = "quiet"
+        "#,
+        duration = shape.duration,
+        threads = shape.threads,
+        protocol = shape.protocol,
+        connections = shape.connections,
+        pipeline = shape.pipeline,
+        rate = shape.rate,
+        routing = shape.routing,
+        keyspace = shape.keyspace,
+    );
+    let path = std::env::temp_dir().join(format!(
+        "cachecannon-routed-{}-{}.toml",
+        std::process::id(),
+        shape.protocol
+    ));
+    std::fs::write(&path, toml).unwrap();
+    let config = Config::load(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    run_benchmark_full(
+        config,
+        None,
+        create_formatter(OutputFormat::Quiet, ColorMode::Never),
+        Arc::new(AtomicBool::new(true)),
+    )
+    .unwrap();
+}
+
+/// Run routed against three servers with zipf keys and check that each server
+/// received its key share of the GETs. An even split, which is what pinned
+/// routing gives, fails: the shares differ by more than the tolerance.
+pub fn assert_routed_key_share(protocol: &str) {
+    use cachecannon::keydist::KeyDist;
+
+    const KEYS: usize = 1000;
+    const THETA: f64 = 0.99;
+    let shares = |endpoints: &[SocketAddr]| {
+        let keys = Arc::new(cachecannon::worker::build_endpoint_keys(
+            KEYS, 16, endpoints, &None,
+        ));
+        let dist = KeyDist::zipf(KEYS, THETA).with_endpoint_keys(&keys);
+        dist.endpoint_sampler().unwrap().shares().to_vec()
+    };
+    let spread = |s: &[f64]| {
+        s.iter().cloned().fold(f64::MIN, f64::max) - s.iter().cloned().fold(f64::MAX, f64::min)
+    };
+    // Placement follows the servers' addresses, and the ports are whatever
+    // the OS hands out, so some placements split the keys nearly evenly. Pick
+    // servers whose placement is clearly uneven, or an even split would pass.
+    let (servers, endpoints, expected) = (0..100)
+        .find_map(|_| {
+            let servers: Vec<_> = (0..3)
+                .map(|_| spawn_get_counter(protocol, Duration::ZERO))
+                .collect();
+            let endpoints: Vec<SocketAddr> = servers.iter().map(|(a, _)| *a).collect();
+            let expected = shares(&endpoints);
+            (spread(&expected) > 0.1).then_some((servers, endpoints, expected))
+        })
+        .expect("no uneven placement in 100 tries");
+    // The hot node takes up to about 60% of the rate. Four connections per
+    // node per worker keep each connection's share of it to about 150 req/s,
+    // well within what the thread-per-connection test servers serve on a
+    // loaded CI host, so the shares measure routing and not the hot node's
+    // capacity.
+    const RATE: u64 = 2000;
+    const SECONDS: u64 = 3;
+    run_routed(&Routed {
+        protocol,
+        endpoints: &endpoints,
+        threads: 2,
+        connections: 24,
+        pipeline: 8,
+        rate: RATE,
+        duration: &format!("{SECONDS}s"),
+        routing: "routed",
+        keyspace: "count = 1000\ndistribution = \"zipf\"\nzipf_theta = 0.99",
+    });
+
+    let counts: Vec<u64> = servers
+        .iter()
+        .map(|(_, g)| g.load(std::sync::atomic::Ordering::Relaxed))
+        .collect();
+    let dropped = cachecannon::metrics::ROUTED_QUEUE_DROPPED.value();
+    assert_eq!(
+        dropped, 0,
+        "a node's queue filled, so the shares reflect its capacity, not routing \
+         (counts {counts:?}, shares {expected:?})"
+    );
+    let total: u64 = counts.iter().sum();
+    assert!(
+        total * 10 > RATE * SECONDS * 8,
+        "fewer than 80% of the offered GETs were received: {counts:?}"
+    );
+    for (i, (&c, &want)) in counts.iter().zip(&expected).enumerate() {
+        let got = c as f64 / total as f64;
+        assert!(
+            (got - want).abs() < 0.03,
+            "server {i} received {got:.3} of GETs, its key share is {want:.3} \
+             (counts {counts:?}, shares {expected:?})"
+        );
+    }
+}
+
+fn p50_ns(h: &metriken::AtomicHistogram) -> u64 {
+    let h = h.load().expect("histogram has samples");
+    h.quantiles(&[0.5])
+        .unwrap()
+        .unwrap()
+        .entries()
+        .values()
+        .next()
+        .unwrap()
+        .end()
+}
+
+/// Run routed against one server slower than the offered rate and check that
+/// requests waited in the node's queue, that the wait is part of the reported
+/// response latency, and that requests finding the queue full were dropped.
+pub fn assert_routed_queue_wait(protocol: &str) {
+    use cachecannon::metrics::{RESPONSE_LATENCY, ROUTED_QUEUE_DROPPED, ROUTED_QUEUE_WAIT};
+
+    // One connection with a pipeline of one against a server that takes 2 ms
+    // per GET serves about 500 requests a second; 2000 are offered.
+    let (addr, _) = spawn_get_counter(protocol, Duration::from_millis(2));
+    run_routed(&Routed {
+        protocol,
+        endpoints: &[addr],
+        threads: 1,
+        connections: 1,
+        pipeline: 1,
+        rate: 2000,
+        duration: "2s",
+        routing: "routed",
+        keyspace: "count = 1000",
+    });
+
+    assert!(
+        ROUTED_QUEUE_DROPPED.value() > 0,
+        "the queue holds 16 requests and fills, so some are dropped"
+    );
+    let wait = p50_ns(&ROUTED_QUEUE_WAIT);
+    let latency = p50_ns(&RESPONSE_LATENCY);
+    assert!(
+        wait > 4_000_000,
+        "a full queue of 16 at 2 ms each waits well over 4 ms, got p50 {wait} ns"
+    );
+    assert!(
+        latency >= wait,
+        "response latency (p50 {latency} ns) includes the queue wait (p50 {wait} ns)"
+    );
+}

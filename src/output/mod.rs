@@ -195,6 +195,10 @@ pub struct Results {
     /// connections sent less than their pipeline depth allows, and the latency
     /// percentiles cover only the requests that were sent.
     pub requests_send_failed: u64,
+    /// With `workload.routing = "routed"`: requests the dispatcher funded but
+    /// dropped because the owning node's queue was full. None of them is
+    /// counted in `requests`.
+    pub routed_queue_dropped: u64,
     /// Schedule slip percentiles (microseconds). Zero when no rate limit.
     pub schedule_slip: LatencyStats,
     /// Perceived (arrival-relative, CO-honest) response latency percentiles (µs).
@@ -321,9 +325,12 @@ impl Results {
     }
 
     /// Total requests offered = sent + dropped by the limiter + discarded by
-    /// a failed send.
+    /// a failed send + dropped at a full routed queue.
     pub fn offered(&self) -> u64 {
-        self.requests + self.requests_dropped + self.requests_send_failed
+        self.requests
+            + self.requests_dropped
+            + self.requests_send_failed
+            + self.routed_queue_dropped
     }
 
     /// Percentage of offered requests shed under overload (0.0-100.0).
@@ -367,6 +374,7 @@ mod overload_tests {
             conns_total: 0,
             requests_dropped: dropped,
             requests_send_failed: 0,
+            routed_queue_dropped: 0,
             schedule_slip: Default::default(),
             perceived_latency: Default::default(),
             kv_replay: None,
@@ -383,6 +391,11 @@ mod overload_tests {
             ..results_with(900, 100)
         };
         assert_eq!(r.offered(), 1050);
+        let r = Results {
+            routed_queue_dropped: 25,
+            ..results_with(900, 100)
+        };
+        assert_eq!(r.offered(), 1025);
     }
 
     #[test]
