@@ -554,7 +554,28 @@ mutation in 01a15a1e, which does send between replies, read 6.0 ms, and
 setting `TCP_NODELAY` on the stub (516dcb4) brought the control to 6 ms. One
 run each, no packet capture; the macOS control read 6.6 ms with Nagle on,
 which I have not explained. The control test now also asserts an upper bound
-of 50 ms, so a stub that falls back to Nagle fails it.
+(250 ms since the change below), so a stub that falls back to Nagle fails it.
+
+The RESP batch-1 test then failed on every GitHub macOS CI run of the branch
+(p50 381-671 ms) while passing on Linux CI and locally on macOS; the memcache
+and default-batch tests passed on the same runner. I missed this at first
+because the job summary I read deduplicated the failure lines. A diagnostic
+run (6e27aa2) printed the cause on the runner: 164 requests sent and 220
+dropped in the 2 s run, queue wait p50 625 ms and max 1.04 s, response
+latency min 64 ms against the stub's 12 ms, and response latency about 30 ms
+above queue wait at every quantile. At pipeline 4 and 200 req/s the
+connection carries the offered rate only while a round trip is under 20 ms,
+so a slow round trip filled the queue and the test measured the backlog.
+Locally, macOS background QoS (`taskpolicy -c background`) reproduces it: a
+12 ms `thread::sleep` there takes 99 ms at p50 (1.5 ms without), and all
+three tests failed with 280-290 dropped. Raising the test pipeline to 32,
+which carries 200 req/s up to a 160 ms round trip, made both batch-1 tests
+pass under background QoS (p50 47 µs RESP, 61 µs memcache, nothing dropped)
+and the default-batch control read 54 ms there; its ceiling is now 250 ms.
+With the new wait disabled the batch-1 tests still fail at pipeline 32
+(5.4 ms, 6.6 ms). I have not measured what slows the runner's round trip;
+sleep overshoot in the stub is the likely cause by analogy with background
+QoS, not by measurement there.
 
 Against valkey 8.1.1 on the same guest (three instances on loopback, routed,
 2 threads, 6 connections, pipeline 8, 50,000 req/s, 90% GET, 20 s after 5 s

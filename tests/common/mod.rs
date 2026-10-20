@@ -781,12 +781,21 @@ pub fn assert_routed_queue_wait(protocol: &str) {
     );
 }
 
-/// Run routed with one connection of pipeline 4 at 200 requests a second
-/// against a server that answers each GET 12 ms after it arrives, and return
-/// the p50 of `routed_queue_wait`. About 2.4 requests are in flight, so the
-/// connection usually has a reply pending when a request is queued. With room
-/// for a batch (`batch` unset, or 1) it sends the request at once; with
-/// `batch` at the pipeline depth, the request waits for the replies.
+/// The pipeline depth of [`routed_queue_wait_with_a_reply_pending`].
+pub const PENDING_PIPELINE: usize = 32;
+
+/// Run routed with one connection of pipeline [`PENDING_PIPELINE`] at 200
+/// requests a second against a server that answers each GET 12 ms after it
+/// arrives, and return the p50 of `routed_queue_wait`. About 2.4 requests are
+/// in flight, so the connection usually has a reply pending when a request is
+/// queued. With room for a batch (`batch` unset, or 1) it sends the request at
+/// once; with `batch` at the pipeline depth, the request waits for the
+/// replies.
+///
+/// The connection carries the offered rate while a round trip takes under
+/// 160 ms (32 / 200 per second). Past that the queue fills and its wait is the
+/// backlog, whatever the batch. The diagnostic line printed on failure shows
+/// whether requests were dropped.
 pub fn routed_queue_wait_with_a_reply_pending(protocol: &str, batch: Option<usize>) -> u64 {
     let (addr, _) = spawn_paced(protocol, Pace::FromArrival(Duration::from_millis(12)));
     let started = Instant::now();
@@ -795,7 +804,7 @@ pub fn routed_queue_wait_with_a_reply_pending(protocol: &str, batch: Option<usiz
         endpoints: &[addr],
         threads: 1,
         connections: 1,
-        pipeline: 4,
+        pipeline: PENDING_PIPELINE,
         batch,
         rate: 200,
         duration: "2s",
