@@ -487,8 +487,8 @@ impl Replies {
             Pace::FromArrival(_) => {
                 // With Nagle on, a reply written while an earlier one is
                 // unacknowledged is held for the ACK, which the client
-                // delays when it has nothing to send. On Linux the
-                // default-batch control read 650 ms p50 queue wait with
+                // delays when it has nothing to send. On Linux at pipeline 4
+                // the default-batch control read 650 ms p50 queue wait with
                 // Nagle on and 6 ms with it off (one run each, no packet
                 // capture; attributed, not traced).
                 writer.set_nodelay(true).unwrap();
@@ -793,9 +793,9 @@ pub const PENDING_PIPELINE: usize = 32;
 /// replies.
 ///
 /// The connection carries the offered rate while a round trip takes under
-/// 160 ms (32 / 200 per second). Past that the queue fills and its wait is the
-/// backlog, whatever the batch, so the run fails if the queue dropped a
-/// request.
+/// 160 ms (32 / 200 per second). Past that requests back up in the queue and
+/// its wait is the backlog, whatever the batch, so the run fails if the
+/// connection sent fewer than 350 of the about 400 requests funded.
 pub fn routed_queue_wait_with_a_reply_pending(protocol: &str, batch: Option<usize>) -> u64 {
     let (addr, _) = spawn_paced(protocol, Pace::FromArrival(Duration::from_millis(12)));
     let started = Instant::now();
@@ -838,10 +838,11 @@ pub fn routed_queue_wait_with_a_reply_pending(protocol: &str, batch: Option<usiz
         m::CONNECTIONS_FAILED.value(),
         m::REQUESTS_SEND_FAILED.value(),
     );
-    assert_eq!(
-        m::ROUTED_QUEUE_DROPPED.value(),
-        0,
-        "the connection did not carry the offered rate, so the queue wait is a backlog"
+    let sent = m::REQUESTS_SENT.value();
+    assert!(
+        sent >= 350,
+        "200 req/s for 2 s funds about 400 requests and the connection sent {sent}, \
+         so it fell behind and the queue wait is a backlog"
     );
     p50_ns(&m::ROUTED_QUEUE_WAIT)
 }

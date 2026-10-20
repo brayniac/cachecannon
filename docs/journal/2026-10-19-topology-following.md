@@ -572,19 +572,33 @@ about 2 s with 4 in flight gives a mean of about 50 ms. At pipeline 4 and
 under 20 ms, so the queue filled and the test measured the backlog.
 
 Locally, macOS background QoS (`taskpolicy -c background`) reproduces it: a
-12 ms `thread::sleep` there takes 111 ms at p50 (13.5 ms without), and all
+12 ms `thread::sleep` there takes 111 ms at p50 (13.6 ms without), and all
 three tests failed with 280-290 dropped. Raising the test pipeline to 32,
 which carries 200 req/s up to a 160 ms round trip, made both batch-1 tests
-pass under background QoS (p50 47 µs RESP, 61 µs memcache, nothing dropped);
-the default-batch control read 54 ms there, and the batch-1 round trips read
-p50 50 ms and max 112 ms. With the new wait disabled the batch-1 tests still fail at
-pipeline 32 (5.4 ms, 6.6 ms). The helper now fails the run if the queue
-dropped a request, which catches a backlog of any cause. It no longer catches
-Nagle on the stub: the 650 ms reading was a backlog at pipeline 4, and at
-pipeline 32 a cycle stretched by a delayed ACK is not expected to fill the
-queue. I have not measured what slows the runner's round trip; sleep
-overshoot in the stub is the likely cause by analogy with background QoS,
-not by measurement there.
+pass under background QoS, one run each: RESP queue wait p50 47 µs, memcache
+61 µs, nothing dropped, and round trips (response latency) p50 50 ms and max
+112 ms in both. The default-batch control read 54 ms there. A reviewer's
+RESP run under the same QoS read round trips of p50 75 ms and max 337 ms, past
+the 160 ms headroom for part of the run, and still passed at 88.6 µs. With
+the new wait disabled the batch-1 tests still fail at pipeline 32 (5.4 ms,
+6.6 ms).
+
+At pipeline 32 the node queue holds 512 requests, more than a 2 s run at
+200 req/s funds, so a backlog no longer shows up as drops. The helper fails
+the run if the connection sent fewer than 350 requests (about 400 are
+funded). Healthy local runs sent 412-414 and runs under background QoS
+417-423; with the stub at 400 ms all three tests fail on it, having sent
+161-172. A first version asserted no drops, which a reviewer showed could
+not fire: with the stub answering 400 ms after arrival, the RESP test sent
+175 with none dropped, and the default-batch control passed on a backlog.
+
+The control test's ceiling is gone, so it no longer catches Nagle on the
+stub. I infer the 650 ms reading was Nagle-stretched cycles backing up the
+queue at pipeline 4 (not measured: 01a15a1e recorded no drop count); at
+pipeline 32 a cycle stretched by a 40 ms delayed ACK still carries 200 req/s.
+I have not measured what slows the runner's round trip; sleep overshoot in
+the stub is the likely cause by analogy with background QoS, not by
+measurement there.
 
 Against valkey 8.1.1 on the same guest (three instances on loopback, routed,
 2 threads, 6 connections, pipeline 8, 50,000 req/s, 90% GET, 20 s after 5 s
