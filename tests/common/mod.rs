@@ -485,6 +485,11 @@ impl Replies {
         match pace {
             Pace::Serial(_) => Replies::Serial(writer),
             Pace::FromArrival(_) => {
+                // Replies are small and written one at a time while others
+                // are unacknowledged; with Nagle on, each waits for the
+                // client's delayed ACK (measured on Linux: p50 queue wait
+                // 650 ms at the default batch instead of milliseconds).
+                writer.set_nodelay(true).unwrap();
                 let (tx, rx) = std::sync::mpsc::channel::<(std::time::Instant, &'static [u8])>();
                 std::thread::spawn(move || {
                     for (at, reply) in rx {
