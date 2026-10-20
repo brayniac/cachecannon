@@ -601,9 +601,70 @@ struct RoutedRequest {
 struct NodeQueue {
     requests: VecDeque<RoutedRequest>,
     cap: usize,
-    /// Connection tasks for this node with nothing in flight, waiting for a
-    /// request, longest-waiting first. One entry per task.
-    waiters: VecDeque<Waker>,
+    /// Connection tasks for this node waiting for a request, longest-waiting
+    /// first. An entry whose wait has returned or been dropped is dead and is
+    /// skipped by `push`.
+    waiters: VecDeque<Rc<WaitSlot>>,
+    /// `waiters` is compacted to its live entries when it reaches this length.
+    waiters_cap: usize,
+}
+
+/// One pending `RoutedQueues::wait`'s entry in its node's waiter list.
+struct WaitSlot {
+    /// Cleared when `push` wakes the entry or the wait returns or is dropped.
+    live: Cell<bool>,
+    waker: RefCell<Waker>,
+}
+
+/// Future returned by `RoutedQueues::wait`.
+struct NodeWait<'a> {
+    queues: &'a RoutedQueues,
+    node: usize,
+    /// This wait's entry in `waiters`, once it has registered.
+    slot: Option<Rc<WaitSlot>>,
+}
+
+impl Future for NodeWait<'_> {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let queues = self.queues;
+        let mut q = queues.nodes[self.node].borrow_mut();
+        if queues.closed.get() || !q.requests.is_empty() {
+            if let Some(slot) = self.slot.take() {
+                slot.live.set(false);
+            }
+            return Poll::Ready(());
+        }
+        if let Some(slot) = &self.slot
+            && slot.live.get()
+        {
+            let mut waker = slot.waker.borrow_mut();
+            if !waker.will_wake(cx.waker()) {
+                waker.clone_from(cx.waker());
+            }
+            return Poll::Pending;
+        }
+        if q.waiters.len() >= q.waiters_cap {
+            q.waiters.retain(|w| w.live.get());
+        }
+        let slot = Rc::new(WaitSlot {
+            live: Cell::new(true),
+            waker: RefCell::new(cx.waker().clone()),
+        });
+        q.waiters.push_back(Rc::clone(&slot));
+        drop(q);
+        self.slot = Some(slot);
+        Poll::Pending
+    }
+}
+
+impl Drop for NodeWait<'_> {
+    fn drop(&mut self) {
+        if let Some(slot) = &self.slot {
+            slot.live.set(false);
+        }
+    }
 }
 
 /// One worker's routed requests, one queue per node. Worker-local, like
@@ -631,6 +692,8 @@ impl RoutedQueues {
                         .saturating_mul(pipeline_depth)
                         .saturating_mul(ROUTED_QUEUE_PIPELINES),
                     waiters: VecDeque::new(),
+                    // Each connection has at most one live entry.
+                    waiters_cap: c.saturating_mul(2).saturating_add(16),
                 })
             })
             .collect();
@@ -649,8 +712,11 @@ impl RoutedQueues {
             return false;
         }
         q.requests.push_back(request);
-        if let Some(w) = q.waiters.pop_front() {
-            w.wake();
+        while let Some(w) = q.waiters.pop_front() {
+            if w.live.replace(false) {
+                w.waker.borrow().wake_by_ref();
+                break;
+            }
         }
         true
     }
@@ -664,28 +730,25 @@ impl RoutedQueues {
     /// from `close`, which the dispatcher calls when the run stops.
     ///
     /// A waiting task can be polled without a push, for example when its
-    /// request-timeout timer fires. It keeps a single entry in `waiters`, and
-    /// the entry is removed when the wait returns, so a push never spends its
-    /// wake on a task that is no longer waiting.
-    fn wait(&self, node: usize) -> impl Future<Output = ()> + '_ {
-        std::future::poll_fn(move |cx| {
-            let mut q = self.nodes[node].borrow_mut();
-            if self.closed.get() || !q.requests.is_empty() {
-                q.waiters.retain(|w| !w.will_wake(cx.waker()));
-                return Poll::Ready(());
-            }
-            if !q.waiters.iter().any(|w| w.will_wake(cx.waker())) {
-                q.waiters.push_back(cx.waker().clone());
-            }
-            Poll::Pending
-        })
+    /// request-timeout timer fires or a reply arrives. The wait keeps a single
+    /// entry in `waiters`, and the entry is dead once the wait returns or is
+    /// dropped, so a push never spends its wake on a task that is no longer
+    /// waiting.
+    fn wait(&self, node: usize) -> NodeWait<'_> {
+        NodeWait {
+            queues: self,
+            node,
+            slot: None,
+        }
     }
 
     fn close(&self) {
         self.closed.set(true);
         for node in &self.nodes {
             for w in node.borrow_mut().waiters.drain(..) {
-                w.wake();
+                if w.live.replace(false) {
+                    w.waker.borrow().wake_by_ref();
+                }
             }
         }
     }
@@ -799,6 +862,26 @@ fn record_routed_latency(result: &RequestResult, queued_ns: u64) {
     let _ = metrics::RESPONSE_LATENCY.increment(latency);
     let _ = metrics::PERCEIVED_LATENCY
         .increment(latency.saturating_add(metrics::CURRENT_SLIP_NS.value() as u64));
+}
+
+/// For a routed connection with a reply pending, wait until a request is
+/// queued for its node or the reply starts arriving. Returns true for a
+/// queued request, which the caller sends before it receives. Bounded by the
+/// connection's request timeout, like the recv that follows.
+///
+/// The queue is polled first, so when both are ready the request is sent
+/// first, and a push's wake is not spent on a wait that then returns for the
+/// reply.
+async fn routed_wait_send_or_recv(
+    queues: &RoutedQueues,
+    node: usize,
+    ready: ringline::RecvReadyFuture,
+    inflight: &mut InFlight,
+    conn: ConnCtx,
+) -> Result<bool, DisconnectReason> {
+    let woke =
+        recv_with_timeout(ringline::select(queues.wait(node), ready), inflight, conn).await?;
+    Ok(matches!(woke, ringline::Either::Left(())))
 }
 
 /// Borrow a random `value_len`-byte slice of the value pool, for the
@@ -2193,6 +2276,28 @@ async fn drive_resp_workload(
             continue;
         }
 
+        // Routed, with room for a batch: send requests queued while this
+        // reply is pending instead of leaving them queued until it arrives.
+        if let Some(ref queues) = routed
+            && (phase == Phase::Warmup || phase == Phase::Running)
+            && !send_failed
+            && pipeline_depth.saturating_sub(client.pending_count()) >= batch_size
+            && let Ok(ready) = client.recv_ready()
+        {
+            match routed_wait_send_or_recv(queues, endpoint_idx, ready, &mut inflight, conn).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(reason) => {
+                    requeue_drained_prefill(
+                        &state.task_state,
+                        key_buf,
+                        prefill_in_flight.drain(..),
+                    );
+                    return Err(reason);
+                }
+            }
+        }
+
         // By default, zero-copy recv for every reply, every op kind and phase
         // (prefill SETs included): only the header (kind / hit-miss / length /
         // error) is used, so `recv_meta` drains each value without
@@ -2581,6 +2686,13 @@ impl McClient {
         match self {
             McClient::Ascii(c, _) => c.pending_count(),
             McClient::Binary(c, _) => c.pending_count(),
+        }
+    }
+
+    fn recv_ready(&mut self) -> Result<ringline::RecvReadyFuture, ringline_memcache::Error> {
+        match self {
+            McClient::Ascii(c, _) => c.recv_ready(),
+            McClient::Binary(c, _) => c.recv_ready(),
         }
     }
 
@@ -3118,6 +3230,26 @@ async fn drive_memcache_workload(
         }
 
         let conn = client.conn();
+        // Routed, with room for a batch: see the RESP recv loop.
+        if let Some(ref queues) = routed
+            && (phase == Phase::Warmup || phase == Phase::Running)
+            && !send_failed
+            && pipeline_depth.saturating_sub(client.pending_count()) >= batch_size
+            && let Ok(ready) = client.recv_ready()
+        {
+            match routed_wait_send_or_recv(queues, endpoint_idx, ready, &mut inflight, conn).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(reason) => {
+                    requeue_drained_prefill(
+                        &state.task_state,
+                        key_buf,
+                        prefill_in_flight.drain(..),
+                    );
+                    return Err(reason);
+                }
+            }
+        }
         let op = match recv_with_timeout(client.recv(), &mut inflight, conn).await {
             Ok(Ok(op)) => op,
             Ok(Err(ringline_memcache::Error::ConnectionClosed)) => {
@@ -4502,6 +4634,49 @@ mod routed_tests {
         q.push(0, request(0));
         q.push(0, request(1));
         assert_eq!((woken(&a_wakes), woken(&b_wakes)), (1, 1));
+    }
+
+    #[test]
+    fn a_dropped_wait_does_not_take_a_push() {
+        let q = RoutedQueues::new(&[2], 2);
+        let (a_wakes, a) = task();
+        let (b_wakes, b) = task();
+        let mut wait_a = Box::pin(q.wait(0));
+        let mut wait_b = Box::pin(q.wait(0));
+        assert!(
+            wait_a
+                .as_mut()
+                .poll(&mut Context::from_waker(&a))
+                .is_pending()
+        );
+        assert!(
+            wait_b
+                .as_mut()
+                .poll(&mut Context::from_waker(&b))
+                .is_pending()
+        );
+        // `a`'s reply started arriving first, so its wait was dropped.
+        drop(wait_a);
+        q.push(0, request(0));
+        assert_eq!((woken(&a_wakes), woken(&b_wakes)), (0, 1));
+    }
+
+    #[test]
+    fn dropped_waits_do_not_grow_the_waiter_list() {
+        let q = RoutedQueues::new(&[2], 1);
+        let (_, a) = task();
+        let mut cx = Context::from_waker(&a);
+        for _ in 0..1000 {
+            let mut wait = Box::pin(q.wait(0));
+            assert!(wait.as_mut().poll(&mut cx).is_pending());
+        }
+        let node = q.nodes[0].borrow();
+        assert!(
+            node.waiters.len() <= node.waiters_cap,
+            "{} entries for a cap of {}",
+            node.waiters.len(),
+            node.waiters_cap
+        );
     }
 
     #[test]

@@ -495,13 +495,66 @@ return). With hundreds of idle connections to one node per worker that scan
 is a per-request cost that grows with the connection count. If it measures
 badly, a per-task registered flag makes both checks O(1).
 
+## 2026-10-20: sending while a reply is pending
+
+ringline #682 (merged as ab81ceb) added `Client::recv_ready` to
+ringline-redis and ringline-memcache: it flushes, then returns a future that
+resolves when the next reply starts arriving and borrows nothing from the
+client. Using it needed the ringline pin moved from dfff2e5 to ab81ceb, which
+brought three breaking changes and went up as its own change
+(`timestamps.mode = "software"` rejected, `get_ttfb` from the arrival log,
+timer slots fixed at 65,536 per worker).
+
+In both routed recv loops (`drive_resp_workload`, `drive_memcache_workload`),
+a connection with replies pending and room for a batch now waits on
+`ringline::select(queues.wait(node), client.recv_ready())`, inside the
+request-timeout bound (`routed_wait_send_or_recv`). A queued request wins
+and is sent; a reply wins and is received. `select` polls the queue first,
+so a push's wake is not spent on a wait that then returns for the reply.
+
+The wait is dropped whenever the reply wins, so the waiter list could no
+longer rely on entries being removed when a wait returns. Each wait now
+registers an `Rc<WaitSlot>` with a `live` flag; dropping or completing the
+wait clears it, `push` skips dead entries, and the list is compacted to its
+live entries at `2 x connections + 16`. That also makes the re-poll check
+O(1), which answers the scan cost recorded above. A unit test drops a
+registered wait and checks the next push reaches the other connection; with
+the `Drop` made a no-op it fails, as does the compaction test.
+
+The batch gate is unchanged, and it decides everything. `batch_size`
+defaults to `pipeline_depth`, so by default a connection with anything in
+flight has no room for a batch and never reaches the new wait. Measured
+(macOS, mio, one connection, pipeline 4, 200 req/s, a stub answering each
+GET 12 ms after it arrived, so about 2.4 requests in flight):
+
+| batch_size | `routed_queue_wait` p50 |
+|---|---|
+| 1, RESP | 21 µs |
+| 1, memcache | 26 µs |
+| 4 (default), RESP | 6.6 ms |
+| 1, RESP, new wait disabled | 6.5 ms |
+| 1, memcache, new wait disabled | 6.8 ms |
+
+One run each. The first stub tried was the serial one the queue-wait tests
+use (4 ms per GET, one at a time) at 200 req/s, and the default-batch
+control read 18.8 µs where I predicted over 1 ms: the limiter spaces requests
+5 ms apart, so each reply finished before the next request was funded and
+the connection was rarely busy when one was queued. The stub that answers
+from arrival keeps replies overlapping.
+
+Not measured: the same comparison on io_uring and against a real server,
+and client CPU per request with the new wait, which polls one more future
+and registers one waiter per reply.
+
 ## Open questions for the owner
 
 - Routed latency includes the wait above. Options: document it and size
   connections per node so the wait stays small (what step 2 does now), or
   change the ringline clients so a connection can wait on a reply and on its
   node queue at once (a `recv` that does not pop the pending operation until
-  the reply is complete, or a split send and receive half).
+  the reply is complete, or a split send and receive half). The second is
+  built for `batch_size` below `pipeline_depth` (2026-10-20 above). Open:
+  whether routed should ignore the batch gate by default.
 
 - When a node is added, should total connections grow with the node count or
   stay fixed? In the routed model a fixed total stops meeting threads × nodes

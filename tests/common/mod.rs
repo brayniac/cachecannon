@@ -447,18 +447,73 @@ pub fn spawn_get_counter(
     protocol: &str,
     delay: Duration,
 ) -> (SocketAddr, Arc<std::sync::atomic::AtomicU64>) {
+    spawn_paced(protocol, Pace::Serial(delay))
+}
+
+/// How a counting server times its GET replies.
+#[derive(Clone, Copy)]
+pub enum Pace {
+    /// Each GET takes this long, one at a time.
+    Serial(Duration),
+    /// Each GET's reply is written this long after the GET was read, however
+    /// many are in flight. Replies keep their order.
+    FromArrival(Duration),
+}
+
+/// A server like [`spawn_get_counter`]'s, with GET replies timed by `pace`.
+pub fn spawn_paced(protocol: &str, pace: Pace) -> (SocketAddr, Arc<std::sync::atomic::AtomicU64>) {
     let gets = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let counted = Arc::clone(&gets);
     let addr = match protocol {
-        "resp" => spawn(move |stream| count_resp(stream, &counted, delay)),
-        "memcache" => spawn(move |stream| count_memcache(stream, &counted, delay)),
+        "resp" => spawn(move |stream| count_resp(stream, &counted, pace)),
+        "memcache" => spawn(move |stream| count_memcache(stream, &counted, pace)),
         _ => unreachable!(),
     };
     (addr, gets)
 }
 
-fn count_resp(stream: TcpStream, gets: &std::sync::atomic::AtomicU64, delay: Duration) {
-    let mut writer = stream.try_clone().unwrap();
+/// Writes a counting server's replies in order, timed by its [`Pace`].
+enum Replies {
+    Serial(TcpStream),
+    /// Replies with the time to write each, for a writer thread.
+    FromArrival(std::sync::mpsc::Sender<(std::time::Instant, &'static [u8])>),
+}
+
+impl Replies {
+    fn new(stream: &TcpStream, pace: Pace) -> Self {
+        let mut writer = stream.try_clone().unwrap();
+        match pace {
+            Pace::Serial(_) => Replies::Serial(writer),
+            Pace::FromArrival(_) => {
+                let (tx, rx) = std::sync::mpsc::channel::<(std::time::Instant, &'static [u8])>();
+                std::thread::spawn(move || {
+                    for (at, reply) in rx {
+                        std::thread::sleep(at.saturating_duration_since(std::time::Instant::now()));
+                        if writer.write_all(reply).is_err() {
+                            return;
+                        }
+                    }
+                });
+                Replies::FromArrival(tx)
+            }
+        }
+    }
+
+    /// Write `reply` after `delay`. False once the client has gone.
+    fn send(&mut self, reply: &'static [u8], delay: Duration) -> bool {
+        match self {
+            Replies::Serial(writer) => {
+                std::thread::sleep(delay);
+                writer.write_all(reply).is_ok()
+            }
+            Replies::FromArrival(tx) => tx.send((std::time::Instant::now() + delay, reply)).is_ok(),
+        }
+    }
+}
+
+fn count_resp(stream: TcpStream, gets: &std::sync::atomic::AtomicU64, pace: Pace) {
+    let (Pace::Serial(delay) | Pace::FromArrival(delay)) = pace;
+    let mut replies = Replies::new(&stream, pace);
     let mut reader = BufReader::new(stream);
     while let Some(header) = read_line(&mut reader) {
         let n: usize = std::str::from_utf8(&header[1..]).unwrap().parse().unwrap();
@@ -476,35 +531,34 @@ fn count_resp(stream: TcpStream, gets: &std::sync::atomic::AtomicU64, delay: Dur
                 command = arg.to_ascii_uppercase();
             }
         }
-        let reply: &[u8] = match command.as_slice() {
+        let sent = match command.as_slice() {
             b"GET" => {
                 gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                std::thread::sleep(delay);
-                b"$-1\r\n"
+                replies.send(b"$-1\r\n", delay)
             }
-            b"PING" => b"+PONG\r\n",
-            _ => b"+OK\r\n",
+            b"PING" => replies.send(b"+PONG\r\n", Duration::ZERO),
+            _ => replies.send(b"+OK\r\n", Duration::ZERO),
         };
-        if writer.write_all(reply).is_err() {
+        if !sent {
             return;
         }
     }
 }
 
-fn count_memcache(stream: TcpStream, gets: &std::sync::atomic::AtomicU64, delay: Duration) {
-    let mut writer = stream.try_clone().unwrap();
+fn count_memcache(stream: TcpStream, gets: &std::sync::atomic::AtomicU64, pace: Pace) {
+    let (Pace::Serial(delay) | Pace::FromArrival(delay)) = pace;
+    let mut replies = Replies::new(&stream, pace);
     let mut reader = BufReader::new(stream);
     while let Some(line) = read_line(&mut reader) {
-        let reply: &[u8] = match line.split(|b| *b == b' ').next().unwrap() {
+        let sent = match line.split(|b| *b == b' ').next().unwrap() {
             b"get" => {
                 gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                std::thread::sleep(delay);
-                b"END\r\n"
+                replies.send(b"END\r\n", delay)
             }
-            b"version" => b"VERSION 1.0\r\n",
-            _ => b"ERROR\r\n",
+            b"version" => replies.send(b"VERSION 1.0\r\n", Duration::ZERO),
+            _ => replies.send(b"ERROR\r\n", Duration::ZERO),
         };
-        if writer.write_all(reply).is_err() {
+        if !sent {
             return;
         }
     }
@@ -517,6 +571,8 @@ pub struct Routed<'a> {
     pub threads: usize,
     pub connections: usize,
     pub pipeline: usize,
+    /// `[connection] batch_size`; `None` leaves it at `pipeline`.
+    pub batch: Option<usize>,
     pub rate: u64,
     pub duration: &'a str,
     /// `[workload] routing`.
@@ -547,6 +603,7 @@ pub fn run_routed(shape: &Routed) {
         [connection]
         connections = {connections}
         pipeline_depth = {pipeline}
+        {batch}
 
         [workload]
         rate_limit = {rate}
@@ -567,6 +624,9 @@ pub fn run_routed(shape: &Routed) {
         protocol = shape.protocol,
         connections = shape.connections,
         pipeline = shape.pipeline,
+        batch = shape
+            .batch
+            .map_or(String::new(), |b| format!("batch_size = {b}")),
         rate = shape.rate,
         routing = shape.routing,
         keyspace = shape.keyspace,
@@ -632,6 +692,7 @@ pub fn assert_routed_key_share(protocol: &str) {
         threads: 2,
         connections: 24,
         pipeline: 8,
+        batch: None,
         rate: RATE,
         duration: &format!("{SECONDS}s"),
         routing: "routed",
@@ -690,6 +751,7 @@ pub fn assert_routed_queue_wait(protocol: &str) {
         threads: 1,
         connections: 1,
         pipeline: 1,
+        batch: None,
         rate: 2000,
         duration: "2s",
         routing: "routed",
@@ -710,4 +772,27 @@ pub fn assert_routed_queue_wait(protocol: &str) {
         latency >= wait,
         "response latency (p50 {latency} ns) includes the queue wait (p50 {wait} ns)"
     );
+}
+
+/// Run routed with one connection of pipeline 4 at 200 requests a second
+/// against a server that answers each GET 12 ms after it arrives, and return
+/// the p50 of `routed_queue_wait`. About 2.4 requests are in flight, so the
+/// connection usually has a reply pending when a request is queued. With room
+/// for a batch it sends the request at once; without, the request waits for
+/// the replies.
+pub fn routed_queue_wait_with_a_reply_pending(protocol: &str, batch: Option<usize>) -> u64 {
+    let (addr, _) = spawn_paced(protocol, Pace::FromArrival(Duration::from_millis(12)));
+    run_routed(&Routed {
+        protocol,
+        endpoints: &[addr],
+        threads: 1,
+        connections: 1,
+        pipeline: 4,
+        batch,
+        rate: 200,
+        duration: "2s",
+        routing: "routed",
+        keyspace: "count = 1000",
+    });
+    p50_ns(&cachecannon::metrics::ROUTED_QUEUE_WAIT)
 }
