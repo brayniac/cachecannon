@@ -112,6 +112,13 @@ connections = 16
 # Typical values: 1 (no pipelining), 32 (high throughput)
 pipeline_depth = 32
 
+# Most requests coalesced into one send, and the free pipeline room a
+# connection needs before it takes more. Defaults to pipeline_depth, clamped to
+# [1, pipeline_depth]. With workload.routing = "routed", a value below
+# pipeline_depth lets a connection with replies pending send newly queued
+# requests.
+# batch_size = 32
+
 # Connection establishment timeout. Bounds each connect attempt (including
 # reconnects mid-run) and doubles as the precheck deadline. "0s" = unbounded.
 connect_timeout = "5s"

@@ -552,8 +552,9 @@ and registers one waiter per reply.
   connections per node so the wait stays small (what step 2 does now), or
   change the ringline clients so a connection can wait on a reply and on its
   node queue at once (a `recv` that does not pop the pending operation until
-  the reply is complete, or a split send and receive half). The second is
-  built for `batch_size` below `pipeline_depth` (2026-10-20 above). Open:
+  the reply is complete, or a split send and receive half). The second option
+  is built, as `Client::recv_ready` rather than either mechanism named, for
+  `batch_size` below `pipeline_depth` (2026-10-20 above). Open:
   whether routed should ignore the batch gate by default.
 
 - When a node is added, should total connections grow with the node count or

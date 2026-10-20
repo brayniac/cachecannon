@@ -602,8 +602,8 @@ struct NodeQueue {
     requests: VecDeque<RoutedRequest>,
     cap: usize,
     /// Connection tasks for this node waiting for a request, longest-waiting
-    /// first. An entry whose wait has returned or been dropped is dead and is
-    /// skipped by `push`.
+    /// first. An entry whose wait has returned or been dropped, or that `push`
+    /// woke, is dead and is skipped by `push`.
     waiters: VecDeque<Rc<WaitSlot>>,
     /// `waiters` is compacted to its live entries when it reaches this length.
     waiters_cap: usize,
@@ -703,8 +703,8 @@ impl RoutedQueues {
         }
     }
 
-    /// Queue `request` for `node` and wake the idle connection to it that has
-    /// waited longest, so load spreads over every connection. Returns false,
+    /// Queue `request` for `node` and wake the connection waiting on it that
+    /// has waited longest, so load spreads over every connection. Returns false,
     /// leaving the queue unchanged, when the queue is full.
     fn push(&self, node: usize, request: RoutedRequest) -> bool {
         let mut q = self.nodes[node].borrow_mut();
@@ -865,9 +865,10 @@ fn record_routed_latency(result: &RequestResult, queued_ns: u64) {
 }
 
 /// For a routed connection with a reply pending, wait until a request is
-/// queued for its node or the reply starts arriving. Returns true for a
-/// queued request, which the caller sends before it receives. Bounded by the
-/// connection's request timeout, like the recv that follows.
+/// queued for its node or the reply starts arriving. Returns true when a
+/// request is queued for the node or the dispatcher has stopped; the caller
+/// loops to send it or to exit. Bounded by the connection's request timeout,
+/// like the recv that follows.
 ///
 /// The queue is polled first, so when both are ready the request is sent
 /// first, and a push's wake is not spent on a wait that then returns for the
@@ -4558,7 +4559,7 @@ mod routed_tests {
     }
 
     #[test]
-    fn a_waiter_polled_again_keeps_one_entry_and_drops_it_on_return() {
+    fn a_waiter_polled_again_is_woken_once_and_does_not_take_the_next_push() {
         let q = RoutedQueues::new(&[2], 1);
         let (a_wakes, a) = task();
         let (b_wakes, b) = task();
@@ -4587,7 +4588,7 @@ mod routed_tests {
     }
 
     #[test]
-    fn a_waiter_that_returns_without_its_own_wake_leaves_no_entry() {
+    fn a_waiter_that_returns_without_its_own_wake_does_not_take_the_next_push() {
         let q = RoutedQueues::new(&[2], 1);
         let (a_wakes, a) = task();
         let (b_wakes, b) = task();
