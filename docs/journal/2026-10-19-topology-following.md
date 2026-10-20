@@ -524,8 +524,9 @@ the `Drop` made a no-op it fails, as does the compaction test.
 The batch gate is unchanged and decides whether a connection reaches the new
 wait. In f140eb9 `batch_size` defaulted to `pipeline_depth`, so by default a
 connection with anything in flight had no room for a batch and never reached
-the new wait (the routed default is 1 since ed7363c; see below). Measured (macOS, mio, one connection, pipeline 4, 200 req/s, a stub
-answering each GET 12 ms after it arrived, so about 2.4 requests in flight):
+the new wait (the routed default is 1 since ed7363c; see below). Measured
+(macOS, mio, one connection, pipeline 4, 200 req/s, a stub answering each GET
+12 ms after it arrived, so about 2.4 requests in flight):
 
 | batch_size | `routed_queue_wait` p50 |
 |---|---|
@@ -596,12 +597,13 @@ pipeline full: ed7363c makes an unset `batch_size` 1 in routed mode
 pinned mode is unchanged. Routed was unreleased, so no released config
 changes behaviour.
 
-The cost, measured before deciding to keep it (SystemsLab 01a15a54,
-ed7363c, release build, thin LTO): one client worker, four valkey 8.1.1
-instances on loopback, one connection per node, routed, offered 2,000,000
-req/s so the client runs flat out; 15 s after 3 s warmup, five rounds. The
-client process used 18.26-18.30 s of CPU per 18.6 s run (one worker busy),
-and every valkey instance 0.23-0.31 cores, so the client was the limit.
+The cost, measured before deciding to keep it (SystemsLab 01a15a54, ed7363c,
+release build, thin LTO): one client worker, four valkey 8.1.1 instances on
+loopback, one connection per node, routed, offered 2,000,000 req/s so the
+client runs flat out; 15 s after 3 s warmup, five rounds. The client process
+used 18.25-18.30 s of CPU per run of 15 s plus 3 s warmup, about 18.6 s
+between results (one worker busy), and every valkey instance 0.23-0.31 cores,
+so the client was the limit.
 
 | pipeline | batch 1 req/s | batch = pipeline req/s |
 |---|---|---|
@@ -628,9 +630,19 @@ first. 0303b64 is reverted (a1f20d5). The default stays at 1 and the guide
 states the cost; a user short of generator capacity adds threads or sets
 `batch_size = pipeline_depth`.
 
-Not measured: CPU per request below saturation at a rate the generator
-keeps up with, where the cost would show as CPU rather than throughput; and
-batch sizes between 1 and the pipeline depth.
+Below saturation the cost is unresolved: in the valkey table of the previous
+section (50k req/s, 6 connections, pipeline 8) B at batch 1 used about 1 s
+more client CPU per 25 s run than B at batch 8, within the spread of three
+rounds. Not measured: batch sizes between 1 and the pipeline depth.
+
+Side effects of the routed default, read from the code and not measured: the
+limiter claim is now one request, so `slip_ns` subtracts one token instead of
+a pipeline's worth, and `schedule_slip` and perceived latency count tokens
+they ignored before (matching the dispatcher, which takes one token per
+request); a routed prefill sends one SET per send; a batch of 1 sizes the send
+pool for one send per request, so a run with 8 threads, 8192 connections and
+pipeline 32 reaches the u16 send-pool cap and warns, where pinned needs 2064
+slots.
 
 ## Open questions for the owner
 
@@ -640,8 +652,7 @@ batch sizes between 1 and the pipeline depth.
   node queue at once (a `recv` that does not pop the pending operation until
   the reply is complete, or a split send and receive half). The second option
   is built, as `Client::recv_ready` rather than either mechanism named, for
-  `batch_size` below `pipeline_depth` (2026-10-20 above). Answered
-  2026-10-20: routed `batch_size` defaults to 1 (below).
+  `batch_size` below `pipeline_depth` (2026-10-20 above). Answered 2026-10-20: routed `batch_size` defaults to 1 (above).
 
 - When a node is added, should total connections grow with the node count or
   stay fixed? In the routed model a fixed total stops meeting threads × nodes

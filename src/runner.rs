@@ -1726,7 +1726,8 @@ fn check_send_pool(loads: &[SendLoad], num_threads: usize) -> Result<Option<Stri
         "the send pool needs {demand} slots per worker and ringline allows {max}, so it is \
          capped: sends that do not fit fail and are counted in requests_send_failed \
          (kv_replay lookups also in kv_requests_failed). Inputs: {}. More threads, fewer \
-         connections, a smaller pipeline_depth or shorter requests lower it",
+         connections, a smaller pipeline_depth, a larger batch_size or shorter requests \
+         lower it",
         inputs.join("; ")
     )))
 }
