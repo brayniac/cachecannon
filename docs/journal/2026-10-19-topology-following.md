@@ -631,9 +631,12 @@ states the cost; a user short of generator capacity adds threads or sets
 `batch_size = pipeline_depth`.
 
 Below saturation the cost is unresolved: in the valkey table of the previous
-section (50k req/s, 6 connections, pipeline 8) B at batch 1 used about 1 s
-more client CPU per 25 s run than B at batch 8, within the spread of three
-rounds. Not measured: batch sizes between 1 and the pipeline depth.
+section (50k req/s, 6 connections, pipeline 8) B at batch 1 used more client
+CPU than B at batch 8 in every round (+1.5, +0.7, +1.0 s per 25 s run), but B1
+ran first and B8 third in every round, and the arm means fall roughly with
+position (38.4, 38.0, 37.4, 37.6 s), so three rounds do not separate batch
+size from run order. Not measured: batch sizes between 1 and the pipeline
+depth.
 
 Side effects of the routed default, read from the code and not measured: the
 limiter claim is now one request, so `slip_ns` subtracts one token instead of
@@ -652,7 +655,8 @@ slots.
   node queue at once (a `recv` that does not pop the pending operation until
   the reply is complete, or a split send and receive half). The second option
   is built, as `Client::recv_ready` rather than either mechanism named, for
-  `batch_size` below `pipeline_depth` (2026-10-20 above). Answered 2026-10-20: routed `batch_size` defaults to 1 (above).
+  `batch_size` below `pipeline_depth` (2026-10-20 above). Answered 2026-10-20:
+  routed `batch_size` defaults to 1 (above).
 
 - When a node is added, should total connections grow with the node count or
   stay fixed? In the routed model a fixed total stops meeting threads × nodes

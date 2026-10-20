@@ -23,11 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wait is mostly the generator's. Batch 1 costs generator capacity: in one
   loopback measurement (one worker, four nodes, one connection each) a
   saturated worker sent about 45% fewer requests than at `batch_size =
-  pipeline_depth`. With a claim of one request, `schedule_slip` and
-  perceived latency count every token beyond one, matching the dispatcher,
-  which takes one token per request. Needs a
-  rate limit, a RESP or memcache protocol, and at least `threads x nodes`
-  connections. The default, `"pinned"`, is the existing behaviour.
+  pipeline_depth`. At the routed default the limiter's claim is one
+  request, so `schedule_slip` and perceived latency count every request's
+  worth of tokens a worker holds beyond one, matching the dispatcher, which
+  takes one token per request. Needs a rate limit, a RESP or memcache
+  protocol, and at least `threads x nodes` connections. The default,
+  `"pinned"`, is the existing behaviour.
 - `target.auto_discovery` supports ElastiCache for Memcached auto discovery.
   Before the run, cachecannon sends `config get cluster` to the configured
   endpoints (falling back to `get AmazonElastiCache:cluster` on engines that

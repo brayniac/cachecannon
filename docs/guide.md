@@ -781,21 +781,22 @@ How a routed run works:
    flight has no room for a batch, so it sends nothing until its replies are
    in.
 
-   The default costs generator capacity: at saturation a connection that
-   keeps its pipeline full sends about one request per reply instead of a
-   pipeline's worth per send. In one loopback measurement (one saturated
-   worker, four valkey nodes, one connection per node, five rounds each)
-   batch 1 sent about 45% fewer requests than `batch_size = pipeline_depth`:
-   141k against 257k req/s at pipeline 8, 394k against 734k at pipeline 32.
-   Below saturation the cost has not been resolved: at 50k req/s
-   (6 connections, pipeline 8) batch 1 used about 1 s more client CPU per
-   25 s run than batch 8, within the run-to-run spread. A routed prefill
-   also sends one SET per send, so a prefill limited by the generator takes
-   longer, and a routed saturation search limited by the generator finds a
-   lower knee. If a run is short of generator capacity, add threads, or set
-   `batch_size = pipeline_depth` and accept the queue wait in step 3. A
-   batch of 1 also sizes the send pool for one send per request, so a large
-   routed run can reach the send-pool cap that the startup warning names.
+   The default costs generator capacity: at saturation a connection that keeps
+   its pipeline full sends about one request per reply instead of a pipeline's
+   worth per send. In one loopback measurement (one saturated worker, four
+   valkey nodes, one connection per node, five rounds each) batch 1 sent about
+   45% fewer requests than `batch_size = pipeline_depth`: 141k against 257k
+   req/s at pipeline 8, 394k against 734k at pipeline 32. Below saturation the
+   cost has not been resolved: at 50k req/s (6 connections, pipeline 8) batch
+   1 used 0.7-1.5 s more client CPU per 25 s run than batch 8 in each of three
+   rounds, but batch 1 ran first in every round, so the difference is not
+   separated from run order. A routed prefill also sends one SET per send, so
+   a prefill limited by the generator takes longer, and a routed saturation
+   search limited by the generator finds a lower knee. If a run is short of
+   generator capacity, add threads, or set `batch_size = pipeline_depth` and
+   accept the queue wait in step 3. A batch of 1 also sizes the send pool for
+   one send per request, so a large routed run can reach the send-pool cap
+   that the startup warning names.
 3. Latency is measured from the moment the dispatcher funded the request. It
    includes the time the request waited for a connection to its node to take
    it: the node answering slowly, and every one of this worker's connections
@@ -803,11 +804,10 @@ How a routed run works:
    `routed_queue_wait`, recorded when the request is sent (including requests
    a failed send then discards). With few connections per node, that wait is
    mostly the generator's. With `batch_size` at `pipeline_depth`, once this
-   worker's connections to the node can carry the rate, a deeper pipeline
-   does not bring the wait below about one reply time; more connections per
-   node do. Keep `routed_queue_wait` small
-   next to the latency you are measuring, or the result describes the
-   generator as much as the server.
+   worker's connections to the node can carry the rate, a deeper pipeline does
+   not bring the wait below about one reply time; more connections per node
+   do. Keep `routed_queue_wait` small next to the latency you are measuring,
+   or the result describes the generator as much as the server.
 4. Requests routed to a node whose connections on a worker are all
    reconnecting stay in the queue until it fills, and count the reconnect time
    as latency.
