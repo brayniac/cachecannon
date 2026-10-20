@@ -128,7 +128,7 @@ pub fn run_benchmark_full(
         Some(Arc::new(WorkerLimiters::new(
             initial_rate,
             &conns,
-            config.effective_batch_size() as u64,
+            config.coalesce_batch_size() as u64,
         )))
     } else {
         None
@@ -142,7 +142,7 @@ pub fn run_benchmark_full(
     }
     let prefill_ratelimiter = match config.workload.prefill_rate_limit {
         Some(rate) if rate > 0 && config.workload.prefill => Some(Arc::new(
-            crate::limiters::PrefillPacer::new(rate, config.effective_batch_size() as u64),
+            crate::limiters::PrefillPacer::new(rate, config.coalesce_batch_size() as u64),
         )),
         _ => None,
     };

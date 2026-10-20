@@ -1334,11 +1334,11 @@ impl Config {
 }
 
 impl Config {
-    /// The fire_* coalesce threshold, which is also the pipeline room a
-    /// connection needs before it sends: `connection.batch_size`, clamped to
-    /// `[1, pipeline_depth]`. Unset, it is `pipeline_depth`, except with
-    /// `workload.routing = "routed"`, where it is 1, so a connection sends a
-    /// queued request whenever its pipeline has room.
+    /// The pipeline room a connection needs before it takes more requests:
+    /// `connection.batch_size`, clamped to `[1, pipeline_depth]`. Unset, it
+    /// is `pipeline_depth`, except with `workload.routing = "routed"`, where
+    /// it is 1, so a connection sends a queued request whenever its pipeline
+    /// has room.
     pub fn effective_batch_size(&self) -> usize {
         let depth = self.connection.pipeline_depth;
         let unset = if self.workload.routing == Routing::Routed {
@@ -1349,6 +1349,19 @@ impl Config {
         self.connection
             .batch_size
             .unwrap_or(unset)
+            .clamp(1, depth.max(1))
+    }
+
+    /// Most fire_* calls the client coalesces into one send:
+    /// `connection.batch_size`, clamped to `[1, pipeline_depth]`, or
+    /// `pipeline_depth` when unset, in either routing mode. The recv loops
+    /// flush after each round of fires, so a routed connection taking one
+    /// request still sends it at once.
+    pub fn coalesce_batch_size(&self) -> usize {
+        let depth = self.connection.pipeline_depth;
+        self.connection
+            .batch_size
+            .unwrap_or(depth)
             .clamp(1, depth.max(1))
     }
 
@@ -1989,6 +2002,22 @@ mod validation_tests {
             8,
             "clamped to the pipeline"
         );
+    }
+
+    #[test]
+    fn routed_coalesces_a_pipeline_unless_batch_size_is_set() {
+        let cfg = |routing: &str, batch: &str| {
+            parse_config(&format!(
+                "[target]\nendpoints = [\"127.0.0.1:6379\"]\n\
+                 [connection]\npipeline_depth = 8\n{batch}\n\
+                 [workload]\nrate_limit = 1000\nrouting = \"{routing}\"\n"
+            ))
+            .unwrap()
+            .coalesce_batch_size()
+        };
+        assert_eq!(cfg("routed", ""), 8);
+        assert_eq!(cfg("pinned", ""), 8);
+        assert_eq!(cfg("routed", "batch_size = 1"), 1);
     }
 
     #[test]
