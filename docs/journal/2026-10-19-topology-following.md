@@ -522,9 +522,9 @@ registered wait and checks the next push reaches the other connection; with
 the `Drop` made a no-op it fails, as does the compaction test.
 
 The batch gate is unchanged and decides whether a connection reaches the new
-wait. `batch_size` defaults to `pipeline_depth`, so by default a connection
-with anything in flight has no room for a batch and never reaches the new
-wait. Measured (macOS, mio, one connection, pipeline 4, 200 req/s, a stub
+wait. In f140eb9 `batch_size` defaulted to `pipeline_depth`, so by default a
+connection with anything in flight had no room for a batch and never reached
+the new wait (the routed default is 1 since ed7363c; see below). Measured (macOS, mio, one connection, pipeline 4, 200 req/s, a stub
 answering each GET 12 ms after it arrived, so about 2.4 requests in flight):
 
 | batch_size | `routed_queue_wait` p50 |
@@ -585,6 +585,53 @@ waiter list), differed by up to 0.61 s in one round. Three rounds do not
 resolve a difference of this size. I don't know whether the new wait costs
 CPU.
 
+## 2026-10-20: routed batch_size defaults to 1
+
+At the default `batch_size` (= `pipeline_depth`) a routed connection sends
+a burst only when nothing is in flight and then drains, and routed latency
+counts that drain as queue wait. A pipelining client sends whenever it has a
+request and room, so the owner decided the routed default should keep the
+pipeline full: ed7363c makes an unset `batch_size` 1 in routed mode
+(`Config::effective_batch_size`); an explicit value still applies, and
+pinned mode is unchanged. Routed was unreleased, so no released config
+changes behaviour.
+
+The cost, measured before deciding to keep it (SystemsLab 01a15a54,
+ed7363c, release build, thin LTO): one client worker, four valkey 8.1.1
+instances on loopback, one connection per node, routed, offered 2,000,000
+req/s so the client runs flat out; 15 s after 3 s warmup, five rounds. The
+client process used 18.26-18.30 s of CPU per 18.6 s run (one worker busy),
+and every valkey instance 0.23-0.31 cores, so the client was the limit.
+
+| pipeline | batch 1 req/s | batch = pipeline req/s |
+|---|---|---|
+| 8 | 139.7k-143.4k | 249.3k-268.6k |
+| 32 | 362.8k-423.1k | 676.4k-775.5k |
+
+Batch 1 sent about 45% fewer requests at both depths.
+
+I predicted the cost came from `batch_size` also setting the client's
+coalesce threshold, so that batch 1 flushed every request as its own send,
+and that keeping coalescing at the pipeline depth with a room of 1 would
+recover most of it (0303b64, `Config::coalesce_batch_size`). Refuted
+(01a15a5e, 0303b64, same shape, three arms with order rotating by round):
+
+| pipeline | unset (room 1, coalesce = depth), mean | batch 1, mean | batch = pipeline, mean |
+|---|---|---|---|
+| 8 | 142.6k (125.1k-150.8k) | 144.5k (132.3k-152.1k) | 256.0k (246.1k-266.1k) |
+| 32 | 399.2k (379.4k-414.8k) | 402.9k (385.1k-432.2k) | 730.8k (651.7k-780.8k) |
+
+At saturation each reply frees one pipeline slot, so a room of 1 sends one
+request per reply whatever the coalesce threshold; the batch-equal-pipeline
+arm sends a pipeline's worth per send because it waits for every reply
+first. 0303b64 is reverted (a1f20d5). The default stays at 1 and the guide
+states the cost; a user short of generator capacity adds threads or sets
+`batch_size = pipeline_depth`.
+
+Not measured: CPU per request below saturation at a rate the generator
+keeps up with, where the cost would show as CPU rather than throughput; and
+batch sizes between 1 and the pipeline depth.
+
 ## Open questions for the owner
 
 - Routed latency includes the wait above. Options: document it and size
@@ -593,8 +640,8 @@ CPU.
   node queue at once (a `recv` that does not pop the pending operation until
   the reply is complete, or a split send and receive half). The second option
   is built, as `Client::recv_ready` rather than either mechanism named, for
-  `batch_size` below `pipeline_depth` (2026-10-20 above). Open:
-  whether routed should ignore the batch gate by default.
+  `batch_size` below `pipeline_depth` (2026-10-20 above). Answered
+  2026-10-20: routed `batch_size` defaults to 1 (below).
 
 - When a node is added, should total connections grow with the node count or
   stay fixed? In the routed model a fixed total stops meeting threads × nodes

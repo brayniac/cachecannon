@@ -116,7 +116,8 @@ pipeline_depth = 32
 # connection needs before it takes more. Clamped to [1, pipeline_depth].
 # Defaults to pipeline_depth, or to 1 with workload.routing = "routed", so a
 # routed connection with replies pending sends a newly queued request
-# whenever its pipeline has room.
+# whenever its pipeline has room. Batch 1 sends about one request per reply,
+# which costs generator capacity; see the guide's routed section.
 # batch_size = 32
 
 # Connection establishment timeout. Bounds each connect attempt (including

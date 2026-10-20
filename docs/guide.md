@@ -780,6 +780,15 @@ How a routed run works:
    With `batch_size` set to `pipeline_depth`, a connection with anything in
    flight has no room for a batch, so it sends nothing until its replies are
    in.
+
+   The default costs generator capacity: a connection that keeps its
+   pipeline full sends about one request per reply instead of a pipeline's
+   worth per send. One saturated worker against four valkey nodes on
+   loopback sent about 45% fewer requests at batch 1 than at
+   `batch_size = pipeline_depth` (143k against 256k req/s at pipeline 8,
+   401k against 731k at pipeline 32). Below saturation the cost is CPU per
+   request. If a run is short of generator capacity, add threads, or set
+   `batch_size = pipeline_depth` and accept the queue wait in step 3.
 3. Latency is measured from the moment the dispatcher funded the request. It
    includes the time the request waited for a connection to its node to take
    it: the node answering slowly, and every one of this worker's connections

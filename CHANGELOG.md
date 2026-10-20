@@ -20,7 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   In routed mode `connection.batch_size` defaults to 1, so that is whenever
   the pipeline has room; with `batch_size` at `pipeline_depth` it sends
   nothing until its replies are in, and with few connections per node that
-  wait is mostly the generator's. Needs a
+  wait is mostly the generator's. Batch 1 costs generator capacity: a
+  saturated worker sent about 45% fewer requests than at `batch_size =
+  pipeline_depth`. Needs a
   rate limit, a RESP or memcache protocol, and at least `threads x nodes`
   connections. The default, `"pinned"`, is the existing behaviour.
 - `target.auto_discovery` supports ElastiCache for Memcached auto discovery.
