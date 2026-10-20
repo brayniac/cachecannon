@@ -546,18 +546,22 @@ On io_uring (SystemsLab 01a15a2b, Linux 6.12.63, 16 vCPU guest, branch at
 516dcb4), five repeats each: batch 1 read 5.8-6.4 µs (RESP) and 5.8-6.3 µs
 (memcache); the default-batch control 6.06-6.29 ms; with the new wait
 disabled the batch-1 tests failed at 6.16 ms and 5.96 ms. An earlier run
-(01a15a1e, f140eb9) read the control at 650 ms on Linux. The stub wrote each
-small reply with Nagle on while earlier replies were unacknowledged, and at
-the default batch the client sends nothing that carries an ACK, so each
-reply waited for a delayed ACK. 516dcb4 sets `TCP_NODELAY` on the stub, and
-the control fell to the 6 ms above, which is consistent with that
-explanation.
+(01a15a1e, f140eb9) read the control at 650 ms on Linux. I attribute it to
+Nagle plus delayed ACK: at the default batch the client sends nothing while
+replies are pending, so nothing carries an ACK. Evidence: with Nagle on, the
+batch-1 mutation in the same run, which does send between replies, read
+6.0 ms, and setting `TCP_NODELAY` on the stub (516dcb4) brought the control
+to 6 ms. One run each, no packet capture; the macOS control read 6.6 ms with
+Nagle on, which I have not explained. The control test now also asserts an
+upper bound of 50 ms, so a stub that falls back to Nagle fails it.
 
 Against valkey 8.1.1 on the same guest (three instances on loopback, routed,
 2 threads, 6 connections, pipeline 8, 50,000 req/s, 90% GET, 20 s after 5 s
-warmup, three interleaved rounds; A is 707a044 without the new wait, B is
-516dcb4; both release builds with thin LTO). Times in µs, one value per
-round; CPU is user+sys seconds for the whole 25 s process:
+warmup, three rounds each running B1, A1, B8, A8 in that order; A is 707a044
+without the new wait, B is 516dcb4; both release builds with thin LTO).
+Quantiles are from the final `/metrics` scrape, cumulative over warmup and
+run. Times in µs, one value per round; CPU is user+sys seconds for the whole
+25 s process:
 
 | arm | queue wait p50 | queue wait p99 | latency p50 | latency p99 | CPU |
 |---|---|---|---|---|---|
@@ -568,16 +572,16 @@ round; CPU is user+sys seconds for the whole 25 s process:
 
 Every arm delivered 50,000 req/s with no drops. At batch 8, A and B match
 within the round-to-round spread, as the unchanged gate predicts. At batch 1,
-B lowered response latency p50 by 10-14 µs and p99 by 31-87% against A, round
-by round. The queue-wait p50 is small in every arm because valkey on loopback
-answers in tens of microseconds; the effect is in the tail.
+B lowered response latency p50 by 10-14 µs, but queue-wait p50 by only 1-2 µs;
+the rest is in send-to-reply time, and I don't know why the new wait changed
+it. Queue-wait p99 fell 54-96% and response latency p99 31-87%, round by
+round.
 
-CPU does not resolve the cost of the new wait: the process used about 1.5
-cores in every arm, because ringline workers spin while tasks are runnable
-(see CLAUDE.md on per-worker CPU), and B at batch 1 read 38.4 s mean against
-38.0 s for A, within a spread of 1 s. A cost measurement needs a metric
-that is not pinned, such as achieved throughput at a fixed worker count
-near saturation.
+CPU was 37.0-38.6 s per 25 s run (about 0.75 core per worker) in every arm. B
+at batch 1 used 38.4 s mean against 38.0 s for A, and was higher in two of
+three rounds (+0.88, +0.53, -0.01 s). B and A at batch 8, which run the same
+code, differed by up to 0.61 s in one round. Three rounds do not resolve a
+difference of this size. I don't know whether the new wait costs CPU.
 
 ## Open questions for the owner
 
