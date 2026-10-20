@@ -542,9 +542,42 @@ control read 18.8 µs where I predicted over 1 ms: the limiter spaces requests
 the connection was rarely busy when one was queued. The stub that answers
 from arrival keeps replies overlapping.
 
-Not measured: the same comparison on io_uring and against a real server,
-and client CPU per request with the new wait, which polls one more future
-and registers one waiter per reply.
+On io_uring (SystemsLab 01a15a2b, Linux 6.12.63, 16 vCPU guest, branch at
+516dcb4), five repeats each: batch 1 read 5.8-6.4 µs (RESP) and 5.8-6.3 µs
+(memcache); the default-batch control 6.06-6.29 ms; with the new wait
+disabled the batch-1 tests failed at 6.16 ms and 5.96 ms. An earlier run
+(01a15a1e, f140eb9) read the control at 650 ms on Linux. The stub wrote each
+small reply with Nagle on while earlier replies were unacknowledged, and at
+the default batch the client sends nothing that carries an ACK, so each
+reply waited for a delayed ACK. 516dcb4 sets `TCP_NODELAY` on the stub, and
+the control fell to the 6 ms above, which is consistent with that
+explanation.
+
+Against valkey 8.1.1 on the same guest (three instances on loopback, routed,
+2 threads, 6 connections, pipeline 8, 50,000 req/s, 90% GET, 20 s after 5 s
+warmup, three interleaved rounds; A is 707a044 without the new wait, B is
+516dcb4; both release builds with thin LTO). Times in µs, one value per
+round; CPU is user+sys seconds for the whole 25 s process:
+
+| arm | queue wait p50 | queue wait p99 | latency p50 | latency p99 | CPU |
+|---|---|---|---|---|---|
+| B, batch 1 | 7.0, 7.1, 6.9 | 104, 122, 22 | 61, 62, 60 | 362, 397, 162 | 38.5, 38.2, 38.6 |
+| A, batch 1 | 8.5, 8.3, 9.1 | 293, 266, 614 | 73, 72, 74 | 578, 578, 1253 | 37.6, 37.7, 38.6 |
+| B, batch 8 | 8.6, 8.0, 7.9 | 295, 215, 201 | 73, 70, 70 | 602, 461, 477 | 37.0, 37.5, 37.6 |
+| A, batch 8 | 8.1, 8.3, 8.0 | 276, 182, 204 | 71, 71, 70 | 541, 391, 457 | 37.6, 37.6, 37.5 |
+
+Every arm delivered 50,000 req/s with no drops. At batch 8, A and B match
+within the round-to-round spread, as the unchanged gate predicts. At batch 1,
+B lowered response latency p50 by 10-14 µs and p99 by 31-87% against A, round
+by round. The queue-wait p50 is small in every arm because valkey on loopback
+answers in tens of microseconds; the effect is in the tail.
+
+CPU does not resolve the cost of the new wait: the process used about 1.5
+cores in every arm, because ringline workers spin while tasks are runnable
+(see CLAUDE.md on per-worker CPU), and B at batch 1 read 38.4 s mean against
+38.0 s for A, within a spread of 1 s. A cost measurement needs a metric
+that is not pinned, such as achieved throughput at a fixed worker count
+near saturation.
 
 ## Open questions for the owner
 
