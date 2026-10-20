@@ -578,7 +578,7 @@ pub struct Routed<'a> {
     pub threads: usize,
     pub connections: usize,
     pub pipeline: usize,
-    /// `[connection] batch_size`; `None` leaves it at `pipeline`.
+    /// `[connection] batch_size`; `None` leaves it unset.
     pub batch: Option<usize>,
     pub rate: u64,
     pub duration: &'a str,
@@ -785,8 +785,8 @@ pub fn assert_routed_queue_wait(protocol: &str) {
 /// against a server that answers each GET 12 ms after it arrives, and return
 /// the p50 of `routed_queue_wait`. About 2.4 requests are in flight, so the
 /// connection usually has a reply pending when a request is queued. With room
-/// for a batch it sends the request at once; without, the request waits for
-/// the replies.
+/// for a batch (`batch` unset, or 1) it sends the request at once; with
+/// `batch` at the pipeline depth, the request waits for the replies.
 pub fn routed_queue_wait_with_a_reply_pending(protocol: &str, batch: Option<usize>) -> u64 {
     let (addr, _) = spawn_paced(protocol, Pace::FromArrival(Duration::from_millis(12)));
     run_routed(&Routed {

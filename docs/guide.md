@@ -773,22 +773,23 @@ How a routed run works:
 1. Each worker runs a dispatcher. For each token the rate limiter grants, it
    draws a key, routes it, and queues the request for the owning node.
 2. A connection to that node takes queued requests when its pipeline has room
-   for a full batch (`connection.batch_size`, which defaults to
-   `pipeline_depth`). With replies pending and room for a batch, it sends a
-   request queued for its node as soon as one is, without waiting for the next
-   reply. A request queued while a reply is being read waits for that reply to
-   finish. At the default batch size a connection with anything in flight has
-   no room for a batch, so it sends nothing until its replies are in.
+   for a batch (`connection.batch_size`, which in routed mode defaults to 1).
+   With replies pending and room in its pipeline, it sends a request queued
+   for its node as soon as one is, without waiting for the next reply. A
+   request queued while a reply is being read waits for that reply to finish.
+   With `batch_size` set to `pipeline_depth`, a connection with anything in
+   flight has no room for a batch, so it sends nothing until its replies are
+   in.
 3. Latency is measured from the moment the dispatcher funded the request. It
    includes the time the request waited for a connection to its node to take
    it: the node answering slowly, and every one of this worker's connections
    to the node waiting on a reply. The waiting part alone is in
    `routed_queue_wait`, recorded when the request is sent (including requests
    a failed send then discards). With few connections per node, that wait is
-   mostly the generator's. At the default batch size, once this worker's
-   connections to the node can carry the rate, a deeper pipeline does not
-   bring the wait below about one reply time; more connections per node, or a
-   `batch_size` below `pipeline_depth`, do. Keep `routed_queue_wait` small
+   mostly the generator's. With `batch_size` at `pipeline_depth`, once this
+   worker's connections to the node can carry the rate, a deeper pipeline
+   does not bring the wait below about one reply time; more connections per
+   node do. Keep `routed_queue_wait` small
    next to the latency you are measuring, or the result describes the
    generator as much as the server.
 4. Requests routed to a node whose connections on a worker are all

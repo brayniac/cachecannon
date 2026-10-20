@@ -266,14 +266,6 @@ impl Connection {
     pub fn total_connections(&self) -> usize {
         self.pool_size.unwrap_or(self.connections)
     }
-
-    /// Effective fire_* coalesce threshold. Defaults to `pipeline_depth` when
-    /// `batch_size` is unset, and is clamped to `[1, pipeline_depth]`.
-    pub fn effective_batch_size(&self) -> usize {
-        self.batch_size
-            .unwrap_or(self.pipeline_depth)
-            .clamp(1, self.pipeline_depth.max(1))
-    }
 }
 
 impl Default for Connection {
@@ -1342,6 +1334,24 @@ impl Config {
 }
 
 impl Config {
+    /// The fire_* coalesce threshold, which is also the pipeline room a
+    /// connection needs before it sends: `connection.batch_size`, clamped to
+    /// `[1, pipeline_depth]`. Unset, it is `pipeline_depth`, except with
+    /// `workload.routing = "routed"`, where it is 1, so a connection sends a
+    /// queued request whenever its pipeline has room.
+    pub fn effective_batch_size(&self) -> usize {
+        let depth = self.connection.pipeline_depth;
+        let unset = if self.workload.routing == Routing::Routed {
+            1
+        } else {
+            depth
+        };
+        self.connection
+            .batch_size
+            .unwrap_or(unset)
+            .clamp(1, depth.max(1))
+    }
+
     /// `workload.routing = "routed"`. The node-count requirement (`threads x
     /// nodes` connections) is checked after discovery, in
     /// `runner::check_node_counts`, because validation sees only the seeds.
@@ -1957,6 +1967,28 @@ mod validation_tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("length = 36"));
+    }
+
+    #[test]
+    fn batch_size_defaults_to_the_pipeline_except_when_routed() {
+        let cfg = |routing: &str, batch: &str| {
+            parse_config(&format!(
+                "[target]\nendpoints = [\"127.0.0.1:6379\"]\n\
+                 [connection]\npipeline_depth = 8\n{batch}\n\
+                 [workload]\nrate_limit = 1000\nrouting = \"{routing}\"\n"
+            ))
+            .unwrap()
+            .effective_batch_size()
+        };
+        assert_eq!(cfg("pinned", ""), 8);
+        assert_eq!(cfg("routed", ""), 1);
+        assert_eq!(cfg("pinned", "batch_size = 4"), 4);
+        assert_eq!(cfg("routed", "batch_size = 4"), 4);
+        assert_eq!(
+            cfg("routed", "batch_size = 64"),
+            8,
+            "clamped to the pipeline"
+        );
     }
 
     #[test]

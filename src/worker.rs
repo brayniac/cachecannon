@@ -1719,7 +1719,7 @@ async fn resp_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: usize
         // unchanged and metrics are identical (recorded by the `on_result`
         // callback above).
         let mut client = builder
-            .max_batch_size(config.connection.effective_batch_size())
+            .max_batch_size(config.effective_batch_size())
             .build();
         log_resp_recv_path_once(config.workload.read_values);
 
@@ -1851,7 +1851,7 @@ async fn drive_resp_workload(
     let num_endpoints = state.task_state.endpoints.len();
     let multi_endpoint = num_endpoints > 1;
     let pipeline_depth = config.connection.pipeline_depth;
-    let batch_size = config.connection.effective_batch_size();
+    let batch_size = config.effective_batch_size();
     // `None` for a closed-loop run; see `TokenDispatcher`.
     let token_dispatch = dispatcher();
     // `Some` with `workload.routing = "routed"`: Warmup and Running requests
@@ -2779,7 +2779,7 @@ async fn memcache_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: u
         metrics::CONNECTIONS_ACTIVE.increment();
         let builder = ringline_memcache::Client::builder(connection)
             .on_result(make_memcache_callback(routed_queues().is_some()))
-            .max_batch_size(config.connection.effective_batch_size());
+            .max_batch_size(config.effective_batch_size());
         let binary = matches!(config.target.protocol, CacheProtocol::MemcacheBinary);
         let mut client = if binary {
             McClient::Binary(builder.build_binary(), conn)
@@ -2876,7 +2876,7 @@ async fn drive_memcache_workload(
     let num_endpoints = state.task_state.endpoints.len();
     let multi_endpoint = num_endpoints > 1;
     let pipeline_depth = config.connection.pipeline_depth;
-    let batch_size = config.connection.effective_batch_size();
+    let batch_size = config.effective_batch_size();
     // `None` for a closed-loop run; see `TokenDispatcher`.
     let token_dispatch = dispatcher();
     // `Some` with `workload.routing = "routed"`: Warmup and Running requests

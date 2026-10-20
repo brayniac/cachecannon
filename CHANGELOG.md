@@ -16,10 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its node is counted (`routed_queue_wait` holds that part alone), and a
   request that finds the node's queue full is dropped and counted in
   `routed_queue_dropped`. A connection with replies pending sends a queued
-  request as soon as one is queued when its pipeline has room for a full
-  batch (`connection.batch_size`). At the default batch size, equal to
-  `pipeline_depth`, it sends nothing until its replies are in, so with few
-  connections per node that wait is mostly the generator's. Needs a
+  request as soon as one is queued when its pipeline has room for a batch.
+  In routed mode `connection.batch_size` defaults to 1, so that is whenever
+  the pipeline has room; with `batch_size` at `pipeline_depth` it sends
+  nothing until its replies are in, and with few connections per node that
+  wait is mostly the generator's. Needs a
   rate limit, a RESP or memcache protocol, and at least `threads x nodes`
   connections. The default, `"pinned"`, is the existing behaviour.
 - `target.auto_discovery` supports ElastiCache for Memcached auto discovery.
