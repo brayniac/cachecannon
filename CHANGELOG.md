@@ -134,6 +134,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   share and `key_share` connection count.
 
 ### Changed
+- ringline moves from dfff2e5 to ab81ceb (ringline main after #682), which
+  brings these changes:
+  - Breaking: `[timestamps] mode = "software"` is rejected at config load.
+    ringline #667 removed its kernel receive-timestamp mode, so latency is
+    always timed with the userspace clock.
+  - `get_ttfb` has samples in every run. Before, it was filled only under
+    `mode = "software"`, where it equalled `get_latency`. It now runs from
+    the send to the completion batch in which the worker handled the receive
+    carrying the reply's first byte (ringline #672), so it excludes the time
+    between that batch and the client parsing the reply. The clean, verbose
+    and JSON outputs show the GET TTFB row they omitted when it was empty.
+    ringline keeps the arrival log behind it on every connection; ringline
+    #672 puts its cost at 1-3% of CPU per request on the receiving side, and
+    the generator now pays it.
+  - The timer pool is ringline's fixed 65,536 slots per worker (ringline
+    #661). cachecannon sized it at two timers per connection per worker,
+    with no upper limit below 2^31, so a worker with more than 32,768
+    connections can now exhaust it.
 - A run whose computed send copy pool exceeds ringline's per-worker maximum
   of 65,535 slots logs a warning naming the inputs (connections per worker,
   pipeline depth, batch, value length, TLS, and for `kv_replay` the largest

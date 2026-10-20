@@ -124,13 +124,7 @@ rand = "0.9"
 rand_xoshiro = "0.7"
 rand_distr = "0.5"
 
-# Kernel SO_TIMESTAMPING support is Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]
-ringline = { version = "0.7.0-alpha.0", features = ["timestamps"] }
-ringline-redis = { version = "0.7.0", features = ["timestamps"] }
-ringline-memcache = { version = "0.7.1", features = ["timestamps"] }
-ringline-ping = { version = "0.6.0", features = ["timestamps"] }
-
 # Jemalloc allocator (glibc only — not needed on musl/macOS/Windows).
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
@@ -213,10 +207,10 @@ dendro = { version = "0.4", default-features = false }
 # match a 0.7 pre-release, and cargo then builds a second ringline from
 # crates.io alongside the patched one the client crates use.
 [patch.crates-io]
-# dfff2e5 is ringline main after #649, which moved ringline to metriken 0.11.3
-# (metriken-core 0.3). metriken-core declares `links`, so ringline and
-# cachecannon must agree on one metriken-core; 1be7049 was still on metriken 0.9.
-ringline = { git = "https://github.com/ringline-rs/ringline", rev = "dfff2e5" }
-ringline-redis = { git = "https://github.com/ringline-rs/ringline", rev = "dfff2e5" }
-ringline-memcache = { git = "https://github.com/ringline-rs/ringline", rev = "dfff2e5" }
-ringline-ping = { git = "https://github.com/ringline-rs/ringline", rev = "dfff2e5" }
+# ab81ceb is ringline main after #682, which added `Client::recv_ready`.
+# metriken-core declares `links`, so ringline and cachecannon must agree on one
+# metriken-core (0.3, from metriken 0.11.3 since ringline #649).
+ringline = { git = "https://github.com/ringline-rs/ringline", rev = "ab81ceb" }
+ringline-redis = { git = "https://github.com/ringline-rs/ringline", rev = "ab81ceb" }
+ringline-memcache = { git = "https://github.com/ringline-rs/ringline", rev = "ab81ceb" }
+ringline-ping = { git = "https://github.com/ringline-rs/ringline", rev = "ab81ceb" }

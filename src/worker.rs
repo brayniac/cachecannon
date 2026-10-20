@@ -6,8 +6,6 @@
 //! phase transitions, diagnostics, and shutdown.
 
 use crate::client::{RequestResult, RequestType};
-#[cfg(target_os = "linux")]
-use crate::config::TimestampMode;
 use crate::config::{Config, EndpointAllocation, Protocol as CacheProtocol, Routing};
 use crate::keydist::KeyDist;
 use crate::kvreplay::KvReplay;
@@ -1630,9 +1628,6 @@ async fn resp_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: usize
         metrics::CONNECTIONS_ACTIVE.increment();
         let builder = ringline_redis::Client::builder(connection)
             .on_result(make_resp_callback(routed_queues().is_some()));
-        #[cfg(target_os = "linux")]
-        let builder =
-            builder.kernel_timestamps(matches!(config.timestamps.mode, TimestampMode::Software));
         // Zero-copy recv is not a builder toggle — it lives in the recv method:
         // the recv loop calls `client.recv_meta()`, which drains each value
         // without materializing it (zero-copy on io_uring, streaming-drain on
@@ -2672,9 +2667,6 @@ async fn memcache_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: u
         let builder = ringline_memcache::Client::builder(connection)
             .on_result(make_memcache_callback(routed_queues().is_some()))
             .max_batch_size(config.connection.effective_batch_size());
-        #[cfg(target_os = "linux")]
-        let builder =
-            builder.kernel_timestamps(matches!(config.timestamps.mode, TimestampMode::Software));
         let binary = matches!(config.target.protocol, CacheProtocol::MemcacheBinary);
         let mut client = if binary {
             McClient::Binary(builder.build_binary(), conn)
@@ -3290,8 +3282,6 @@ fn map_memcache_op(op: ringline_memcache::CompletedOp) -> RequestResult {
 /// A single Ping protocol connection task.
 async fn ping_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: usize, _seed: u64) {
     let endpoint = state.task_state.endpoints[endpoint_idx];
-    #[cfg(target_os = "linux")]
-    let config = &state.task_state.config;
     let tls_name = resolve_tls_server_name(&state.task_state, endpoint);
 
     loop {
@@ -3319,9 +3309,6 @@ async fn ping_connection_task(state: Arc<SharedWorkerState>, endpoint_idx: usize
         let _close = CloseOnDrop(conn);
         metrics::CONNECTIONS_ACTIVE.increment();
         let builder = ringline_ping::Client::builder(connection).on_result(make_ping_callback());
-        #[cfg(target_os = "linux")]
-        let builder =
-            builder.kernel_timestamps(matches!(config.timestamps.mode, TimestampMode::Software));
         let mut client = builder.build();
 
         tracing::debug!(
@@ -3732,9 +3719,6 @@ async fn resp_append_task(state: Arc<SharedWorkerState>, endpoint_idx: usize, se
         metrics::APPEND_CONNECTIONS_ACTIVE.increment();
         let builder =
             ringline_redis::Client::builder(connection).on_result(make_resp_append_callback());
-        #[cfg(target_os = "linux")]
-        let builder =
-            builder.kernel_timestamps(matches!(config.timestamps.mode, TimestampMode::Software));
         let mut client = builder.max_batch_size(append.pipeline_depth).build();
 
         // Same RESP3 negotiation as the reader connections.
@@ -3949,9 +3933,6 @@ async fn memcache_append_task(state: Arc<SharedWorkerState>, endpoint_idx: usize
         let builder = ringline_memcache::Client::builder(connection)
             .on_result(make_memcache_append_callback())
             .max_batch_size(append.pipeline_depth);
-        #[cfg(target_os = "linux")]
-        let builder =
-            builder.kernel_timestamps(matches!(config.timestamps.mode, TimestampMode::Software));
         let binary = matches!(config.target.protocol, CacheProtocol::MemcacheBinary);
         let mut client = if binary {
             McClient::Binary(builder.build_binary(), conn)
@@ -4345,8 +4326,8 @@ fn timer_exhausted_warn_once() {
     ONCE.call_once(|| {
         tracing::warn!(
             "ringline timer pool exhausted: a request timeout could not be armed and the \
-             connection was dropped; this indicates timer_slots is undersized for the \
-             connection count"
+             connection was dropped; this worker had all {} of ringline's timer slots in use",
+            ringline::TIMER_SLOTS
         );
     });
 }

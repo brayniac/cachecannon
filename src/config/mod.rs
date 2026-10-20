@@ -938,6 +938,8 @@ pub enum DmaProvider {
 pub enum TimestampMode {
     #[default]
     Userspace,
+    /// Kernel SO_TIMESTAMPING, which ringline no longer provides. Kept so
+    /// validation can reject it by name.
     Software,
 }
 
@@ -1287,10 +1289,11 @@ impl Config {
             )));
         }
 
-        #[cfg(not(target_os = "linux"))]
         if matches!(self.timestamps.mode, TimestampMode::Software) {
             return Err(ConfigError::Validation(
-                "timestamps.mode = \"software\" (kernel SO_TIMESTAMPING) is only supported on Linux"
+                "timestamps.mode = \"software\" (kernel SO_TIMESTAMPING) was removed: ringline \
+                 no longer has a kernel receive-timestamp mode. Use \"userspace\" or omit \
+                 the key; latency is timed with the userspace clock"
                     .to_string(),
             ));
         }
@@ -1954,6 +1957,18 @@ mod validation_tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("length = 36"));
+    }
+
+    #[test]
+    fn rejects_software_timestamps() {
+        let cfg = |mode: &str| {
+            parse_config(&format!(
+                "[target]\nendpoints = [\"127.0.0.1:6379\"]\n[timestamps]\nmode = \"{mode}\"\n"
+            ))
+        };
+        let err = cfg("software").unwrap_err().to_string();
+        assert!(err.contains("was removed"), "{err}");
+        assert!(cfg("userspace").is_ok());
     }
 
     #[test]
