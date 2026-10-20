@@ -504,8 +504,7 @@ enabled = true
 mode = "userspace"
 ```
 
-Both keys are accepted and neither changes behaviour: `enabled` is not read,
-and `"userspace"` is the only mode. `mode = "software"` (kernel
+`enabled` is not read. `mode` accepts only `"userspace"`; `"software"` (kernel
 SO_TIMESTAMPING) is rejected at config load.
 
 `response_latency` is sampled after the response is parsed, so it includes time

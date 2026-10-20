@@ -151,7 +151,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     of an earlier lookup, and measured +0.4% at one cell for the current
     one. Its cost in cachecannon has not been measured.
   - The timer pool is ringline's fixed 65,536 slots per worker (ringline
-    #661). cachecannon sized it at two timers per connection per worker.
+    #661). cachecannon sized it at two timers per connection on each worker.
     ringline's connection table holds 16,000 connections per worker, which
     cachecannon does not raise, so the pool covers four timers per
     connection at that limit.

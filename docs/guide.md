@@ -1160,8 +1160,9 @@ carried the reply's first byte. Time between that batch and the client parsing
 the reply is in `get_latency` but not in `get_ttfb`, so a gap between the two
 at the same percentile is time between the worker handling that receive and
 the client finishing the reply: the connection task waiting to run, parsing,
-or the rest of a reply that spans several receives (plus the routed queue wait
-under `routing = "routed"`).
+or the rest of a reply that spans several receives. Under `routing = "routed"`,
+`get_latency` also includes the routed queue wait, which comes before the send
+(see below).
 
 `get_ttfb` still includes time between the kernel queuing the data and the
 worker handling the receive. For that, use `tcp_packet_latency` from
