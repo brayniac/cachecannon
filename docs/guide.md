@@ -1160,18 +1160,16 @@ carried the reply's first byte. Time between that batch and the client parsing
 the reply is in `get_latency` but not in `get_ttfb`, so a gap between the two
 at the same percentile is time between the worker handling that receive and
 the client finishing the reply: the connection task waiting to run, parsing,
-or the rest of a reply that spans several receives. Under `routing = "routed"`,
-`get_latency` also includes the routed queue wait, which comes before the send
-(see below).
+or the rest of a reply that spans several receives. Under
+`workload.routing = "routed"`, `get_latency` also includes the routed queue
+wait, which comes before the send.
 
 `get_ttfb` still includes time between the kernel queuing the data and the
 worker handling the receive. For that, use `tcp_packet_latency` from
 client-side Rezolus — see
 [Is the generator the bottleneck?](#is-the-generator-the-bottleneck).
 
-`get_ttfb` is recorded for GETs only. With `workload.routing = "routed"` it
-starts at the send, so it excludes the routed queue wait that `get_latency`
-includes.
+`get_ttfb` is recorded for GETs only.
 
 ### Per-worker CPU, and why 1.00 is ambiguous
 
