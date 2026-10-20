@@ -794,8 +794,8 @@ pub const PENDING_PIPELINE: usize = 32;
 ///
 /// The connection carries the offered rate while a round trip takes under
 /// 160 ms (32 / 200 per second). Past that the queue fills and its wait is the
-/// backlog, whatever the batch. The diagnostic line printed on failure shows
-/// whether requests were dropped.
+/// backlog, whatever the batch, so the run fails if the queue dropped a
+/// request.
 pub fn routed_queue_wait_with_a_reply_pending(protocol: &str, batch: Option<usize>) -> u64 {
     let (addr, _) = spawn_paced(protocol, Pace::FromArrival(Duration::from_millis(12)));
     let started = Instant::now();
@@ -813,15 +813,17 @@ pub fn routed_queue_wait_with_a_reply_pending(protocol: &str, batch: Option<usiz
     });
     let elapsed = started.elapsed();
     use cachecannon::metrics as m;
-    let quantiles = |h: &metriken::AtomicHistogram| -> Vec<u64> {
-        let h = h.load().expect("histogram has samples");
-        h.quantiles(&[0.0, 0.1, 0.5, 0.9, 0.99, 1.0])
-            .unwrap()
-            .unwrap()
-            .entries()
-            .values()
-            .map(|b| b.end())
-            .collect()
+    let quantiles = |h: &metriken::AtomicHistogram| -> Option<Vec<u64>> {
+        let h = h.load()?;
+        Some(
+            h.quantiles(&[0.0, 0.1, 0.5, 0.9, 0.99, 1.0])
+                .unwrap()
+                .unwrap()
+                .entries()
+                .values()
+                .map(|b| b.end())
+                .collect(),
+        )
     };
     eprintln!(
         "run {elapsed:?}; queue wait min/p10/p50/p90/p99/max {:?} ns; \
@@ -835,6 +837,11 @@ pub fn routed_queue_wait_with_a_reply_pending(protocol: &str, batch: Option<usiz
         m::REQUEST_TIMEOUTS.value(),
         m::CONNECTIONS_FAILED.value(),
         m::REQUESTS_SEND_FAILED.value(),
+    );
+    assert_eq!(
+        m::ROUTED_QUEUE_DROPPED.value(),
+        0,
+        "the connection did not carry the offered rate, so the queue wait is a backlog"
     );
     p50_ns(&m::ROUTED_QUEUE_WAIT)
 }
