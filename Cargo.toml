@@ -211,9 +211,9 @@ dendro = { version = "0.4", default-features = false }
 # (feat/recv-direct), from brayniac/ringline feat/recv-direct.
 # metriken-core declares `links`, so ringline and cachecannon must agree on
 # one metriken-core (0.3, metriken 0.11.3).
-ringline = { git = "https://github.com/brayniac/ringline", rev = "8e4c3f945a7f5787c1c6e05ec132587dfd1cc03e" }
-ringline-redis = { git = "https://github.com/brayniac/ringline", rev = "8e4c3f945a7f5787c1c6e05ec132587dfd1cc03e" }
-ringline-memcache = { git = "https://github.com/brayniac/ringline", rev = "8e4c3f945a7f5787c1c6e05ec132587dfd1cc03e" }
-ringline-ping = { git = "https://github.com/brayniac/ringline", rev = "8e4c3f945a7f5787c1c6e05ec132587dfd1cc03e" }
+ringline = { git = "https://github.com/brayniac/ringline", rev = "ff61e77c62d9b75817e76c71653efd94a7b511e2" }
+ringline-redis = { git = "https://github.com/brayniac/ringline", rev = "ff61e77c62d9b75817e76c71653efd94a7b511e2" }
+ringline-memcache = { git = "https://github.com/brayniac/ringline", rev = "ff61e77c62d9b75817e76c71653efd94a7b511e2" }
+ringline-ping = { git = "https://github.com/brayniac/ringline", rev = "ff61e77c62d9b75817e76c71653efd94a7b511e2" }
 resp-proto = { git = "https://github.com/ringline-rs/resp-proto", rev = "d0054e338fa200a73b6b40692faa7094363779d3" }
 memcache-proto = { git = "https://github.com/ringline-rs/memcache-proto", rev = "aa93e3ca2528f431607b4a4bfbdfabfd63ba0bf3" }
