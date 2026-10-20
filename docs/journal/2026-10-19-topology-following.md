@@ -521,11 +521,11 @@ O(1), which answers the scan cost recorded above. A unit test drops a
 registered wait and checks the next push reaches the other connection; with
 the `Drop` made a no-op it fails, as does the compaction test.
 
-The batch gate is unchanged, and it decides everything. `batch_size`
-defaults to `pipeline_depth`, so by default a connection with anything in
-flight has no room for a batch and never reaches the new wait. Measured
-(macOS, mio, one connection, pipeline 4, 200 req/s, a stub answering each
-GET 12 ms after it arrived, so about 2.4 requests in flight):
+The batch gate is unchanged and decides whether a connection reaches the new
+wait. `batch_size` defaults to `pipeline_depth`, so by default a connection
+with anything in flight has no room for a batch and never reaches the new
+wait. Measured (macOS, mio, one connection, pipeline 4, 200 req/s, a stub
+answering each GET 12 ms after it arrived, so about 2.4 requests in flight):
 
 | batch_size | `routed_queue_wait` p50 |
 |---|---|
@@ -544,16 +544,16 @@ from arrival keeps replies overlapping.
 
 On io_uring (SystemsLab 01a15a2b, Linux 6.12.63, 16 vCPU guest, branch at
 516dcb4), five repeats each: batch 1 read 5.8-6.4 µs (RESP) and 5.8-6.3 µs
-(memcache); the default-batch control 6.06-6.29 ms; with the new wait
-disabled the batch-1 tests failed at 6.16 ms and 5.96 ms. An earlier run
-(01a15a1e, f140eb9) read the control at 650 ms on Linux. I attribute it to
-Nagle plus delayed ACK: at the default batch the client sends nothing while
-replies are pending, so nothing carries an ACK. Evidence: with Nagle on, the
-batch-1 mutation in the same run, which does send between replies, read
-6.0 ms, and setting `TCP_NODELAY` on the stub (516dcb4) brought the control
-to 6 ms. One run each, no packet capture; the macOS control read 6.6 ms with
-Nagle on, which I have not explained. The control test now also asserts an
-upper bound of 50 ms, so a stub that falls back to Nagle fails it.
+(memcache); the default-batch control 6.06-6.29 ms; with the new wait disabled
+the batch-1 tests failed at 6.16 ms and 5.96 ms. An earlier run (01a15a1e,
+f140eb9) read the control at 650 ms on Linux. I attribute it to Nagle plus
+delayed ACK: at the default batch the client sends nothing while replies are
+pending, so nothing carries an ACK. Evidence: with Nagle on, the batch-1
+mutation in 01a15a1e, which does send between replies, read 6.0 ms, and
+setting `TCP_NODELAY` on the stub (516dcb4) brought the control to 6 ms. One
+run each, no packet capture; the macOS control read 6.6 ms with Nagle on,
+which I have not explained. The control test now also asserts an upper bound
+of 50 ms, so a stub that falls back to Nagle fails it.
 
 Against valkey 8.1.1 on the same guest (three instances on loopback, routed,
 2 threads, 6 connections, pipeline 8, 50,000 req/s, 90% GET, 20 s after 5 s
@@ -572,16 +572,18 @@ run. Times in µs, one value per round; CPU is user+sys seconds for the whole
 
 Every arm delivered 50,000 req/s with no drops. At batch 8, A and B match
 within the round-to-round spread, as the unchanged gate predicts. At batch 1,
-B lowered response latency p50 by 10-14 µs, but queue-wait p50 by only 1-2 µs;
-the rest is in send-to-reply time, and I don't know why the new wait changed
-it. Queue-wait p99 fell 54-96% and response latency p99 31-87%, round by
-round.
+B lowered response latency p50 by 10-14 µs, but queue-wait p50 by only 1-2 µs.
+Send-to-reply time was not recorded separately, and I don't know what accounts
+for the rest. Queue-wait p99 fell 54-96% and response latency p99 31-87%,
+round by round.
 
-CPU was 37.0-38.6 s per 25 s run (about 0.75 core per worker) in every arm. B
-at batch 1 used 38.4 s mean against 38.0 s for A, and was higher in two of
-three rounds (+0.88, +0.53, -0.01 s). B and A at batch 8, which run the same
-code, differed by up to 0.61 s in one round. Three rounds do not resolve a
-difference of this size. I don't know whether the new wait costs CPU.
+CPU was 37.0-38.6 s per 25 s run (about 1.5 cores for the process, which runs
+2 worker threads) in every arm. B at batch 1 used 38.4 s mean against 38.0 s
+for A, and was higher in two of three rounds (+0.88, +0.53, -0.01 s). B and A
+at batch 8, where the new wait is never reached (B still has the rewritten
+waiter list), differed by up to 0.61 s in one round. Three rounds do not
+resolve a difference of this size. I don't know whether the new wait costs
+CPU.
 
 ## Open questions for the owner
 
