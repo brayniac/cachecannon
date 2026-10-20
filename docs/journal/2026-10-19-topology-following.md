@@ -559,7 +559,7 @@ below removed it.
 
 The RESP batch-1 test then failed on every GitHub macOS CI run of the branch
 (p50 381-801 ms over eight runs) while passing on Linux CI and locally on
-macOS. The memcache and default-batch tests never ran there: `cargo test`
+macOS. The memcache test and the full-batch control never ran there: `cargo test`
 stops at the first failing binary, and `routed_send_while_pending` sorts
 before them. I missed the failure at first because the job summary I read
 deduplicated the failure lines. A diagnostic run (6e27aa2) printed the cause
@@ -577,7 +577,7 @@ three tests failed with 280-290 dropped. Raising the test pipeline to 32,
 which carries 200 req/s up to a 160 ms round trip, made both batch-1 tests
 pass under background QoS, one run each: RESP queue wait p50 47 µs, memcache
 61 µs, nothing dropped, and round trips (response latency) p50 50 ms and max
-112 ms in both. The default-batch control read 54 ms there. A reviewer's
+112 ms in both. The full-batch control (batch 32) read 54 ms there. A reviewer's
 RESP run under the same QoS read round trips of p50 75 ms and max 337 ms, past
 the 160 ms headroom for part of the run, and still passed at 88.6 µs. With
 the new wait disabled the batch-1 tests still fail at pipeline 32 (5.4 ms,
@@ -588,9 +588,12 @@ At pipeline 32 the node queue holds 512 requests, more than a 2 s run at
 the run if the connection sent fewer than 350 requests (about 400 are
 funded). Healthy local runs sent 412-414 and runs under background QoS
 417-423; with the stub at 400 ms all three tests fail on it, having sent
-161-172. A first version asserted no drops, which a reviewer showed could
+161-172. The floor allows about 60 unsent at stop, so it catches a round trip
+over about 180 ms; a reviewer's control at a 170 ms stub sent 353 and passed
+with a p50 queue wait of 166 ms. The batch-1 tests fail on their own p50 in
+that band. A first version asserted no drops, which a reviewer showed could
 not fire: with the stub answering 400 ms after arrival, the RESP test sent
-175 with none dropped, and the default-batch control passed on a backlog.
+175 with none dropped, and the full-batch control passed on a backlog.
 
 The control test's ceiling is gone, so it no longer catches Nagle on the
 stub. I infer the 650 ms reading was Nagle-stretched cycles backing up the

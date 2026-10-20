@@ -487,10 +487,10 @@ impl Replies {
             Pace::FromArrival(_) => {
                 // With Nagle on, a reply written while an earlier one is
                 // unacknowledged is held for the ACK, which the client
-                // delays when it has nothing to send. On Linux at pipeline 4
-                // the default-batch control read 650 ms p50 queue wait with
-                // Nagle on and 6 ms with it off (one run each, no packet
-                // capture; attributed, not traced).
+                // delays when it has nothing to send. On Linux, at pipeline 4
+                // and batch 4 (then the default), the control read 650 ms p50
+                // queue wait with Nagle on and 6 ms with it off (one run
+                // each, no packet capture; attributed, not traced).
                 writer.set_nodelay(true).unwrap();
                 let (tx, rx) = std::sync::mpsc::channel::<(std::time::Instant, &'static [u8])>();
                 std::thread::spawn(move || {
@@ -794,8 +794,10 @@ pub const PENDING_PIPELINE: usize = 32;
 ///
 /// The connection carries the offered rate while a round trip takes under
 /// 160 ms (32 / 200 per second). Past that requests back up in the queue and
-/// its wait is the backlog, whatever the batch, so the run fails if the
-/// connection sent fewer than 350 of the about 400 requests funded.
+/// its wait is the backlog, whatever the batch. The run fails if the
+/// connection sent fewer than 350 of the about 410 requests funded, which a
+/// round trip over about 180 ms produces; a backlog from a round trip between
+/// 160 ms and that is not caught here.
 pub fn routed_queue_wait_with_a_reply_pending(protocol: &str, batch: Option<usize>) -> u64 {
     let (addr, _) = spawn_paced(protocol, Pace::FromArrival(Duration::from_millis(12)));
     let started = Instant::now();
