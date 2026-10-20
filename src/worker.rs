@@ -4267,8 +4267,9 @@ where
         return Ok(recv.await);
     };
     if inflight.timer.is_none() && !inflight.arm(remaining) {
-        // Timer pool exhausted. The pool is sized from the connection count in
-        // the runner, so this should not happen. Without a timer the recv
+        // Timer pool exhausted. ringline's pool is 65536 per worker, at least
+        // four timers per connection at its 16,000-connection table limit, so
+        // this should not happen. Without a timer the recv
         // cannot be bounded: drop the connection, let the caller reconnect,
         // and say why once.
         timer_exhausted_warn_once();
@@ -4325,8 +4326,8 @@ fn timer_exhausted_warn_once() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         tracing::warn!(
-            "ringline timer pool exhausted: a request timeout could not be armed and the \
-             connection was dropped; this worker had all {} of ringline's timer slots in use",
+            "ringline timer pool exhausted: a request or connect timeout could not be armed; \
+             all {} of this worker's timer slots were in use",
             ringline::TIMER_SLOTS
         );
     });

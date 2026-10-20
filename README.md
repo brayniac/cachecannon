@@ -71,7 +71,7 @@ cachecannon view results.parquet
 - **Multiple protocols** — Valkey/Redis RESP2/RESP3, Memcache ASCII/binary, Ping
 - **io_uring I/O** — Same high-performance ringline framework as the server (Linux 6.0+)
 - **Request pipelining** — Configurable pipeline depth per connection
-- **Latency histograms** — p50, p90, p99, p99.9, p99.99 with userspace or kernel timestamps
+- **Latency histograms** — p50, p90, p99, p99.9, p99.99, plus GET time-to-first-byte
 - **[Prefill and backfill](docs/guide.md#prefill)** — Pre-populate the cache or auto-SET on miss (cache-aside)
 - **[Append stream](docs/guide.md#append-stream)** — Grow the keyspace in batches on a cadence, with newest-is-hottest reads
 - **[Saturation search](docs/guide.md#saturation-search)** — Automatically find max throughput that meets your latency SLO

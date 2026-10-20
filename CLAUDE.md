@@ -85,11 +85,11 @@ the highest connection count, before trusting the counters it drives.
 ## ringline
 
 **Per-worker pools default to fixed sizes, independent of the workload.**
-Four matter: `standalone_task_capacity` is scaled by connections-per-worker in
+Five matter: `standalone_task_capacity` is scaled by connections-per-worker in
 `src/runner.rs` (it was silently capping runs at 2040 connections); the timer
 pool is fixed by ringline at 65536 slots per worker (`ringline::TIMER_SLOTS`),
-which covers two timers per connection up to 32768 connections per worker; the
-send pool and zero-copy
+four per connection at ringline's default connection table of 16,000 per
+worker, which cachecannon does not raise; the send pool and zero-copy
 send slab are sized from connections, pipeline depth, batch size, value length
 and TLS (`SendLoad`; at ringline's defaults some connections sent almost nothing
 and went unmeasured); `recv_buffer.ring_size` is deliberately left at ringline's

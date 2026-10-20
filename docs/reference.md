@@ -500,15 +500,13 @@ SLO.
 
 ```toml
 [timestamps]
-# Enable latency measurement
 enabled = true
-
-# Timestamp source. "userspace" is the only mode.
 mode = "userspace"
 ```
 
-`mode = "software"` (kernel SO_TIMESTAMPING) is rejected at config load: ringline
-no longer has a kernel receive-timestamp mode.
+Both keys are accepted and neither changes behaviour: `enabled` is not read,
+and `"userspace"` is the only mode. `mode = "software"` (kernel
+SO_TIMESTAMPING) is rejected at config load.
 
 `response_latency` is sampled after the response is parsed, so it includes time
 cachecannon spent getting to a reply that had already arrived. `get_ttfb` stops

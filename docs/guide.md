@@ -1158,8 +1158,10 @@ the completion batch in which the worker handled each receive (one clock read
 per batch), and the client reports the time from the send to the batch that
 carried the reply's first byte. Time between that batch and the client parsing
 the reply is in `get_latency` but not in `get_ttfb`, so a gap between the two
-at the same percentile is time spent after the first byte reached the worker:
-reaping, parsing, or the rest of a reply that spans several receives.
+at the same percentile is time between the worker handling that receive and
+the client finishing the reply: the connection task waiting to run, parsing,
+or the rest of a reply that spans several receives (plus the routed queue wait
+under `routing = "routed"`).
 
 `get_ttfb` still includes time between the kernel queuing the data and the
 worker handling the receive. For that, use `tcp_packet_latency` from

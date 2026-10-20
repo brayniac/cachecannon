@@ -139,19 +139,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Breaking: `[timestamps] mode = "software"` is rejected at config load.
     ringline #667 removed its kernel receive-timestamp mode, so latency is
     always timed with the userspace clock.
-  - `get_ttfb` has samples in every run. Before, it was filled only under
+  - `get_ttfb` has samples in every RESP or memcache run that sends GETs.
+    Before, it was filled only under
     `mode = "software"`, where it equalled `get_latency`. It now runs from
     the send to the completion batch in which the worker handled the receive
     carrying the reply's first byte (ringline #672), so it excludes the time
     between that batch and the client parsing the reply. The clean, verbose
     and JSON outputs show the GET TTFB row they omitted when it was empty.
-    ringline keeps the arrival log behind it on every connection; ringline
-    #672 puts its cost at 1-3% of CPU per request on the receiving side, and
-    the generator now pays it.
+    ringline keeps the arrival log behind it on every connection. ringline
+    #672 estimates the log at 1-3% of server CPU per request from A/B runs
+    of an earlier lookup, and measured +0.4% at one cell for the current
+    one. Its cost in cachecannon has not been measured.
   - The timer pool is ringline's fixed 65,536 slots per worker (ringline
-    #661). cachecannon sized it at two timers per connection per worker,
-    with no upper limit below 2^31, so a worker with more than 32,768
-    connections can now exhaust it.
+    #661). cachecannon sized it at two timers per connection per worker.
+    ringline's connection table holds 16,000 connections per worker, which
+    cachecannon does not raise, so the pool covers four timers per
+    connection at that limit.
 - A run whose computed send copy pool exceeds ringline's per-worker maximum
   of 65,535 slots logs a warning naming the inputs (connections per worker,
   pipeline depth, batch, value length, TLS, and for `kv_replay` the largest
@@ -212,9 +215,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     before and after. ringline made one-shot
     the default for servers with many connections and large messages, where
     a multishot receive lets some connections hold the receive ring while
-    others get no buffers; one-shot costs an SQE per received buffer. With
-    `[timestamps] mode = "software"` (Linux), every receive is multishot
-    `recvmsg` in either mode.
+    others get no buffers; one-shot costs an SQE per received buffer.
   - `valkey-lab search`: a query task that panicked or was cancelled resolves
     its `JoinHandle` to a `JoinError` (ringline-rs/ringline#557), reported as
     a `query worker:` error.
