@@ -102,7 +102,7 @@ metriken-storage = { version = "0.2", default-features = false, features = ["con
 
 # TLS
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
-webpki-roots = "0.26"
+webpki-roots = "1"
 
 # Request-level KV-cache traces, model geometry and the request-to-object
 # mapping (`[workload.kv_replay]`). Pinned to a commit of pelikan-io/cachesim
