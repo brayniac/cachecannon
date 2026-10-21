@@ -128,7 +128,7 @@ pub fn run_benchmark_full(
         Some(Arc::new(WorkerLimiters::new(
             initial_rate,
             &conns,
-            config.connection.effective_batch_size() as u64,
+            config.effective_batch_size() as u64,
         )))
     } else {
         None
@@ -141,12 +141,9 @@ pub fn run_benchmark_full(
         tracing::warn!("prefill_rate_limit is set but prefill is off; it has no effect");
     }
     let prefill_ratelimiter = match config.workload.prefill_rate_limit {
-        Some(rate) if rate > 0 && config.workload.prefill => {
-            Some(Arc::new(crate::limiters::PrefillPacer::new(
-                rate,
-                config.connection.effective_batch_size() as u64,
-            )))
-        }
+        Some(rate) if rate > 0 && config.workload.prefill => Some(Arc::new(
+            crate::limiters::PrefillPacer::new(rate, config.effective_batch_size() as u64),
+        )),
         _ => None,
     };
 
@@ -1517,7 +1514,7 @@ impl SendLoad {
         Self {
             connections: config.connection.total_connections(),
             pipeline_depth: config.connection.pipeline_depth,
-            batch_size: config.connection.effective_batch_size(),
+            batch_size: config.effective_batch_size(),
             key_len: config.workload.keyspace.length,
             value_len: config.workload.values.length,
             tls: config.target.tls,
@@ -1729,7 +1726,8 @@ fn check_send_pool(loads: &[SendLoad], num_threads: usize) -> Result<Option<Stri
         "the send pool needs {demand} slots per worker and ringline allows {max}, so it is \
          capped: sends that do not fit fail and are counted in requests_send_failed \
          (kv_replay lookups also in kv_requests_failed). Inputs: {}. More threads, fewer \
-         connections, a smaller pipeline_depth or shorter requests lower it",
+         connections, a smaller pipeline_depth, a larger batch_size or shorter requests \
+         lower it",
         inputs.join("; ")
     )))
 }

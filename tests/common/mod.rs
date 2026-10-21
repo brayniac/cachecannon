@@ -447,18 +447,80 @@ pub fn spawn_get_counter(
     protocol: &str,
     delay: Duration,
 ) -> (SocketAddr, Arc<std::sync::atomic::AtomicU64>) {
+    spawn_paced(protocol, Pace::Serial(delay))
+}
+
+/// How a counting server times its GET replies.
+#[derive(Clone, Copy)]
+pub enum Pace {
+    /// Each GET takes this long, one at a time.
+    Serial(Duration),
+    /// Each GET's reply is written this long after the GET was read, however
+    /// many are in flight. Replies keep their order.
+    FromArrival(Duration),
+}
+
+/// A server like [`spawn_get_counter`]'s, with GET replies timed by `pace`.
+pub fn spawn_paced(protocol: &str, pace: Pace) -> (SocketAddr, Arc<std::sync::atomic::AtomicU64>) {
     let gets = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let counted = Arc::clone(&gets);
     let addr = match protocol {
-        "resp" => spawn(move |stream| count_resp(stream, &counted, delay)),
-        "memcache" => spawn(move |stream| count_memcache(stream, &counted, delay)),
+        "resp" => spawn(move |stream| count_resp(stream, &counted, pace)),
+        "memcache" => spawn(move |stream| count_memcache(stream, &counted, pace)),
         _ => unreachable!(),
     };
     (addr, gets)
 }
 
-fn count_resp(stream: TcpStream, gets: &std::sync::atomic::AtomicU64, delay: Duration) {
-    let mut writer = stream.try_clone().unwrap();
+/// Writes a counting server's replies in order, timed by its [`Pace`].
+enum Replies {
+    Serial(TcpStream),
+    /// Replies with the time to write each, for a writer thread.
+    FromArrival(std::sync::mpsc::Sender<(std::time::Instant, &'static [u8])>),
+}
+
+impl Replies {
+    fn new(stream: &TcpStream, pace: Pace) -> Self {
+        let mut writer = stream.try_clone().unwrap();
+        match pace {
+            Pace::Serial(_) => Replies::Serial(writer),
+            Pace::FromArrival(_) => {
+                // With Nagle on, a reply written while an earlier one is
+                // unacknowledged is held for the ACK, which the client
+                // delays when it has nothing to send. On Linux, at pipeline 4
+                // and batch 4 (then the default), the control read 650 ms p50
+                // queue wait with Nagle on and 6 ms with it off (one run
+                // each, no packet capture; attributed, not traced).
+                writer.set_nodelay(true).unwrap();
+                let (tx, rx) = std::sync::mpsc::channel::<(std::time::Instant, &'static [u8])>();
+                std::thread::spawn(move || {
+                    for (at, reply) in rx {
+                        std::thread::sleep(at.saturating_duration_since(std::time::Instant::now()));
+                        if writer.write_all(reply).is_err() {
+                            return;
+                        }
+                    }
+                });
+                Replies::FromArrival(tx)
+            }
+        }
+    }
+
+    /// Write `reply` after `delay`. False once the client has gone.
+    fn send(&mut self, reply: &'static [u8], delay: Duration) -> bool {
+        match self {
+            Replies::Serial(writer) => {
+                std::thread::sleep(delay);
+                writer.write_all(reply).is_ok()
+            }
+            Replies::FromArrival(tx) => tx.send((std::time::Instant::now() + delay, reply)).is_ok(),
+        }
+    }
+}
+
+fn count_resp(stream: TcpStream, gets: &std::sync::atomic::AtomicU64, pace: Pace) {
+    let (Pace::Serial(delay) | Pace::FromArrival(delay)) = pace;
+    let mut replies = Replies::new(&stream, pace);
     let mut reader = BufReader::new(stream);
     while let Some(header) = read_line(&mut reader) {
         let n: usize = std::str::from_utf8(&header[1..]).unwrap().parse().unwrap();
@@ -476,35 +538,34 @@ fn count_resp(stream: TcpStream, gets: &std::sync::atomic::AtomicU64, delay: Dur
                 command = arg.to_ascii_uppercase();
             }
         }
-        let reply: &[u8] = match command.as_slice() {
+        let sent = match command.as_slice() {
             b"GET" => {
                 gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                std::thread::sleep(delay);
-                b"$-1\r\n"
+                replies.send(b"$-1\r\n", delay)
             }
-            b"PING" => b"+PONG\r\n",
-            _ => b"+OK\r\n",
+            b"PING" => replies.send(b"+PONG\r\n", Duration::ZERO),
+            _ => replies.send(b"+OK\r\n", Duration::ZERO),
         };
-        if writer.write_all(reply).is_err() {
+        if !sent {
             return;
         }
     }
 }
 
-fn count_memcache(stream: TcpStream, gets: &std::sync::atomic::AtomicU64, delay: Duration) {
-    let mut writer = stream.try_clone().unwrap();
+fn count_memcache(stream: TcpStream, gets: &std::sync::atomic::AtomicU64, pace: Pace) {
+    let (Pace::Serial(delay) | Pace::FromArrival(delay)) = pace;
+    let mut replies = Replies::new(&stream, pace);
     let mut reader = BufReader::new(stream);
     while let Some(line) = read_line(&mut reader) {
-        let reply: &[u8] = match line.split(|b| *b == b' ').next().unwrap() {
+        let sent = match line.split(|b| *b == b' ').next().unwrap() {
             b"get" => {
                 gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                std::thread::sleep(delay);
-                b"END\r\n"
+                replies.send(b"END\r\n", delay)
             }
-            b"version" => b"VERSION 1.0\r\n",
-            _ => b"ERROR\r\n",
+            b"version" => replies.send(b"VERSION 1.0\r\n", Duration::ZERO),
+            _ => replies.send(b"ERROR\r\n", Duration::ZERO),
         };
-        if writer.write_all(reply).is_err() {
+        if !sent {
             return;
         }
     }
@@ -517,6 +578,8 @@ pub struct Routed<'a> {
     pub threads: usize,
     pub connections: usize,
     pub pipeline: usize,
+    /// `[connection] batch_size`; `None` leaves it unset.
+    pub batch: Option<usize>,
     pub rate: u64,
     pub duration: &'a str,
     /// `[workload] routing`.
@@ -547,6 +610,7 @@ pub fn run_routed(shape: &Routed) {
         [connection]
         connections = {connections}
         pipeline_depth = {pipeline}
+        {batch}
 
         [workload]
         rate_limit = {rate}
@@ -567,6 +631,9 @@ pub fn run_routed(shape: &Routed) {
         protocol = shape.protocol,
         connections = shape.connections,
         pipeline = shape.pipeline,
+        batch = shape
+            .batch
+            .map_or(String::new(), |b| format!("batch_size = {b}")),
         rate = shape.rate,
         routing = shape.routing,
         keyspace = shape.keyspace,
@@ -632,6 +699,7 @@ pub fn assert_routed_key_share(protocol: &str) {
         threads: 2,
         connections: 24,
         pipeline: 8,
+        batch: None,
         rate: RATE,
         duration: &format!("{SECONDS}s"),
         routing: "routed",
@@ -690,6 +758,7 @@ pub fn assert_routed_queue_wait(protocol: &str) {
         threads: 1,
         connections: 1,
         pipeline: 1,
+        batch: None,
         rate: 2000,
         duration: "2s",
         routing: "routed",
@@ -710,4 +779,72 @@ pub fn assert_routed_queue_wait(protocol: &str) {
         latency >= wait,
         "response latency (p50 {latency} ns) includes the queue wait (p50 {wait} ns)"
     );
+}
+
+/// The pipeline depth of [`routed_queue_wait_with_a_reply_pending`].
+pub const PENDING_PIPELINE: usize = 32;
+
+/// Run routed with one connection of pipeline [`PENDING_PIPELINE`] at 200
+/// requests a second against a server that answers each GET 12 ms after it
+/// arrives, and return the p50 of `routed_queue_wait`. About 2.4 requests are
+/// in flight, so the connection usually has a reply pending when a request is
+/// queued. With room for a batch (`batch` unset, or 1) it sends the request at
+/// once; with `batch` at the pipeline depth, the request waits for the
+/// replies.
+///
+/// The connection carries the offered rate while a round trip takes under
+/// 160 ms (32 / 200 per second). Past that requests back up in the queue and
+/// its wait is the backlog, whatever the batch. The run fails if the
+/// connection sent fewer than 350 of the about 410 requests funded, which a
+/// round trip over about 180 ms produces; a backlog from a round trip between
+/// 160 ms and that is not caught here.
+pub fn routed_queue_wait_with_a_reply_pending(protocol: &str, batch: Option<usize>) -> u64 {
+    let (addr, _) = spawn_paced(protocol, Pace::FromArrival(Duration::from_millis(12)));
+    let started = Instant::now();
+    run_routed(&Routed {
+        protocol,
+        endpoints: &[addr],
+        threads: 1,
+        connections: 1,
+        pipeline: PENDING_PIPELINE,
+        batch,
+        rate: 200,
+        duration: "2s",
+        routing: "routed",
+        keyspace: "count = 1000",
+    });
+    let elapsed = started.elapsed();
+    use cachecannon::metrics as m;
+    let quantiles = |h: &metriken::AtomicHistogram| -> Option<Vec<u64>> {
+        let h = h.load()?;
+        Some(
+            h.quantiles(&[0.0, 0.1, 0.5, 0.9, 0.99, 1.0])
+                .unwrap()
+                .unwrap()
+                .entries()
+                .values()
+                .map(|b| b.end())
+                .collect(),
+        )
+    };
+    eprintln!(
+        "run {elapsed:?}; queue wait min/p10/p50/p90/p99/max {:?} ns; \
+         response latency {:?} ns; sent {} received {} dropped {} timeouts {} \
+         connect failed {} send failed {}",
+        quantiles(&m::ROUTED_QUEUE_WAIT),
+        quantiles(&m::RESPONSE_LATENCY),
+        m::REQUESTS_SENT.value(),
+        m::RESPONSES_RECEIVED.value(),
+        m::ROUTED_QUEUE_DROPPED.value(),
+        m::REQUEST_TIMEOUTS.value(),
+        m::CONNECTIONS_FAILED.value(),
+        m::REQUESTS_SEND_FAILED.value(),
+    );
+    let sent = m::REQUESTS_SENT.value();
+    assert!(
+        sent >= 350,
+        "200 req/s for 2 s funds about 400 requests and the connection sent {sent}, \
+         so it fell behind and the queue wait is a backlog"
+    );
+    p50_ns(&m::ROUTED_QUEUE_WAIT)
 }

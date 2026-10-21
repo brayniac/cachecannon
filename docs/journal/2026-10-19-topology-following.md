@@ -495,13 +495,215 @@ return). With hundreds of idle connections to one node per worker that scan
 is a per-request cost that grows with the connection count. If it measures
 badly, a per-task registered flag makes both checks O(1).
 
+## 2026-10-20: sending while a reply is pending
+
+ringline #682 (merged as ab81ceb) added `Client::recv_ready` to
+ringline-redis and ringline-memcache: it flushes, then returns a future that
+resolves when the next reply starts arriving and borrows nothing from the
+client. Using it needed the ringline pin moved from dfff2e5 to ab81ceb, which
+brought three breaking changes and went up as its own change
+(`timestamps.mode = "software"` rejected, `get_ttfb` from the arrival log,
+timer slots fixed at 65,536 per worker).
+
+In both routed recv loops (`drive_resp_workload`, `drive_memcache_workload`),
+a connection with replies pending and room for a batch now waits on
+`ringline::select(queues.wait(node), client.recv_ready())`, inside the
+request-timeout bound (`routed_wait_send_or_recv`). A queued request wins
+and is sent; a reply wins and is received. `select` polls the queue first,
+so a push's wake is not spent on a wait that then returns for the reply.
+
+The wait is dropped whenever the reply wins, so the waiter list could no
+longer rely on entries being removed when a wait returns. Each wait now
+registers an `Rc<WaitSlot>` with a `live` flag; dropping or completing the
+wait clears it, `push` skips dead entries, and the list is compacted to its
+live entries at `2 x connections + 16`. That also makes the re-poll check
+O(1), which answers the scan cost recorded above. A unit test drops a
+registered wait and checks the next push reaches the other connection; with
+the `Drop` made a no-op it fails, as does the compaction test.
+
+The batch gate is unchanged and decides whether a connection reaches the new
+wait. In f140eb9 `batch_size` defaulted to `pipeline_depth`, so by default a
+connection with anything in flight had no room for a batch and never reached
+the new wait (the routed default is 1 since ed7363c; see below). Measured
+(macOS, mio, one connection, pipeline 4, 200 req/s, a stub answering each GET
+12 ms after it arrived, so about 2.4 requests in flight):
+
+| batch_size | `routed_queue_wait` p50 |
+|---|---|
+| 1, RESP | 21 µs |
+| 1, memcache | 26 µs |
+| 4 (default), RESP | 6.6 ms |
+| 1, RESP, new wait disabled | 6.5 ms |
+| 1, memcache, new wait disabled | 6.8 ms |
+
+One run each. The first stub tried was the serial one the queue-wait tests
+use (4 ms per GET, one at a time) at 200 req/s, and the default-batch
+control read 18.8 µs where I predicted over 1 ms: the limiter spaces requests
+5 ms apart, so each reply finished before the next request was funded and
+the connection was rarely busy when one was queued. The stub that answers
+from arrival keeps replies overlapping.
+
+On io_uring (SystemsLab 01a15a2b, Linux 6.12.63, 16 vCPU guest, branch at
+516dcb4), five repeats each: batch 1 read 5.8-6.4 µs (RESP) and 5.8-6.3 µs
+(memcache); the default-batch control 6.06-6.29 ms; with the new wait disabled
+the batch-1 tests failed at 6.16 ms and 5.96 ms. An earlier run (01a15a1e,
+f140eb9) read the control at 650 ms on Linux. I attribute it to Nagle plus
+delayed ACK: at the default batch the client sends nothing while replies are
+pending, so nothing carries an ACK. Evidence: with Nagle on, the batch-1
+mutation in 01a15a1e, which does send between replies, read 6.0 ms, and
+setting `TCP_NODELAY` on the stub (516dcb4) brought the control to 6 ms. One
+run each, no packet capture; the macOS control read 6.6 ms with Nagle on,
+which I have not explained. The control test then asserted an upper bound of
+50 ms, so a stub that fell back to Nagle failed it at pipeline 4; the change
+below removed it.
+
+The RESP batch-1 test then failed on every GitHub macOS CI run of the branch
+(p50 381-801 ms over eight runs) while passing on Linux CI and locally on
+macOS. The memcache test and the full-batch control never ran there: `cargo test`
+stops at the first failing binary, and `routed_send_while_pending` sorts
+before them. I missed the failure at first because the job summary I read
+deduplicated the failure lines. A diagnostic run (6e27aa2) printed the cause
+on the runner: 164 requests sent and 220 dropped in the 2 s run, queue wait
+p50 625 ms and max 1.04 s, and response latency min 64 ms against the stub's
+12 ms. Response latency is queue wait plus round trip, so the earliest
+requests, queued for 44 µs, took at least 64 ms a round trip; 164 sent in
+about 2 s with 4 in flight gives a mean of about 50 ms. At pipeline 4 and
+200 req/s the connection carries the offered rate only while a round trip is
+under 20 ms, so the queue filled and the test measured the backlog.
+
+Locally, macOS background QoS (`taskpolicy -c background`) reproduces it: a
+12 ms `thread::sleep` there takes 111 ms at p50 (13.6 ms without), and all
+three tests failed with 280-290 dropped. Raising the test pipeline to 32,
+which carries 200 req/s up to a 160 ms round trip, made both batch-1 tests
+pass under background QoS, one run each: RESP queue wait p50 47 µs, memcache
+61 µs, nothing dropped, and round trips (response latency) p50 50 ms and max
+112 ms in both. The full-batch control (batch 32) read 54 ms there. A reviewer's
+RESP run under the same QoS read round trips of p50 75 ms and max 337 ms, past
+the 160 ms headroom for part of the run, and still passed at 88.6 µs. With
+the new wait disabled the batch-1 tests still fail at pipeline 32 (5.4 ms,
+6.6 ms).
+
+At pipeline 32 the node queue holds 512 requests, more than a 2 s run at
+200 req/s funds, so a backlog no longer shows up as drops. The helper fails
+the run if the connection sent fewer than 350 requests (about 400 are
+funded). Healthy local runs sent 412-414 and runs under background QoS
+417-423; with the stub at 400 ms all three tests fail on it, having sent
+161-172. The floor allows about 60 unsent at stop, so it catches a round trip
+over about 180 ms; a reviewer's control at a 170 ms stub sent 353 and passed
+with a p50 queue wait of 166 ms. The batch-1 tests fail on their own p50 in
+that band. A first version asserted no drops, which a reviewer showed could
+not fire: with the stub answering 400 ms after arrival, the RESP test sent
+175 with none dropped, and the full-batch control passed on a backlog.
+
+The control test's ceiling is gone, so it no longer catches Nagle on the
+stub. I infer the 650 ms reading was Nagle-stretched cycles backing up the
+queue at pipeline 4 (not measured: 01a15a1e recorded no drop count); at
+pipeline 32 a cycle stretched by a 40 ms delayed ACK still carries 200 req/s.
+I have not measured what slows the runner's round trip; sleep overshoot in
+the stub is the likely cause by analogy with background QoS, not by
+measurement there.
+
+Against valkey 8.1.1 on the same guest (three instances on loopback, routed,
+2 threads, 6 connections, pipeline 8, 50,000 req/s, 90% GET, 20 s after 5 s
+warmup, three rounds each running B1, A1, B8, A8 in that order; A is 707a044
+without the new wait, B is 516dcb4; both release builds with thin LTO).
+Quantiles are from the final `/metrics` scrape, cumulative over warmup and
+run. Times in µs, one value per round; CPU is user+sys seconds for the whole
+25 s process:
+
+| arm | queue wait p50 | queue wait p99 | latency p50 | latency p99 | CPU |
+|---|---|---|---|---|---|
+| B, batch 1 | 7.0, 7.1, 6.9 | 104, 122, 22 | 61, 62, 60 | 362, 397, 162 | 38.5, 38.2, 38.6 |
+| A, batch 1 | 8.5, 8.3, 9.1 | 293, 266, 614 | 73, 72, 74 | 578, 578, 1253 | 37.6, 37.7, 38.6 |
+| B, batch 8 | 8.6, 8.0, 7.9 | 295, 215, 201 | 73, 70, 70 | 602, 461, 477 | 37.0, 37.5, 37.6 |
+| A, batch 8 | 8.1, 8.3, 8.0 | 276, 182, 204 | 71, 71, 70 | 541, 391, 457 | 37.6, 37.6, 37.5 |
+
+Every arm delivered 50,000 req/s with no drops. At batch 8, A and B match
+within the round-to-round spread, as the unchanged gate predicts. At batch 1,
+B lowered response latency p50 by 10-14 µs, but queue-wait p50 by only 1-2 µs.
+Send-to-reply time was not recorded separately, and I don't know what accounts
+for the rest. Queue-wait p99 fell 54-96% and response latency p99 31-87%,
+round by round.
+
+CPU was 37.0-38.6 s per 25 s run (about 1.5 cores for the process, which runs
+2 worker threads) in every arm. B at batch 1 used 38.4 s mean against 38.0 s
+for A, and was higher in two of three rounds (+0.88, +0.53, -0.01 s). B and A
+at batch 8, where the new wait is never reached (B still has the rewritten
+waiter list), differed by up to 0.61 s in one round. Three rounds do not
+resolve a difference of this size. I don't know whether the new wait costs
+CPU.
+
+## 2026-10-20: routed batch_size defaults to 1
+
+At the default `batch_size` (= `pipeline_depth`) a routed connection sends
+a burst only when nothing is in flight and then drains, and routed latency
+counts that drain as queue wait. A pipelining client sends whenever it has a
+request and room, so the owner decided the routed default should keep the
+pipeline full: ed7363c makes an unset `batch_size` 1 in routed mode
+(`Config::effective_batch_size`); an explicit value still applies, and
+pinned mode is unchanged. Routed was unreleased, so no released config
+changes behaviour.
+
+The cost, measured before deciding to keep it (SystemsLab 01a15a54, ed7363c,
+release build, thin LTO): one client worker, four valkey 8.1.1 instances on
+loopback, one connection per node, routed, offered 2,000,000 req/s so the
+client runs flat out; 15 s after 3 s warmup, five rounds. The client process
+used 18.25-18.30 s of CPU per run of 15 s plus 3 s warmup, about 18.6 s
+between results (one worker busy), and every valkey instance 0.23-0.31 cores,
+so the client was the limit.
+
+| pipeline | batch 1 req/s | batch = pipeline req/s |
+|---|---|---|
+| 8 | 139.7k-143.4k | 249.3k-268.6k |
+| 32 | 362.8k-423.1k | 676.4k-775.5k |
+
+Batch 1 sent about 45% fewer requests at both depths.
+
+I predicted the cost came from `batch_size` also setting the client's
+coalesce threshold, so that batch 1 flushed every request as its own send,
+and that keeping coalescing at the pipeline depth with a room of 1 would
+recover most of it (0303b64, `Config::coalesce_batch_size`). Refuted
+(01a15a5e, 0303b64, same shape, three arms with order rotating by round):
+
+| pipeline | unset (room 1, coalesce = depth), mean | batch 1, mean | batch = pipeline, mean |
+|---|---|---|---|
+| 8 | 142.6k (125.1k-150.8k) | 144.5k (132.3k-152.1k) | 256.0k (246.1k-266.1k) |
+| 32 | 399.2k (379.4k-414.8k) | 402.9k (385.1k-432.2k) | 730.8k (651.7k-780.8k) |
+
+At saturation each reply frees one pipeline slot, so a room of 1 sends one
+request per reply whatever the coalesce threshold; the batch-equal-pipeline
+arm sends a pipeline's worth per send because it waits for every reply
+first. 0303b64 is reverted (a1f20d5). The default stays at 1 and the guide
+states the cost; a user short of generator capacity adds threads or sets
+`batch_size = pipeline_depth`.
+
+Below saturation the cost is unresolved: in the valkey table of the previous
+section (50k req/s, 6 connections, pipeline 8) B at batch 1 used more client
+CPU than B at batch 8 in every round (+1.5, +0.7, +1.0 s per 25 s run), but B1
+ran first and B8 third in every round, and the arm means fall roughly with
+position (38.4, 38.0, 37.4, 37.6 s), so three rounds do not separate batch
+size from run order. Not measured: batch sizes between 1 and the pipeline
+depth.
+
+Side effects of the routed default, read from the code and not measured: the
+limiter claim is now one request, so `slip_ns` subtracts one token instead of
+a pipeline's worth, and `schedule_slip` and perceived latency count tokens
+they ignored before (matching the dispatcher, which takes one token per
+request); a routed prefill sends one SET per send; a batch of 1 sizes the send
+pool for one send per request, so a run with 8 threads, 8192 connections and
+pipeline 32 reaches the u16 send-pool cap and warns, where pinned needs 2064
+slots.
+
 ## Open questions for the owner
 
 - Routed latency includes the wait above. Options: document it and size
   connections per node so the wait stays small (what step 2 does now), or
   change the ringline clients so a connection can wait on a reply and on its
   node queue at once (a `recv` that does not pop the pending operation until
-  the reply is complete, or a split send and receive half).
+  the reply is complete, or a split send and receive half). The second option
+  is built, as `Client::recv_ready` rather than either mechanism named, for
+  `batch_size` below `pipeline_depth` (2026-10-20 above). Answered 2026-10-20:
+  routed `batch_size` defaults to 1 (above).
 
 - When a node is added, should total connections grow with the node count or
   stay fixed? In the routed model a fixed total stops meeting threads × nodes

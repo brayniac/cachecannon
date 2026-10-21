@@ -15,11 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatcher funds a request, so the time a request waits for a connection to
   its node is counted (`routed_queue_wait` holds that part alone), and a
   request that finds the node's queue full is dropped and counted in
-  `routed_queue_dropped`. A connection waiting for a reply does not send
-  queued requests, so with few connections per node that wait is mostly the
-  generator's. Needs a
-  rate limit, a RESP or memcache protocol, and at least `threads x nodes`
-  connections. The default, `"pinned"`, is the existing behaviour.
+  `routed_queue_dropped`. A connection with replies pending sends a queued
+  request as soon as one is queued when its pipeline has room for a batch.
+  In routed mode `connection.batch_size` defaults to 1, so that is whenever
+  the pipeline has room; with `batch_size` at `pipeline_depth` it sends
+  nothing until its replies are in, and with few connections per node that
+  wait is mostly the generator's. Batch 1 costs generator capacity: in one
+  loopback measurement (one worker, four nodes, one connection each) a
+  saturated worker sent about 45% fewer requests than at `batch_size =
+  pipeline_depth`. At the routed default the limiter's claim is one
+  request, so `schedule_slip` and perceived latency count every request's
+  worth of tokens a worker holds beyond one, matching the dispatcher, which
+  takes one token per request. Needs a rate limit, a RESP or memcache
+  protocol, and at least `threads x nodes` connections. The default,
+  `"pinned"`, is the existing behaviour.
 - `target.auto_discovery` supports ElastiCache for Memcached auto discovery.
   Before the run, cachecannon sends `config get cluster` to the configured
   endpoints (falling back to `get AmazonElastiCache:cluster` on engines that
