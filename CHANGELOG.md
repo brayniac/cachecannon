@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `[workload.kv_replay]` runs with `protocol = "dma"` (a `--features dma`
+  build) against the Valkey large-object module or vdma. The lookup is the
+  same EXISTS pipeline, on the DMA connection's RESP control channel; each
+  GET and SET is the module's RDMA transfer, one at a time per connection
+  (`pipeline_depth = 1`, as `protocol = "dma"` already required), so
+  `connection.connections` bounds trace requests and transfers in flight.
+  `[dma] buffer_capacity` defaults to the largest object and is checked
+  against it when the run starts; a smaller one fails the run. Outcomes,
+  `requests_out` rows and `kv_*` metrics are those of the RESP path;
+  `bytes_rx`/`bytes_tx` count object bytes moved over the fabric. Not yet
+  run against the module: tested against an in-process server that answers
+  the module's control commands without moving bytes. `[resp] module =
+  "largeobj"` with a KV replay is still refused.
 - `workload.routing = "routed"` loads several nodes the way a client
   population does: each worker's dispatcher draws every request's key from
   the whole keyspace, routes it, and queues it for the owning node, so a node

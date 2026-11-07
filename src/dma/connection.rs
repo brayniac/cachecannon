@@ -72,7 +72,7 @@ struct Connection {
 }
 
 /// A window of this worker's registered value pool, or `None` if the pool never registered.
-fn source_window(at: usize, length: usize) -> Option<RegionWindow> {
+pub(crate) fn source_window(at: usize, length: usize) -> Option<RegionWindow> {
     SOURCE.with(|slot| slot.borrow().as_ref()?.slice(at, length))
 }
 
@@ -153,10 +153,21 @@ pub(crate) async fn dma_connection_task(
     let endpoint = state.task_state.endpoints[endpoint_idx];
     let config = &state.task_state.config;
     let worker_id = state.task_state.worker_id;
-    let capacity = config
-        .dma
-        .buffer_capacity
-        .unwrap_or(config.workload.values.length);
+    // A KV replay's GET lands a whole object, so its buffer holds the largest one. The runner
+    // checked a configured capacity against it before any worker started.
+    let capacity = match state.task_state.kv_replay {
+        Some(ref kv) => match kv.dma_buffer_capacity(config.dma.buffer_capacity) {
+            Ok(capacity) => capacity,
+            Err(error) => {
+                tracing::error!(worker = worker_id, "{error}");
+                return;
+            }
+        },
+        None => config
+            .dma
+            .buffer_capacity
+            .unwrap_or(config.workload.values.length),
+    };
     let dialect = match config.dma.module {
         DmaModule::Vdma => Dialect::Vdma,
         DmaModule::LargeObj => Dialect::LargeObj,
@@ -187,6 +198,9 @@ pub(crate) async fn dma_connection_task(
         {
             Ok(connection) => connection,
             Err(_) => {
+                if state.task_state.kv_replay.is_some() {
+                    crate::kvreplay::note_connect_failed();
+                }
                 ringline::sleep(Duration::from_millis(100)).await;
                 continue;
             }
@@ -204,6 +218,9 @@ pub(crate) async fn dma_connection_task(
                 tracing::debug!(worker = worker_id, %endpoint, "dma handshake failed: {error}");
                 metrics::CONNECTIONS_ACTIVE.decrement();
                 metrics::CONNECTIONS_FAILED.increment();
+                if state.task_state.kv_replay.is_some() {
+                    crate::kvreplay::note_connect_failed();
+                }
                 ringline::sleep(Duration::from_millis(100)).await;
                 continue;
             }
@@ -214,21 +231,43 @@ pub(crate) async fn dma_connection_task(
             state.mark_precheck_done();
         }
 
-        let mut connection = Connection {
-            dma,
-            conn,
-            // only pipeline depth 1 currently supported
-            inflight: InFlight::new(config.connection.request_timeout, 1),
+        let reason = match state.task_state.kv_replay {
+            Some(ref kv) => {
+                let mut dma = dma;
+                let ctx = crate::kvreplay::KvConn {
+                    kv,
+                    shared: &state.task_state.shared,
+                    value_pool: &state.task_state.value_pool,
+                    pipeline_depth: config.connection.pipeline_depth,
+                    request_timeout: config.connection.request_timeout,
+                };
+                crate::kvreplay::drive_dma(
+                    &mut dma,
+                    config.dma.checksums_writes(),
+                    conn,
+                    &ctx,
+                    &mut rng,
+                )
+                .await
+            }
+            None => {
+                let mut connection = Connection {
+                    dma,
+                    conn,
+                    // only pipeline depth 1 currently supported
+                    inflight: InFlight::new(config.connection.request_timeout, 1),
+                };
+                run_transfers(
+                    &mut connection,
+                    &state,
+                    endpoint_idx,
+                    &mut rng,
+                    &mut key_buf,
+                    &mut backfill_queue,
+                )
+                .await
+            }
         };
-        let reason = run_transfers(
-            &mut connection,
-            &state,
-            endpoint_idx,
-            &mut rng,
-            &mut key_buf,
-            &mut backfill_queue,
-        )
-        .await;
         metrics::CONNECTIONS_ACTIVE.decrement();
         if let Err(reason) = reason {
             tracing::debug!(worker = worker_id, %endpoint, "disconnected: {reason:?}");

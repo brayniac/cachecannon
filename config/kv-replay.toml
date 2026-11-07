@@ -48,3 +48,9 @@ requests_out = "kv-requests.csv"
 
 [admin]
 format = "clean"
+
+# The same replay against the Valkey large-object module over RDMA: a build with
+# `--features dma`, `protocol = "dma"` in [target], `pipeline_depth = 1` in
+# [connection], and a [dma] section as in config/largeobj.toml. Each connection
+# then runs one GET or SET transfer at a time; `[dma] buffer_capacity` defaults
+# to the largest object. Not yet run against the module.

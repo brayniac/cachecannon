@@ -753,3 +753,75 @@ fn kv_replay_trace_finished_during_warmup_fails_the_run() {
         },
     );
 }
+
+/// A large-object server's fabric address over libfabric's `tcp` provider,
+/// with the fabric that owns it, which must outlive the run.
+#[cfg(feature = "dma")]
+fn rdma_address() -> (cachecannon::dma::DmaFabric, String) {
+    use cachecannon::dma::{DmaFabric, FabricConfig, Provider, encode_hex};
+    let fabric = DmaFabric::open(&FabricConfig::new(Provider::Tcp)).unwrap();
+    let address = encode_hex(fabric.local_address());
+    (fabric, address)
+}
+
+/// KV replay over `protocol = "dma"`: the lookup is EXISTS on the control
+/// channel, the load and store are the module's `BLOB.RDMA_GET` and
+/// `BLOB.RDMA_SET`, and the outcome matches the RESP path's for the same
+/// trace (`kv_replay_cold_cache_then_full_prompt_repeat`,
+/// `kv_replay_get_nil_ends_the_cached_prefix`). The test server moves no
+/// bytes over the fabric (`Hooks::rdma_address`), so this covers the control
+/// channel and the accounting, not the transfers.
+#[cfg(feature = "dma")]
+#[test]
+fn kv_replay_over_dma_matches_the_resp_outcome() {
+    common::kv::isolated("kv_replay_over_dma_matches_the_resp_outcome", || {
+        let ct = CHUNK_TOKENS;
+        let (_fabric, address) = rdma_address();
+        // The repeat's EXISTS of chunk 2 answers 1, then its GET finds nothing.
+        let server = Server::with_hooks(Hooks {
+            evict_after_exists: Some(key(2, 0)),
+            rdma_address: Some(address),
+            ..Default::default()
+        });
+        let rows = replay_with(
+            &server,
+            &[
+                request(1, 0, &[1, 2, 3], 3 * ct + 3),
+                request(2, 1, &[1, 2, 3], 3 * ct + 3),
+                request(3, 2, &[4, 5], 2 * ct),
+                request(4, 3, &[4, 5], 2 * ct),
+            ],
+            "",
+            1,
+            "dma",
+        );
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        let r = &rows[0];
+        assert_eq!((r.lookup_hit_chunks, r.gets, r.sets), (0, 0, 3), "{r:?}");
+        let r = &rows[1];
+        assert_eq!((r.lookup_hit_chunks, r.hit_chunks), (3, 1), "{r:?}");
+        assert_eq!((r.gets, r.get_nil, r.sets), (3, 1, 0), "{r:?}");
+        assert_eq!(r.cached_tokens, u64::from(ct), "{r:?}");
+        // A full-prompt hit leaves the last token to compute.
+        let r = &rows[3];
+        assert_eq!((r.hit_chunks, r.gets, r.sets), (2, 2, 0), "{r:?}");
+        assert_eq!(r.cached_tokens, u64::from(2 * ct - 1), "{r:?}");
+
+        assert_eq!(metrics::KV_REQUESTS.value(), 4);
+        assert_eq!(metrics::KV_REQUESTS_FAILED.value(), 0);
+        assert_eq!(metrics::KV_GET_NIL.value(), 1);
+        assert_eq!(metrics::KV_FULL_HITS.value(), 1);
+        assert_eq!(metrics::KV_EXISTS_COUNT.value(), 3 + 3 + 2 + 2);
+        // Two hits and a nil from request 2, two hits from request 4.
+        assert_eq!(metrics::CACHE_HITS.value(), 4);
+        assert_eq!(metrics::CACHE_MISSES.value(), 1);
+
+        // Every GET and SET went out as the module's transfer command, and
+        // each SET named the object's size, 4 bytes per token.
+        assert!(server.ops("GET").is_empty() && server.ops("SET").is_empty());
+        assert_eq!(server.ops("BLOB.RDMA_GET").len(), 5);
+        let sets: Vec<Vec<u8>> = [1, 2, 3, 4, 5].map(|c| key(c, 0)).to_vec();
+        assert_eq!(server.ops("BLOB.RDMA_SET"), sets);
+        assert_eq!(server.value_len(&key(4, 0)), Some(4 * ct as usize));
+    });
+}

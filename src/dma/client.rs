@@ -111,6 +111,17 @@ impl DmaClient {
         self.commit(&command, window.length()).await
     }
 
+    /// The RESP control connection, for commands the module answers like any other key (`EXISTS`).
+    /// Nothing may be left in flight on it: the transfers share it and read replies in order.
+    pub(crate) fn control(&mut self) -> &mut Client {
+        &mut self.client
+    }
+
+    /// Whether the control connection is still open.
+    pub(crate) fn is_alive(&self) -> bool {
+        self.client.is_alive()
+    }
+
     /// Plain `DEL` on the control connection. Returns true if the key existed.
     pub(crate) async fn delete(&mut self, key: &[u8]) -> Result<bool, Error> {
         Ok(self.client.del(key).await? == 1)

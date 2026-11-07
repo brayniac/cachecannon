@@ -99,6 +99,12 @@ pub fn run_benchmark_full(
         Some(ref kv) => Some(Arc::new(KvReplay::load(kv)?)),
         None => None,
     };
+    // Each DMA connection registers one buffer that a GET lands a whole object in.
+    if let Some(ref kv) = kv_replay
+        && config.target.protocol == CacheProtocol::Dma
+    {
+        kv.dma_buffer_capacity(config.dma.buffer_capacity)?;
+    }
     // Object trace replay: check the trace's columns and read its largest
     // object size from the footer before anything starts.
     let trace_replay = match config.workload.trace_replay {

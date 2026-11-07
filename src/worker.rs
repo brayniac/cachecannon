@@ -998,7 +998,7 @@ pub(crate) struct TaskSharedState {
     /// Steady-state key-id distribution (see `BenchWorkerConfig::key_dist`).
     pub(crate) key_dist: Arc<KeyDist>,
     /// See `BenchWorkerConfig::kv_replay`.
-    kv_replay: Option<Arc<KvReplay>>,
+    pub(crate) kv_replay: Option<Arc<KvReplay>>,
     /// See `BenchWorkerConfig::trace_replay`.
     trace_replay: Option<Arc<TraceReplay>>,
 }

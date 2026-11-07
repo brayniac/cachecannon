@@ -1195,9 +1195,13 @@ impl Config {
                 ));
             }
 
+            // A KV replay's GETs land objects of the trace's sizes, not `values.length`; its
+            // capacity is checked against the largest object when the run starts
+            // (`KvReplay::dma_buffer_capacity`).
             #[cfg(feature = "dma")]
             if let Some(capacity) = self.dma.buffer_capacity
                 && capacity < self.workload.values.length
+                && self.workload.kv_replay.is_none()
             {
                 return Err(ConfigError::Validation(format!(
                     "dma.buffer_capacity ({capacity}) must hold workload.values.length ({})",
@@ -1523,8 +1527,13 @@ impl Config {
         }
         // The lookup is one pipeline of EXISTS per connection, so every key a
         // request touches must live on the server that connection reaches.
-        if !matches!(self.target.protocol, Protocol::Resp | Protocol::Resp3) {
-            return bad("needs protocol resp or resp3 (it issues EXISTS, GET and SET)");
+        // Under `dma` the EXISTS go over the control connection and the GETs
+        // and SETs are the module's transfers.
+        if !matches!(
+            self.target.protocol,
+            Protocol::Resp | Protocol::Resp3 | Protocol::Dma
+        ) {
+            return bad("needs protocol resp, resp3 or dma (it issues EXISTS, GET and SET)");
         }
         if self.target.cluster || self.target.endpoints.len() > 1 {
             return bad(
@@ -2923,5 +2932,34 @@ mod append_config_tests {
         assert!(dma_config("buffer_capacity = 4096").is_ok());
         let error = dma_config("buffer_capacity = 4095").unwrap_err();
         assert!(error.to_string().contains("buffer_capacity"), "{error}");
+    }
+
+    /// A DMA config with `[workload.kv_replay]` and `extra` appended.
+    #[cfg(feature = "dma")]
+    fn dma_kv_config(extra: &str) -> Result<Config, ConfigError> {
+        parse_config(&format!(
+            "[target]\nendpoints = [\"127.0.0.1:6379\"]\nprotocol = \"dma\"\n{extra}\n\
+             [workload.kv_replay]\ntrace = \"t.parquet\"\nkv_bytes_per_token = 4\n"
+        ))
+    }
+
+    #[cfg(feature = "dma")]
+    #[test]
+    fn kv_replay_runs_over_dma() {
+        let config = dma_kv_config("").unwrap();
+        assert_eq!(config.target.protocol, Protocol::Dma);
+        dma_kv_config("[dma]\nmodule = \"vdma\"").unwrap();
+        // Checked against the largest object when the run starts, not against
+        // `values.length`, which a replay does not use.
+        dma_kv_config("[workload.values]\nlength = 4096\n[dma]\nbuffer_capacity = 64").unwrap();
+        // The DMA path's own limit, and the replay's, still apply.
+        let err = dma_kv_config("[connection]\npipeline_depth = 2")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pipeline_depth = 1"), "{err}");
+        let err = dma_kv_config("[workload]\nprefill = true")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("prefill"), "{err}");
     }
 }

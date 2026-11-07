@@ -1,6 +1,10 @@
 //! For `tests/kv_replay.rs`: an in-process RESP server that stores what it is
 //! sent, a trace writer, one closed-loop replay against the server, and
 //! [`isolated`], which runs a test in its own process.
+//!
+//! With [`Hooks::rdma_address`] set the server also answers the large-object
+//! module's `BLOB.RDMA_*` control commands, without moving any bytes over a
+//! fabric; see [`Hooks::rdma_address`].
 
 use cachecannon::{ColorMode, Config, OutputFormat, create_formatter, run_benchmark_full};
 use kvtrace::{ObjectKind, Request, RequestWriter};
@@ -63,6 +67,13 @@ pub struct Hooks {
     /// With `close_all_after_sets`: from then on accept connections and shut
     /// each down at once.
     pub drop_new_after_close_all: bool,
+    /// Answer `BLOB.RDMA_HELLO` with this fabric address (hex), and
+    /// `BLOB.RDMA_GET` and `BLOB.RDMA_SET` as the large-object module does,
+    /// with no RMA: a SET stores zeros of the length it names and a GET
+    /// reports the stored length without writing the client's buffer. This
+    /// covers the replay's control channel and accounting under
+    /// `protocol = "dma"`, not the transfers.
+    pub rdma_address: Option<String>,
 }
 
 #[derive(Default)]
@@ -209,11 +220,31 @@ fn serve(stream: TcpStream, state: Arc<Mutex<State>>) {
                     }
                     None => b"$-1\r\n".to_vec(),
                 },
-                "SET" => {
+                "BLOB.RDMA_HELLO" => match st.hooks.rdma_address {
+                    Some(ref address) => {
+                        format!("*1\r\n${}\r\n{address}\r\n", address.len()).into_bytes()
+                    }
+                    None => b"-ERR unknown command\r\n".to_vec(),
+                },
+                // `BLOB.RDMA_GET <key> <rkey> <address> <capacity>`: the byte
+                // count and a CRC-32c the client does not check without
+                // `dma.checksum`.
+                "BLOB.RDMA_GET" => match st.store.get(&key) {
+                    Some(v) => format!("*2\r\n:{}\r\n:0\r\n", v.len()).into_bytes(),
+                    None => b"$-1\r\n".to_vec(),
+                },
+                // `BLOB.RDMA_SET <key> <length> <rkey> <address> <length>`.
+                "SET" | "BLOB.RDMA_SET" => {
                     if st.hooks.delay_set.as_ref().is_some_and(|(k, _)| *k == key) {
                         delay = st.hooks.delay_set.take().map(|(_, d)| d);
                     }
-                    st.store.insert(key, args[2].clone());
+                    let value = if cmd == "SET" {
+                        args[2].clone()
+                    } else {
+                        let len: usize = std::str::from_utf8(&args[2]).unwrap().parse().unwrap();
+                        vec![0u8; len]
+                    };
+                    st.store.insert(key, value);
                     st.sets += 1;
                     if st.hooks.close_after_sets.is_some_and(|(n, _)| n == st.sets) {
                         close = st.hooks.close_after_sets.take().map(|(_, d)| d);
@@ -421,7 +452,8 @@ pub fn replay_on(
     replay_with(server, requests, kv_toml, connections, "resp")
 }
 
-/// [`replay_on`] with `protocol` (`resp` or `resp3`).
+/// [`replay_on`] with `protocol` (`resp`, `resp3`, or `dma` over libfabric's
+/// `tcp` provider against a server with [`Hooks::rdma_address`]).
 pub fn replay_with(
     server: &Server,
     requests: &[Request],
@@ -483,6 +515,13 @@ pub fn replay_file(
         .filter(|l| !l.trim().starts_with("general."))
         .collect::<Vec<_>>()
         .join("\n");
+    // `protocol = "dma"` runs one transfer per connection, over libfabric's
+    // software provider.
+    let (pipeline_depth, dma_toml) = if protocol == "dma" {
+        (1, "[dma]\nprovider = \"tcp\"")
+    } else {
+        (4, "")
+    };
     let toml = format!(
         r#"
         [general]
@@ -495,7 +534,7 @@ pub fn replay_file(
 
         [connection]
         connections = {connections}
-        pipeline_depth = 4
+        pipeline_depth = {pipeline_depth}
 
         [workload.kv_replay]
         trace = "{trace}"
@@ -506,6 +545,8 @@ pub fn replay_file(
 
         [admin]
         format = "quiet"
+
+        {dma_toml}
         "#,
         trace = trace.display(),
         out = out.display(),

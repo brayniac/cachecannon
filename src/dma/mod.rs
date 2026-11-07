@@ -10,10 +10,11 @@ pub mod fabric;
 
 pub use advertisement::{Advertisement, AdvertisementError, decode_hex, encode_hex};
 pub use checksum::checksum;
+pub(crate) use client::{DmaClient, Error as DmaClientError};
 pub use command::{
     Dialect, DmaCommand, DmaGetOptions, DmaSetOptions, TransferReceipt, TransferReply,
 };
-pub(crate) use connection::{dma_connection_task, open_fabric};
+pub(crate) use connection::{dma_connection_task, open_fabric, source_window};
 pub use error::DmaError;
 pub use fabric::{
     DmaBuffer, DmaFabric, FabricConfig, ProgressGuard, Provider, RegionWindow, discover_domains,

@@ -26,6 +26,11 @@
 //!
 //! Token accounting is in [`cached_tokens`].
 //!
+//! Under `protocol = "dma"` (`kvreplay/dma.rs`) the lookup is the same EXISTS pipeline,
+//! sent on the DMA connection's RESP control channel, and the load and store
+//! are the module's RDMA transfers, one at a time per connection
+//! (`protocol = "dma"` requires `pipeline_depth = 1`).
+//!
 //! Timing: the trace's timestamps divided by `speedup` (open loop), or as
 //! fast as connections free up (`speedup = 0`, closed loop). Each worker runs
 //! one dispatcher task that hands trace requests to its idle connections and
@@ -56,6 +61,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
+
+#[cfg(feature = "dma")]
+mod dma;
+#[cfg(feature = "dma")]
+pub(crate) use dma::drive_dma;
 
 /// Header of the `requests_out` CSV. One row per trace request that
 /// completed; see `docs/reference.md` "KV-cache replay" for the columns.
@@ -215,6 +225,13 @@ impl KvReplay {
     /// sized for.
     pub fn max_object_size(&self) -> usize {
         self.mapper.max_object_size() as usize
+    }
+
+    /// The registered buffer each `protocol = "dma"` connection needs: every
+    /// GET lands one whole object in it. `configured` is
+    /// `dma.buffer_capacity`; unset, the largest object.
+    pub fn dma_buffer_capacity(&self, configured: Option<usize>) -> Result<usize, String> {
+        dma_buffer_capacity(configured, self.max_object_size())
     }
 
     /// EXISTS one request can send at once.
@@ -422,6 +439,18 @@ pub fn geometry(cfg: &crate::config::KvReplay) -> Result<Geometry, String> {
         .sharding()
         .map_err(|e| format!("kv_replay geometry: {e}"))?;
     Ok(geometry)
+}
+
+/// See [`KvReplay::dma_buffer_capacity`].
+fn dma_buffer_capacity(configured: Option<usize>, max_object: usize) -> Result<usize, String> {
+    match configured {
+        None => Ok(max_object),
+        Some(capacity) if capacity >= max_object => Ok(capacity),
+        Some(capacity) => Err(format!(
+            "kv_replay: dma.buffer_capacity ({capacity}) must hold the largest object \
+             ({max_object} bytes); raise it or leave it unset"
+        )),
+    }
 }
 
 /// Chunks of the lookup's prefix hit: the chunks before the first one with a
@@ -889,10 +918,55 @@ pub(crate) struct KvConn<'a> {
     pub request_timeout: Duration,
 }
 
+/// A connection a trace request runs on: a RESP client, or under
+/// `protocol = "dma"` a DMA client (`kvreplay/dma.rs`).
+trait KvTransport {
+    fn is_alive(&self) -> bool;
+
+    /// Look up, load and store one trace request.
+    async fn run_request(
+        &mut self,
+        conn: ConnCtx,
+        ctx: &KvConn<'_>,
+        rng: &mut Xoshiro256PlusPlus,
+        inflight: &mut InFlight,
+        s: &mut Scratch,
+        req: &Request,
+    ) -> Result<Outcome, Failure>;
+}
+
+impl KvTransport for ringline_redis::Client {
+    fn is_alive(&self) -> bool {
+        ringline_redis::Client::is_alive(self)
+    }
+
+    async fn run_request(
+        &mut self,
+        conn: ConnCtx,
+        ctx: &KvConn<'_>,
+        rng: &mut Xoshiro256PlusPlus,
+        inflight: &mut InFlight,
+        s: &mut Scratch,
+        req: &Request,
+    ) -> Result<Outcome, Failure> {
+        run_request(self, conn, ctx, rng, inflight, s, req).await
+    }
+}
+
 /// Replay trace requests on one connected RESP client until the run stops or
 /// the connection fails.
 pub(crate) async fn drive(
     client: &mut ringline_redis::Client,
+    conn: ConnCtx,
+    ctx: &KvConn<'_>,
+    rng: &mut Xoshiro256PlusPlus,
+) -> Result<(), DisconnectReason> {
+    drive_on(client, conn, ctx, rng).await
+}
+
+/// [`drive`] for any [`KvTransport`].
+async fn drive_on<T: KvTransport>(
+    client: &mut T,
     conn: ConnCtx,
     ctx: &KvConn<'_>,
     rng: &mut Xoshiro256PlusPlus,
@@ -949,16 +1023,9 @@ pub(crate) async fn drive(
         let lag_ns = job
             .scheduled
             .map(|due| started.saturating_duration_since(due).as_nanos() as u64);
-        let result = run_request(
-            client,
-            conn,
-            ctx,
-            rng,
-            &mut inflight,
-            &mut scratch,
-            &job.req,
-        )
-        .await;
+        let result = client
+            .run_request(conn, ctx, rng, &mut inflight, &mut scratch, &job.req)
+            .await;
         if let Err(Failure::Closed) = result {
             if !dispatch.give_back(job, HandBack::LookupSent) {
                 // Closed a second time: counted as failed rather than
@@ -1043,7 +1110,102 @@ async fn run_request(
     if req.chunks.is_empty() {
         return Ok(o);
     }
+    let ranks = prepare(kv, s, req);
+    // 1. Lookup.
+    lookup(client, conn, inflight, s, ranks, &mut o).await?;
 
+    // 2. Load: GET every object of the hit prefix.
+    let gets = o.lookup_hit * ranks;
+    if gets > 0 {
+        let t0 = Instant::now();
+        let mut next = 0;
+        let mut done = 0;
+        while done < gets {
+            let fired_at = Instant::now();
+            let mut fired = 0u64;
+            while next < gets && client.pending_count() < ctx.pipeline_depth {
+                let before = client.pending_count();
+                if client.fire_get(s.key(next), next as u64).is_err() {
+                    note_failed_fire(before, client.pending_count(), inflight, true);
+                    metrics::REQUESTS_SENT.add(fired);
+                    return Err(send_failed(conn));
+                }
+                inflight.push(fired_at);
+                next += 1;
+                fired += 1;
+            }
+            flush(client, conn, inflight, fired)?;
+            let meta = recv_with_timeout(client.recv_meta(), inflight, conn)
+                .await
+                .map_err(Failure::Disconnect)?
+                .map_err(recv_failed)?;
+            inflight.pop();
+            done += 1;
+            let chunk = s.objects[meta.user_data as usize].chunk_index as usize;
+            let result = map_respmeta(meta);
+            record_counters(&result);
+            if !result.success || result.hit == Some(false) {
+                if result.success {
+                    o.get_nil += 1;
+                    metrics::KV_GET_NIL.increment();
+                }
+                o.hit = o.hit.min(chunk);
+            }
+        }
+        o.gets = gets;
+        o.load_ns = t0.elapsed().as_nanos() as u64;
+    }
+
+    // 3. Store.
+    select_sets(kv, s, &o, ranks);
+    let sets = s.sets.len();
+    if sets > 0 {
+        let pool_len = ctx.value_pool.len();
+        let t0 = Instant::now();
+        let mut next = 0;
+        let mut done = 0;
+        while done < sets {
+            let fired_at = Instant::now();
+            let mut fired = 0u64;
+            while next < sets && client.pending_count() < ctx.pipeline_depth {
+                let i = s.sets[next];
+                let len = s.objects[i].size as usize;
+                let before = client.pending_count();
+                let sent = if len >= ZC_VALUE_THRESHOLD {
+                    let guard = make_value_guard(rng, ctx.value_pool, len, pool_len);
+                    client.fire_set_with_guard(s.key(i), guard, i as u64)
+                } else {
+                    let value = value_slice(rng, ctx.value_pool, len, pool_len);
+                    client.fire_set(s.key(i), value, i as u64)
+                };
+                if sent.is_err() {
+                    note_failed_fire(before, client.pending_count(), inflight, true);
+                    metrics::REQUESTS_SENT.add(fired);
+                    return Err(send_failed(conn));
+                }
+                inflight.push(fired_at);
+                next += 1;
+                fired += 1;
+            }
+            flush(client, conn, inflight, fired)?;
+            let meta = recv_with_timeout(client.recv_meta(), inflight, conn)
+                .await
+                .map_err(Failure::Disconnect)?
+                .map_err(recv_failed)?;
+            inflight.pop();
+            done += 1;
+            record_counters(&map_respmeta(meta));
+        }
+        o.sets = sets;
+        o.store_ns = t0.elapsed().as_nanos() as u64;
+    }
+
+    finish(kv, input, &mut o);
+    Ok(o)
+}
+
+/// Fill `s` with `req`'s objects and their keys. Returns the storing ranks.
+fn prepare(kv: &KvReplay, s: &mut Scratch, req: &Request) -> usize {
     // RequestReader rejects chunk ids that do not fit an object id (2^48 or
     // more) as it reads each row.
     s.objects.clear();
@@ -1058,10 +1220,20 @@ async fn run_request(
         kv.push_key(&mut s.keys, obj.obj_id);
         s.key_ends.push(s.keys.len());
     }
-    let ranks = kv.mapper.sharding().ranks as usize;
-    let n = s.objects.len();
+    kv.mapper.sharding().ranks as usize
+}
 
-    // 1. Lookup: every EXISTS in one pipeline.
+/// The lookup: every EXISTS of `s.objects` in one pipeline on `client`. Fills
+/// `s.exists` and sets the outcome's `lookup_ns`, `lookup_hit` and `hit`.
+async fn lookup(
+    client: &mut ringline_redis::Client,
+    conn: ConnCtx,
+    inflight: &mut InFlight,
+    s: &mut Scratch,
+    ranks: usize,
+    o: &mut Outcome,
+) -> Result<(), Failure> {
+    let n = s.objects.len();
     let mut pipeline = client.pipeline();
     let mut tx_bytes = 0u64;
     for i in 0..n {
@@ -1123,53 +1295,14 @@ async fn run_request(
     }
     o.lookup_hit = lookup_prefix(&s.exists, ranks);
     o.hit = o.lookup_hit;
+    Ok(())
+}
 
-    // 2. Load: GET every object of the hit prefix.
-    let gets = o.lookup_hit * ranks;
-    if gets > 0 {
-        let t0 = Instant::now();
-        let mut next = 0;
-        let mut done = 0;
-        while done < gets {
-            let fired_at = Instant::now();
-            let mut fired = 0u64;
-            while next < gets && client.pending_count() < ctx.pipeline_depth {
-                let before = client.pending_count();
-                if client.fire_get(s.key(next), next as u64).is_err() {
-                    note_failed_fire(before, client.pending_count(), inflight, true);
-                    metrics::REQUESTS_SENT.add(fired);
-                    return Err(send_failed(conn));
-                }
-                inflight.push(fired_at);
-                next += 1;
-                fired += 1;
-            }
-            flush(client, conn, inflight, fired)?;
-            let meta = recv_with_timeout(client.recv_meta(), inflight, conn)
-                .await
-                .map_err(Failure::Disconnect)?
-                .map_err(recv_failed)?;
-            inflight.pop();
-            done += 1;
-            let chunk = s.objects[meta.user_data as usize].chunk_index as usize;
-            let result = map_respmeta(meta);
-            record_counters(&result);
-            if !result.success || result.hit == Some(false) {
-                if result.success {
-                    o.get_nil += 1;
-                    metrics::KV_GET_NIL.increment();
-                }
-                o.hit = o.hit.min(chunk);
-            }
-        }
-        o.gets = gets;
-        o.load_ns = t0.elapsed().as_nanos() as u64;
-    }
-
-    // 3. Store.
+/// The objects the write rule stores, into `s.sets`.
+fn select_sets(kv: &KvReplay, s: &mut Scratch, o: &Outcome, ranks: usize) {
     s.sets.clear();
     match kv.write_rule {
-        KvWriteRule::SetFromMiss => s.sets.extend(o.lookup_hit * ranks..n),
+        KvWriteRule::SetFromMiss => s.sets.extend(o.lookup_hit * ranks..s.objects.len()),
         KvWriteRule::InsertIfAbsent => {
             s.sets.extend(
                 s.exists
@@ -1180,48 +1313,10 @@ async fn run_request(
             );
         }
     }
-    let sets = s.sets.len();
-    if sets > 0 {
-        let pool_len = ctx.value_pool.len();
-        let t0 = Instant::now();
-        let mut next = 0;
-        let mut done = 0;
-        while done < sets {
-            let fired_at = Instant::now();
-            let mut fired = 0u64;
-            while next < sets && client.pending_count() < ctx.pipeline_depth {
-                let i = s.sets[next];
-                let len = s.objects[i].size as usize;
-                let before = client.pending_count();
-                let sent = if len >= ZC_VALUE_THRESHOLD {
-                    let guard = make_value_guard(rng, ctx.value_pool, len, pool_len);
-                    client.fire_set_with_guard(s.key(i), guard, i as u64)
-                } else {
-                    let value = value_slice(rng, ctx.value_pool, len, pool_len);
-                    client.fire_set(s.key(i), value, i as u64)
-                };
-                if sent.is_err() {
-                    note_failed_fire(before, client.pending_count(), inflight, true);
-                    metrics::REQUESTS_SENT.add(fired);
-                    return Err(send_failed(conn));
-                }
-                inflight.push(fired_at);
-                next += 1;
-                fired += 1;
-            }
-            flush(client, conn, inflight, fired)?;
-            let meta = recv_with_timeout(client.recv_meta(), inflight, conn)
-                .await
-                .map_err(Failure::Disconnect)?
-                .map_err(recv_failed)?;
-            inflight.pop();
-            done += 1;
-            record_counters(&map_respmeta(meta));
-        }
-        o.sets = sets;
-        o.store_ns = t0.elapsed().as_nanos() as u64;
-    }
+}
 
+/// Token counts from the loaded prefix.
+fn finish(kv: &KvReplay, input: u64, o: &mut Outcome) {
     o.cached_tokens = cached_tokens(o.hit as u64, kv.chunk_tokens, input);
     // `cached_tokens` never exceeds its input; the subtraction is checked so
     // a regression there fails loudly in tests instead of panicking a
@@ -1233,7 +1328,6 @@ async fn run_request(
     );
     o.new_tokens = input.saturating_sub(o.cached_tokens);
     o.full_hit = input > 0 && (o.hit as u64).saturating_mul(kv.chunk_tokens) >= input;
-    Ok(o)
 }
 
 /// Count `n` EXISTS sent and answered. The pipeline has no result callback,
@@ -1532,6 +1626,17 @@ mod tests {
         assert!(!kv.is_finished());
         kv.reader.stopped.store(true, Ordering::Release);
         assert!(kv.is_finished());
+    }
+
+    /// A DMA GET lands a whole object in the connection's one registered
+    /// buffer, so a configured capacity below the largest object is refused.
+    #[test]
+    fn a_dma_buffer_holds_the_largest_object() {
+        assert_eq!(dma_buffer_capacity(None, 4096), Ok(4096));
+        assert_eq!(dma_buffer_capacity(Some(8192), 4096), Ok(8192));
+        assert_eq!(dma_buffer_capacity(Some(4096), 4096), Ok(4096));
+        let err = dma_buffer_capacity(Some(4095), 4096).unwrap_err();
+        assert!(err.contains("dma.buffer_capacity (4095)"), "{err}");
     }
 
     #[test]

@@ -373,6 +373,25 @@ the replay starts at the beginning of recording and every request is recorded.
 The run ends when every trace request has finished, or after warmup +
 `duration`, whichever is first.
 
+### Over RDMA (`protocol = "dma"`)
+
+With `protocol = "dma"` (a `--features dma` build, `[dma]` settings as in
+`config/largeobj.toml`) the replay runs against a server with the Valkey
+large-object module, or vdma, over libfabric. The lookup is unchanged: one
+`EXISTS` per object in one pipeline, on the DMA connection's RESP control
+channel. Each `GET` of the load is the module's RDMA read into the
+connection's registered buffer, and each `SET` of the store its RDMA write from
+the registered value pool. A connection runs one transfer at a time
+(`connection.pipeline_depth = 1` is required), so the load and store of one
+trace request are sequential, and `connection.connections` is both the trace
+requests and the transfers in flight. `[dma] buffer_capacity` defaults to the
+largest object. Token counts, `get_nil` and the timing histograms mean what
+they mean over RESP; `bytes_rx` and `bytes_tx` count object bytes moved over
+the fabric. This path has not been run against the module yet; it is tested
+against an in-process server that answers the module's control commands
+without moving bytes over the fabric. `docs/reference.md` "KV-Cache Replay
+Settings" has the details.
+
 ### Which LMCache connector this matches
 
 LMCache picks its remote connector from the URL scheme of `remote_url`. The

@@ -131,7 +131,9 @@ Config load refuses `module = "largeobj"` with a protocol other than `resp` or
 RDMA commands. It also refuses `[workload.append]`. The append writers send
 plain `SET`, which replaces the module's keys with strings, and later
 `BLOB.TCP_GET`s of those keys answer `WRONGTYPE`. It also refuses
-`[workload.kv_replay]`, a combination not run against the module. The RESP
+`[workload.kv_replay]`, a combination not run against the module; a KV replay
+reaches the module over `protocol = "dma"` instead ("KV-Cache Replay
+Settings"). The RESP
 workload sends no TTL, so every SET is the three-argument form `BLOB.TCP_SET`
 accepts.
 
@@ -403,12 +405,40 @@ applies to every EXISTS, GET and SET. `general.duration` is an upper bound: the
 run ends when every trace request has finished. Trace requests that finish
 during `general.warmup` are not recorded.
 
-Rejected at config load: protocols other than `resp` and `resp3`, more than one
-endpoint, `cluster = true`, `connection.pipeline_depth = 0`, `tp` other than 1, `rate_limit`, `[workload.saturation_search]`,
+With `protocol = "dma"` (a build with `--features dma`) the lookup is the same
+EXISTS pipeline, sent on the DMA connection's RESP control channel; the module's
+keys answer EXISTS like any other key. Each GET is the module's RDMA read
+(`BLOB.RDMA_GET`, or `DMA.GET` with `[dma] module = "vdma"`) into the
+connection's registered buffer, and each SET its RDMA write (`BLOB.RDMA_SET` or
+`DMA.SET`) from a window of the registered value pool the size of the object.
+The DMA client waits for each transfer's reply and has one registered buffer
+per connection, so a connection runs one GET or SET at a time:
+`protocol = "dma"` requires `connection.pipeline_depth = 1`, and
+`connection.connections` is the bound on trace requests and on transfers in
+flight. The registered buffer is `[dma] buffer_capacity`, which defaults to the
+largest object and is checked against it when the run starts rather than
+against `workload.values.length`; registered memory is that times the
+connection count, against `RLIMIT_MEMLOCK`. The `requests_out` columns, the
+`kv_replay` results and the `kv_*` metrics are the same as over RESP. Per GET
+and SET, `bytes_rx` and `bytes_tx` count the object bytes moved over the
+fabric, as the `protocol = "dma"` workload does; over RESP they count the
+bytes on the socket, framing included. A GET answered with nil (no transfer)
+after its EXISTS answered 1 counts in `kv_get_nil`. A transfer the server answers
+with an error ends the cached prefix at its chunk and counts in
+`request_errors`; any other failed transfer (the control channel, the fabric,
+or a receipt that fails its checks, such as `[dma] checksum = true` finding a
+mismatch) ends the trace request, counts it in `kv_requests_failed`, and drops
+the connection. The DMA path has not been run against the module yet: it is
+tested only against an in-process server that answers the module's control
+commands without moving bytes over the fabric.
+
+Rejected at config load: protocols other than `resp`, `resp3` and `dma`, more
+than one endpoint, `cluster = true`, `connection.pipeline_depth = 0`, `tp` other than 1, `rate_limit`, `[workload.saturation_search]`,
 `prefill`, `backfill_on_miss`, `read_values` and `[workload.append]`. Rejected
 when the run starts: an empty trace, a trace file kvtrace cannot open, a
-model with recurrent state (a hybrid linear-attention model), and a trace
-whose largest request's lookup needs more send-pool slots than ringline's
+model with recurrent state (a hybrid linear-attention model), under
+`protocol = "dma"` a `[dma] buffer_capacity` below the largest object, and a
+trace whose largest request's lookup needs more send-pool slots than ringline's
 per-worker maximum of 65,535. A read error
 (a corrupt batch, a row out of timestamp order) found while the reader fills
 its first 16,384 requests ends the run after precheck, before any trace
