@@ -199,7 +199,7 @@ pub(crate) async fn dma_connection_task(
         // Registration happens here, not on first use: `fi_mr_reg` pins pages and is slow, and
         // paying it inside the measured phase would land in the latency histogram.
         let dma = match DmaClient::connect(client, fabric.clone(), capacity, dialect).await {
-            Ok(dma) => dma.with_checksum(config.dma.checksum),
+            Ok(dma) => dma.with_checksum(config.dma.checks_reads()),
             Err(error) => {
                 tracing::debug!(worker = worker_id, %endpoint, "dma handshake failed: {error}");
                 metrics::CONNECTIONS_ACTIVE.decrement();
@@ -259,6 +259,7 @@ async fn run_transfers(
     let value_len = config.workload.values.length;
     let pool_len = state.task_state.value_pool.len();
     let backfill_on_miss = state.task_state.backfill_on_miss;
+    let verify = config.dma.verify_values;
     // A connection the limiter turns away parks on the worker's dispatcher, as the RESP path does,
     // instead of re-polling the limiter on a timer. `None` only if the dispatcher failed to spawn;
     // closed-loop runs have no limiter and never reach it.
@@ -386,7 +387,11 @@ async fn run_transfers(
             Op::Set => {
                 // No staging copy: the value is already in the registered pool, so the transfer
                 // advertises the window where it lives and the server reads it from there.
-                let at = value_offset(rng, value_len, pool_len);
+                let at = if verify {
+                    verify_offset(key_id, value_len, pool_len)
+                } else {
+                    value_offset(rng, value_len, pool_len)
+                };
                 let checksum = write_checksum(
                     &config.dma,
                     &state.task_state.value_pool[at..at + value_len],
@@ -434,6 +439,20 @@ async fn run_transfers(
             }
         };
         let latency_ns = start.elapsed().as_nanos() as u64;
+
+        if matches!(outcome, Err(Error::Dma(crate::dma::DmaError::Integrity(_)))) {
+            metrics::DMA_INTEGRITY_ERRORS.increment();
+            if let Err(error) = &outcome {
+                tracing::error!(key_id, "dma integrity error: {error}");
+            }
+        }
+        // After the latency is taken, so the comparison is not counted as server time.
+        if verify && op == Op::Get && hit == Some(true) {
+            let bytes = outcome.as_ref().copied().unwrap_or(0);
+            let at = verify_offset(key_id, value_len, pool_len);
+            let expected = &state.task_state.value_pool[at..at + value_len];
+            check_value(key_id, expected, bytes, dma.received(bytes));
+        }
 
         let bytes = match &outcome {
             Ok(bytes) => *bytes,
@@ -501,6 +520,68 @@ async fn run_transfers(
     }
 }
 
+/// The value pool offset a key's value is written from under `dma.verify_values`: a hash of the
+/// key and the value length, so every writer and reader of the key agrees on it without sharing
+/// state, and two keys rarely share a window.
+fn verify_offset(key_id: usize, value_len: usize, pool_len: usize) -> usize {
+    // splitmix64 finaliser
+    let mut x = (key_id as u64) ^ (value_len as u64).rotate_left(32);
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    (x % (pool_len - value_len + 1) as u64) as usize
+}
+
+/// How a received value differs from the expected one, or `None` if it matches.
+fn value_difference(expected: &[u8], received: Option<&[u8]>) -> Option<String> {
+    let Some(received) = received else {
+        return Some("no host mapping to compare".into());
+    };
+    if received.len() != expected.len() {
+        return Some(format!(
+            "{} bytes, expected {}",
+            received.len(),
+            expected.len()
+        ));
+    }
+    if received == expected {
+        return None;
+    }
+    let first = received
+        .iter()
+        .zip(expected)
+        .position(|(a, b)| a != b)
+        .unwrap_or(0);
+    let differing = received
+        .iter()
+        .zip(expected)
+        .filter(|(a, b)| a != b)
+        .count();
+    Some(format!(
+        "{differing} of {} bytes differ, first at offset {first}",
+        expected.len()
+    ))
+}
+
+/// Mismatches logged in full per process; later ones are only counted.
+const MISMATCH_LOG_LIMIT: u64 = 20;
+
+/// Compare a GET hit's `bytes` landed bytes with `expected` and count the result.
+fn check_value(key_id: usize, expected: &[u8], bytes: usize, received: Option<&[u8]>) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+
+    metrics::VERIFY_CHECKED.increment();
+    metrics::VERIFY_BYTES.add(bytes as u64);
+    if let Some(difference) = value_difference(expected, received) {
+        metrics::VERIFY_MISMATCHES.increment();
+        if LOGGED.fetch_add(1, Ordering::Relaxed) < MISMATCH_LOG_LIMIT {
+            tracing::error!(key_id, "value mismatch: {difference}");
+        }
+    }
+}
+
 /// The CRC-32c a write of `value` carries: `None` unless the module takes one
 /// ([`crate::config::Dma::checksums_writes`]).
 fn write_checksum(dma: &crate::config::Dma, value: &[u8]) -> Option<u32> {
@@ -509,7 +590,57 @@ fn write_checksum(dma: &crate::config::Dma, value: &[u8]) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::write_checksum;
+    use super::{value_difference, verify_offset, write_checksum};
+
+    #[test]
+    fn verify_offset_is_stable_and_in_range() {
+        let pool = 1 << 20;
+        for key in 0..10_000 {
+            let at = verify_offset(key, 4096, pool);
+            assert!(at + 4096 <= pool);
+            assert_eq!(at, verify_offset(key, 4096, pool));
+        }
+        // Pinned: a change to the hash moves every key's window, and keys written by an older build
+        // then fail verification.
+        assert_eq!(
+            [
+                verify_offset(0, 4096, pool),
+                verify_offset(12_345, 4096, pool)
+            ],
+            [902_384, 540_106]
+        );
+        // A value that fills the pool has one offset.
+        assert_eq!(verify_offset(7, pool, pool), 0);
+    }
+
+    #[test]
+    fn verify_offset_spreads_keys_and_lengths() {
+        let pool = 1 << 30;
+        let len = 17_301_504;
+        let mut seen = std::collections::HashSet::new();
+        for key in 0..1_000 {
+            seen.insert(verify_offset(key, len, pool));
+        }
+        assert!(seen.len() > 990, "{} distinct offsets", seen.len());
+        // The same key at another length is another window, so a value of the wrong size class
+        // fails on content as well as length.
+        assert_ne!(verify_offset(1, len, pool), verify_offset(1, len + 1, pool));
+    }
+
+    #[test]
+    fn value_difference_reports_each_failure() {
+        let expected = [1u8, 2, 3, 4];
+        assert_eq!(value_difference(&expected, Some(&[1, 2, 3, 4])), None);
+        assert_eq!(
+            value_difference(&expected, Some(&[1, 2, 3])).as_deref(),
+            Some("3 bytes, expected 4")
+        );
+        assert_eq!(
+            value_difference(&expected, Some(&[1, 9, 3, 9])).as_deref(),
+            Some("2 of 4 bytes differ, first at offset 1")
+        );
+        assert!(value_difference(&expected, None).is_some());
+    }
     use crate::config::{Dma, DmaModule};
 
     #[test]

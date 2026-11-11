@@ -418,6 +418,24 @@ impl OutputFormatter for JsonFormatter {
         }
     }
 
+    fn print_verify(&self, verify: &super::VerifyResults) {
+        #[derive(Serialize)]
+        struct VerifyOutput<'a> {
+            #[serde(rename = "type")]
+            msg_type: &'static str,
+            #[serde(flatten)]
+            verify: &'a super::VerifyResults,
+        }
+        let output = VerifyOutput {
+            msg_type: "verify",
+            verify,
+        };
+        match serde_json::to_string(&output) {
+            Ok(json) => println!("{}", json),
+            Err(e) => tracing::warn!("failed to serialize JSON output: {e}"),
+        }
+    }
+
     fn print_results(&self, results: &Results) {
         let err_pct = results.err_pct();
         let hit_pct = results.hit_pct();

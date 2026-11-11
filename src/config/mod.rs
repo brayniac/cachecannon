@@ -914,9 +914,26 @@ pub struct Dma {
     /// Off by default. The default module returns one with every read and takes none on a write.
     #[serde(default)]
     pub checksum: bool,
+    /// Check every GET hit byte for byte against the value its key was written with. Off by
+    /// default. Turns on `checksum` too.
+    ///
+    /// Each SET writes the window of the shared value pool at an offset derived from the key and
+    /// the value length, instead of a random one. The pool is filled from a fixed seed, so any
+    /// process with the same key length, key prefix and value length writes and expects the same
+    /// bytes for a key. A GET hit must return exactly `workload.values.length` bytes equal to that
+    /// window; anything else counts in `verify_mismatches`. Keys written by a run without this
+    /// option, or with a different value length, fail the check: start from an empty keyspace or
+    /// prefill. See `docs/reference.md` "Verifying values".
+    #[serde(default)]
+    pub verify_values: bool,
 }
 
 impl Dma {
+    /// Whether reads ask for and check the server's CRC-32c. `verify_values` implies it.
+    pub fn checks_reads(&self) -> bool {
+        self.checksum || self.verify_values
+    }
+
     /// Whether a write carries a CRC-32c for the server to verify. Only vdma takes one: the default
     /// module's write command takes no checksum argument.
     pub fn checksums_writes(&self) -> bool {
@@ -1355,6 +1372,12 @@ impl Config {
                 "workload.read_values does not apply to protocol = \"dma\"; use \
                  dma.checksum = true to checksum each value a GET returns"
                     .to_string(),
+            ));
+        }
+
+        if self.dma.verify_values && self.target.protocol != Protocol::Dma {
+            return Err(ConfigError::Validation(
+                "dma.verify_values needs protocol = \"dma\"".to_string(),
             ));
         }
 

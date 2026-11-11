@@ -32,6 +32,18 @@ const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// `workload.values.length` must not exceed this size.
 pub const VALUE_POOL_SIZE: usize = 1024 * 1024 * 1024;
 
+/// Fill the value pool from a fixed seed. `dma.verify_values` relies on every build producing the
+/// same bytes, so that a key written by one host can be checked by another;
+/// `value_pool_bytes_are_pinned` fails if a dependency change alters them.
+pub(crate) fn fill_value_pool(pool: &mut [u8]) {
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(0xdeadbeef);
+    // Fill in 8KB chunks for efficiency
+    const CHUNK: usize = 8192;
+    for chunk in pool.chunks_mut(CHUNK) {
+        rng.fill_bytes(chunk);
+    }
+}
+
 /// Convenience entry point that takes only a [`Config`].
 ///
 /// Parses `cpu_list`, creates the output formatter, installs a Ctrl-C handler,
@@ -248,12 +260,7 @@ pub fn run_benchmark_full(
     // copies. The pool is seeded deterministically for reproducibility.
     let value_pool = {
         let mut pool = vec![0u8; VALUE_POOL_SIZE];
-        let mut rng = Xoshiro256PlusPlus::seed_from_u64(0xdeadbeef);
-        // Fill in 8KB chunks for efficiency
-        const CHUNK: usize = 8192;
-        for chunk in pool.chunks_mut(CHUNK) {
-            rng.fill_bytes(chunk);
-        }
+        fill_value_pool(&mut pool);
         Arc::new(pool)
     };
 
@@ -1109,6 +1116,9 @@ pub fn run_benchmark_full(
     }
 
     formatter.print_results(&results);
+    if config.dma.verify_values {
+        formatter.print_verify(&crate::output::VerifyResults::take());
+    }
 
     if let Some(state) = saturation_state {
         formatter.print_saturation_results(&state.results());
@@ -1827,6 +1837,16 @@ fn check_send_pool(loads: &[SendLoad], num_threads: usize) -> Result<Option<Stri
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn value_pool_bytes_are_pinned() {
+        // 64 KiB covers several fill chunks. If this changes, a key written by an older build fails
+        // dma.verify_values when a newer build reads it: keep the old bytes or say so in the
+        // changelog.
+        let mut pool = vec![0u8; 64 * 1024];
+        super::fill_value_pool(&mut pool);
+        assert_eq!(crate::dma::checksum(&pool), 2_310_085_454);
+    }
+
     use super::{
         RECV_BUFFER_SIZE_DEFAULT, RECV_RING_SIZE_DEFAULT, SendLoad, check_send_pool,
         resolved_recv_geometry, send_pool_slots, send_slab_slots, standalone_task_capacity,

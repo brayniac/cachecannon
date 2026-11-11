@@ -569,6 +569,27 @@ pub struct PrefillDiagnostics {
     pub likely_cause: PrefillStallCause,
 }
 
+/// Value-verification totals for the whole run.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct VerifyResults {
+    pub checked: u64,
+    pub bytes: u64,
+    pub mismatches: u64,
+    pub integrity_errors: u64,
+}
+
+impl VerifyResults {
+    /// The counters' current values.
+    pub fn take() -> Self {
+        Self {
+            checked: crate::metrics::VERIFY_CHECKED.value(),
+            bytes: crate::metrics::VERIFY_BYTES.value(),
+            mismatches: crate::metrics::VERIFY_MISMATCHES.value(),
+            integrity_errors: crate::metrics::DMA_INTEGRITY_ERRORS.value(),
+        }
+    }
+}
+
 /// Trait for output formatters.
 pub trait OutputFormatter: Send + Sync {
     /// Print the configuration summary at startup.
@@ -612,6 +633,15 @@ pub trait OutputFormatter: Send + Sync {
 
     /// Print the final results.
     fn print_results(&self, results: &Results);
+
+    /// Print the value-verification totals (`dma.verify_values`). Whole run, prefill and warmup
+    /// included: a mismatch outside the measured window still counts.
+    fn print_verify(&self, verify: &VerifyResults) {
+        println!(
+            "verify       {} GET hits checked ({} bytes), {} mismatches, {} integrity errors",
+            verify.checked, verify.bytes, verify.mismatches, verify.integrity_errors
+        );
+    }
 
     /// Print the prefill table header (for formats that use one).
     fn print_prefill_header(&self) {}

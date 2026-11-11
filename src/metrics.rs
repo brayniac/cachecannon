@@ -12,6 +12,39 @@ static CACHE: CounterGroup = CounterGroup::new();
 static CONNECTION: CounterGroup = CounterGroup::new();
 static BYTES: CounterGroup = CounterGroup::new();
 static OPS: CounterGroup = CounterGroup::new();
+static VERIFY: CounterGroup = CounterGroup::new();
+
+/// Counter slot indices for value verification (`dma.verify_values`).
+pub mod verify {
+    pub const CHECKED: usize = 0;
+    pub const BYTES: usize = 1;
+    pub const MISMATCHES: usize = 2;
+    pub const INTEGRITY_ERRORS: usize = 3;
+}
+
+#[metric(
+    name = "verify_checked",
+    description = "GET hits compared byte for byte with the value written (dma.verify_values), whole run"
+)]
+pub static VERIFY_CHECKED: Counter = Counter::new(&VERIFY, verify::CHECKED);
+
+#[metric(
+    name = "verify_bytes",
+    description = "Value bytes compared (dma.verify_values), whole run"
+)]
+pub static VERIFY_BYTES: Counter = Counter::new(&VERIFY, verify::BYTES);
+
+#[metric(
+    name = "verify_mismatches",
+    description = "GET hits whose length or bytes differ from the value written (dma.verify_values), whole run"
+)]
+pub static VERIFY_MISMATCHES: Counter = Counter::new(&VERIFY, verify::MISMATCHES);
+
+#[metric(
+    name = "dma_integrity_errors",
+    description = "DMA reads refused by the client's integrity checks: server CRC-32c mismatch or an over-long transfer, whole run"
+)]
+pub static DMA_INTEGRITY_ERRORS: Counter = Counter::new(&VERIFY, verify::INTEGRITY_ERRORS);
 
 /// Counter slot indices for request metrics.
 pub mod request {

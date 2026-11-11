@@ -342,6 +342,38 @@ Differences from the default path:
   `disconnects_eof` and reconnects, and the next such reply does the same.
   `recv_meta` drains the value as it arrives and is not limited.
 
+#### Verifying values
+
+`[dma] verify_values = true` (valkey-lab `--verify`, which also sets
+`checksum = true`) checks that each GET hit returns the value its key was
+written with. `protocol = "dma"` only; other protocols are rejected at config
+load.
+
+- Each SET, including prefill and backfill SETs, writes the window of the
+  value pool at an offset hashed from the key ID and `workload.values.length`,
+  instead of a random offset. The pool is filled from a fixed seed, so every
+  process with the same key length, key prefix and value length writes the
+  same bytes for a key, and any of them can check a GET of it.
+- A GET hit must return exactly `workload.values.length` bytes equal to that
+  window. A difference in length or content counts in `verify_mismatches`, and
+  the first 20 per process are logged with the key ID, lengths, number of
+  differing bytes and the first differing offset. The request is not counted
+  as an error and the connection stays open.
+- With `checksum` on, the client also compares the CRC-32c the module returns
+  with each GET against the bytes that landed. A failure is a request error,
+  closes the connection, and counts in `dma_integrity_errors`.
+
+The two checks cover different faults. The module computes its CRC over the
+bytes it holds, so it detects corruption on the way back to the client only.
+The byte comparison also detects a value corrupted on the way to the server
+on SET, and a value returned for the wrong key.
+
+The comparison runs after the latency is recorded, as `read_values` does.
+Counters cover the whole run, including prefill and warmup, and a `verify`
+line (JSON: `"type":"verify"`) follows the results. Keys written by a run
+without this option, or with another value length, fail the check: run
+against an empty keyspace or prefill first. Misses are not checked.
+
 ### KV-Cache Replay Settings
 
 `[workload.kv_replay]` replaces the synthetic keyspace with a kvtrace request
@@ -943,6 +975,10 @@ Each snapshot contains the full set of metrics. The file uses the metriken expos
 | `bytes_tx` | Total bytes transmitted |
 | `bytes_rx` | Total bytes received |
 | `values_read_bytes` | GET value bytes checksummed by the client (`workload.read_values`); 0 when the option is off |
+| `verify_checked` | GET hits compared with the value written (`dma.verify_values`), whole run |
+| `verify_bytes` | Value bytes compared (`dma.verify_values`), whole run |
+| `verify_mismatches` | GET hits whose length or bytes differ from the value written (`dma.verify_values`), whole run |
+| `dma_integrity_errors` | DMA reads refused by the client: server CRC-32c mismatch or an over-long transfer, whole run |
 | `connections_failed` | Total failed connection attempts |
 | `disconnects_eof` | Disconnects from EOF (server closed connection) |
 | `disconnects_recv_error` | Disconnects from receive errors |

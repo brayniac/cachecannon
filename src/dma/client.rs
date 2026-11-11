@@ -61,6 +61,12 @@ impl DmaClient {
         self
     }
 
+    /// The first `length` bytes of the registered buffer, where the last GET's value landed.
+    /// `None` for a buffer with no host mapping, or if `length` exceeds the buffer.
+    pub(crate) fn received(&mut self, length: usize) -> Option<&[u8]> {
+        self.buffer.as_host()?.get(..length)
+    }
+
     /// `DMA.GET`: the server writes the value at `key` into the registered buffer.
     ///
     /// `None` if the key is absent. The value is the first `bytes_written` bytes of the buffer.

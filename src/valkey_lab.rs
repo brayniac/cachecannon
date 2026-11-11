@@ -125,6 +125,11 @@ struct BenchArgs {
     #[arg(long)]
     backfill: bool,
 
+    /// DMA only: check every GET hit's CRC-32c and its bytes against the value its key was
+    /// written with (sets dma.checksum and dma.verify_values).
+    #[arg(long)]
+    verify: bool,
+
     /// Path to write Parquet output file.
     #[arg(long)]
     parquet: Option<PathBuf>,
@@ -495,6 +500,10 @@ fn apply_bench_flags(
     }
     if args.backfill {
         config.workload.backfill_on_miss = true;
+    }
+    if args.verify {
+        config.dma.checksum = true;
+        config.dma.verify_values = true;
     }
     if let Some(rate) = args.rate_limit {
         config.workload.rate_limit = Some(rate);

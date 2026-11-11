@@ -57,6 +57,7 @@ Flag | Default | Description
 `--rate-limit` | unlimited | Max requests/second
 `--prefill` | off | Prefill all keys before benchmarking
 `--backfill` | off | SET on GET miss to backfill cache
+`--verify` | off | DMA only: check each GET hit's CRC-32c and compare its bytes with the value the key was written with; see `docs/reference.md` "Verifying values"
 `--parquet` | none | Write results to Parquet file
 `--cpu-list` | none | Pin threads to CPUs (e.g. 0-3,8-11)
 `--resp3` | off | Use RESP3 protocol
